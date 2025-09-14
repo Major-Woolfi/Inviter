@@ -38,10 +38,10 @@ logger = logging.getLogger(__name__)
 
 # --- Конфиг ---
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8156204303:AAGYs2PQg3fuz7hmQ7e1QIOGa0da_qFdw9M")
-    API_ID: int = int(os.getenv("API_ID", 24718107))
-    API_HASH: str = os.getenv("API_HASH", "1ebce04a58cb4078483907f42aee6bb2")
-    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "5225159977, 5169476688").split(",")]
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOU_BOT_TOKET")
+    API_ID: int = int(os.getenv("API_ID", YOU_API_ID))
+    API_HASH: str = os.getenv("API_HASH", "YOU_API_HASH")
+    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "YOU_ADMIN_ID").split(",")]
     MAX_CONCURRENT_TASKS: int = int(os.getenv("MAX_CONCURRENT_TASKS", 10))
     SESSIONS_DIR: str = os.getenv("SESSIONS_DIR", "sessions")
     DATA_DIR: str = os.getenv("DATA_DIR", "data")
@@ -937,4 +937,5 @@ async def main():
         logger.info("All accounts released. Bot shutdown complete.")
 
 if __name__ == "__main__":
+
     asyncio.run(main())
