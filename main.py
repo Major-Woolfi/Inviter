@@ -15,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from telethon import TelegramClient, functions, types as telethon_types
 from telethon.errors import (
     SessionPasswordNeededError, PhoneNumberInvalidError,
@@ -37,10 +38,10 @@ logger = logging.getLogger(__name__)
 
 # --- Конфиг ---
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOU_BOT_TOKEN")
-    API_ID: int = int(os.getenv("API_ID", 123456))
-    API_HASH: str = os.getenv("API_HASH", "YOU_API_HASH")
-    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "5225159977").split(",")]
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8156204303:AAGYs2PQg3fuz7hmQ7e1QIOGa0da_qFdw9M")
+    API_ID: int = int(os.getenv("API_ID", 24718107))
+    API_HASH: str = os.getenv("API_HASH", "1ebce04a58cb4078483907f42aee6bb2")
+    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "5225159977, 5169476688").split(",")]
     MAX_CONCURRENT_TASKS: int = int(os.getenv("MAX_CONCURRENT_TASKS", 10))
     SESSIONS_DIR: str = os.getenv("SESSIONS_DIR", "sessions")
     DATA_DIR: str = os.getenv("DATA_DIR", "data")
@@ -88,7 +89,9 @@ class AddAccountStates(StatesGroup):
 class ScrapingStates(StatesGroup):
     waiting_source = State()
     waiting_target = State()
+    waiting_mode = State()
     waiting_message_limit = State()
+    waiting_user_count = State()
 
 class KeyGeneration(StatesGroup):
     waiting_user_id = State()
@@ -266,7 +269,7 @@ class TaskQueueManager:
         self.logger.info(f"Task added to queue, queue size: {self.queue.qsize()}")
 
 # --- Инициализация ---
-bot = Bot(token=Config.BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(token=Config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 router = Router()
@@ -479,6 +482,10 @@ async def process_code(message: Message, state: FSMContext):
             await message.answer("🔒 <b>Шаг 3/3</b>\nПожалуйста, введите ваш пароль двухфакторной аутентификации:")
             await state.update_data(password_attempts=0)
             await state.set_state(AddAccountStates.waiting_password)
+    except SessionPasswordNeededError:
+        await message.answer("🔒 <b>Шаг 3/3</b>\nПожалуйста, введите ваш пароль двухфакторной аутентификации:")
+        await state.update_data(password_attempts=0)
+        await state.set_state(AddAccountStates.waiting_password)
     except PhoneCodeExpiredError:
         try:
             sent_code = await client.send_code_request(phone)
@@ -558,7 +565,6 @@ async def cmd_genkey(message: Message, state: FSMContext):
     await state.set_state(KeyGeneration.waiting_user_id)
     return None
 
-
 @router.message(KeyGeneration.waiting_user_id)
 async def process_user_id(message: Message, state: FSMContext):
     try:
@@ -591,25 +597,23 @@ async def cmd_list_accounts(message: Message):
     await message.answer(text)
     return None
 
-
 @router.message(Command("start_scraping"))
 async def cmd_start_scraping(message: Message, state: FSMContext):
     if not account_pool.accounts:
         return await message.answer("❌ Нет доступных аккаунтов! Сначала добавьте аккаунты с помощью /add_account")
     await message.answer(
-        "🔍 <b>Шаг 1/3</b>\n"
+        "🔍 <b>Шаг 1/4</b>\n"
         "Отправьте @username или пригласительную ссылку чата/канала, из которого нужно собрать пользователей:"
     )
     await state.set_state(ScrapingStates.waiting_source)
     return None
-
 
 @router.message(ScrapingStates.waiting_source)
 async def process_source(message: Message, state: FSMContext):
     source = message.text.strip()
     await state.update_data(source=source)
     await message.answer(
-        "🎯 <b>Шаг 2/3</b>\n"
+        "🎯 <b>Шаг 2/4</b>\n"
         "Отправьте @username или пригласительную ссылку группы/канала, в которую нужно пригласить пользователей:"
     )
     await state.set_state(ScrapingStates.waiting_target)
@@ -619,10 +623,31 @@ async def process_target(message: Message, state: FSMContext):
     target = message.text.strip()
     await state.update_data(target=target)
     await message.answer(
-        "📊 <b>Шаг 3/3</b>\n"
-        "Введите количество сообщений для анализа (рекомендуется 1000-5000):"
+        "⚙️ <b>Шаг 3/4</b>\n"
+        "Выберите режим сбора:\n"
+        "1. Обработка последних сообщений\n"
+        "2. Количество пользователей\n\n"
+        "Напишите <b>1</b> или <b>2</b>."
     )
-    await state.set_state(ScrapingStates.waiting_message_limit)
+    await state.set_state(ScrapingStates.waiting_mode)
+
+@router.message(ScrapingStates.waiting_mode)
+async def process_mode(message: Message, state: FSMContext):
+    mode = message.text.strip()
+    if mode == "1":
+        await message.answer(
+            "📊 <b>Шаг 4/4</b>\n"
+            "Введите количество сообщений для анализа (рекомендуется 1000-5000):"
+        )
+        await state.set_state(ScrapingStates.waiting_message_limit)
+    elif mode == "2":
+        await message.answer(
+            "📊 <b>Шаг 4/4</b>\n"
+            "Введите количество пользователей для приглашения (от 10 до 1000):"
+        )
+        await state.set_state(ScrapingStates.waiting_user_count)
+    else:
+        await message.answer("⚠️ Пожалуйста, выберите <b>1</b> или <b>2</b>.")
 
 @router.message(ScrapingStates.waiting_message_limit)
 async def process_limit(message: Message, state: FSMContext):
@@ -652,6 +677,33 @@ async def process_limit(message: Message, state: FSMContext):
     await state.clear()
     return None
 
+@router.message(ScrapingStates.waiting_user_count)
+async def process_user_count(message: Message, state: FSMContext):
+    try:
+        user_count = int(message.text)
+        if user_count < 10 or user_count > 1000:
+            raise ValueError
+    except ValueError:
+        return await message.answer("⚠️ Неверное число! Введите от 10 до 1000.")
+    data = await state.get_data()
+    source = data['source']
+    target = data['target']
+    await task_queue.add_task(
+        scrape_and_invite_by_user_count_task,
+        source=source,
+        target=target,
+        user_count=user_count,
+        user_id=message.from_user.id
+    )
+    await message.answer(
+        f"✅ <b>Задача запущена!</b>\n\n"
+        f"• Источник: {source}\n"
+        f"• Цель: {target}\n"
+        f"• Пользователей: {user_count}\n\n"
+        "Вы получите отчет по завершении."
+    )
+    await state.clear()
+    return None
 
 @router.message(Command("task_stats"))
 async def cmd_task_stats(message: Message):
@@ -665,6 +717,53 @@ async def cmd_task_stats(message: Message):
 
 # --- Задачи ---
 invited_cache: Set[int] = set()
+
+async def scrape_and_invite_by_user_count_task(source: str, target: str, user_count: int, user_id: int):
+    logger.info(f"Starting user count task: {source} -> {target} (users: {user_count})")
+    try:
+        async with account_pool.acquire_account() as account:
+            client = account['client']
+            users = set()
+            entity = await client.get_entity(source)
+            async for message in client.iter_messages(entity, limit=10000):
+                if message and message.sender_id:
+                    try:
+                        sender = await message.get_sender()
+                        if isinstance(sender, telethon_types.User) and not sender.bot:
+                            users.add(sender.id)
+                    except Exception:
+                        users.add(message.sender_id)
+                if len(users) >= user_count:
+                    break
+            active_users = list(users)[:user_count]
+            if not active_users:
+                return await notify_user(
+                    user_id,
+                    f"❌ Не найдено активных пользователей в {source}\n"
+                    "Проверьте доступ к чату."
+                )
+            results = await invite_users(account, client, active_users, target)
+            report = (
+                f"📊 <b>Задача завершена!</b>\n\n"
+                f"• Источник: {source}\n"
+                f"• Цель: {target}\n"
+                f"• Приглашено пользователей: {len(active_users)}\n"
+                f"• Успешных приглашений: {results['success']}\n"
+                f"• Уже участников: {results.get('already_members', 0)}\n"
+                f"• Неудачных приглашений: {results['failed']}\n"
+                f"• Ограничения приватности: {results['privacy_errors']}\n"
+                f"• Использованный аккаунт: {account['session_file']}"
+            )
+            await notify_user(user_id, report)
+    except Exception as e:
+        error_msg = (
+            f"🔥 <b>Задача не выполнена!</b>\n\n"
+            f"• Источник: {source}\n"
+            f"• Цель: {target}\n\n"
+            f"Ошибка: {str(e)}"
+        )
+        logger.exception(f"Task error: {source} -> {target}")
+        await notify_user(user_id, error_msg)
 
 async def scrape_and_invite_task(source: str, target: str, message_limit: int, user_id: int):
     logger.info(f"Starting task: {source} -> {target} (limit: {message_limit})")
@@ -709,7 +808,6 @@ async def scrape_and_invite_task(source: str, target: str, message_limit: int, u
         await notify_user(user_id, error_msg)
         return None
 
-
 async def get_active_users(client: TelegramClient, source_entity: str, limit: int) -> List[int]:
     logger.info(f"Collecting users from: {source_entity}")
     users = set()
@@ -733,67 +831,62 @@ async def get_active_users(client: TelegramClient, source_entity: str, limit: in
         raise
 
 async def invite_users(account, client: TelegramClient, user_ids: List[int], target_entity: str) -> Dict[str, int]:
-    logger.info(f"Inviting {len(user_ids)} users to {target_entity}")
+    logger.info(f"Optimized inviting {len(user_ids)} users to {target_entity}")
     results = {'success': 0, 'failed': 0, 'privacy_errors': 0, 'already_members': 0}
     try:
         target = await client.get_entity(target_entity)
-        current_participants = set()
-        if isinstance(target, (telethon_types.Channel, telethon_types.Chat)):
+        if not hasattr(account, 'participants_cache'):
+            current_participants = set()
             async for user in client.iter_participants(target):
                 current_participants.add(user.id)
-        for user_id in user_ids:
-            if user_id in invited_cache:
-                results['already_members'] += 1
-                continue
-            try:
-                if user_id in current_participants:
+            account['participants_cache'] = current_participants
+        else:
+            current_participants = account['participants_cache']
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def invite_one(user_id):
+            async with semaphore:
+                if user_id in invited_cache or user_id in current_participants:
                     results['already_members'] += 1
-                    logger.info(f"User {user_id} is already a member")
-                    continue
-                user_entity = await client.get_entity(user_id)
-                if isinstance(user_entity, telethon_types.User) and user_entity.bot:
-                    logger.debug(f"Skipping bot user: {user_id}")
-                    continue
-                await client(
-                    functions.channels.InviteToChannelRequest(
-                        channel=target,
-                        users=[user_entity]
+                    return
+                try:
+                    user_entity = await client.get_entity(user_id)
+                    if isinstance(user_entity, telethon_types.User) and user_entity.bot:
+                        return
+                    await client(
+                        functions.channels.InviteToChannelRequest(
+                            channel=target,
+                            users=[user_entity]
+                        )
                     )
-                )
-                results['success'] += 1
-                logger.info(f"Successfully invited user: {user_id}")
-                current_participants.add(user_id)
-                invited_cache.add(user_id)
-                # Динамическая задержка
-                await asyncio.sleep(random.randint(60, 90))
-            except UserPrivacyRestrictedError:
-                results['privacy_errors'] += 1
-                logger.warning(f"Privacy restriction for user: {user_id}")
-            except (ChatAdminRequiredError, ChannelPrivateError):
-                results['failed'] += 1
-                logger.error("Admin rights required for inviting or private channel")
-            except (FloodWaitError, FloodError) as e:
-                logger.warning(f"Flood error, waiting: {e.seconds} seconds")
-                account['flood_wait_until'] = datetime.now() + timedelta(seconds=e.seconds + 10)
-                await asyncio.sleep(e.seconds + 10)
-                break  # временно исключаем аккаунт из пула
-            except UserNotParticipantError:
-                results['failed'] += 1
-                logger.warning(f"User {user_id} is not a participant in source chat")
-            except AuthKeyUnregisteredError:
-                account['is_valid'] = False
-                logger.error(f"AuthKeyUnregisteredError: {account['session_file']}")
-                break
-            except Exception as e:
-                results['failed'] += 1
-                logger.error(f"Invite error for {user_id}: {str(e)}")
+                    results['success'] += 1
+                    current_participants.add(user_id)
+                    invited_cache.add(user_id)
+                    await asyncio.sleep(random.randint(60, 90))
+                except UserPrivacyRestrictedError:
+                    results['privacy_errors'] += 1
+                except (ChatAdminRequiredError, ChannelPrivateError):
+                    results['failed'] += 1
+                except (FloodWaitError, FloodError) as e:
+                    account['flood_wait_until'] = datetime.now() + timedelta(seconds=e.seconds + 10)
+                    logger.warning(f"Flood error, waiting: {e.seconds} seconds")
+                    await asyncio.sleep(e.seconds + 10)
+                except UserNotParticipantError:
+                    results['failed'] += 1
+                except AuthKeyUnregisteredError:
+                    account['is_valid'] = False
+                except Exception as e:
+                    results['failed'] += 1
+                    logger.error(f"Invite error for {user_id}: {str(e)}")
+
+        await asyncio.gather(*(invite_one(uid) for uid in user_ids))
         return results
     except Exception as e:
         logger.error(f"Error inviting users: {str(e)}")
         raise
 
 # --- Запуск ---
-# main.py
 
 async def main():
     logger.info(f"Admin IDs: {Config.ADMIN_USER_IDS}")
