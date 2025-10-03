@@ -1,27 +1,29 @@
 import asyncio
+import html
+import json
 import logging
 import os
-import json
+import random
 import secrets
 import sys
-import random
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any, Set
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Set
 from aiogram import Bot, Dispatcher, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
 from telethon import TelegramClient, functions, types as telethon_types
 from telethon.errors import (
-    SessionPasswordNeededError, PhoneNumberInvalidError,
-    FloodWaitError, PhoneCodeInvalidError, UserPrivacyRestrictedError,
-    ChatAdminRequiredError, PhoneCodeExpiredError, ChannelPrivateError,
-    UserNotParticipantError, AuthKeyUnregisteredError, FloodError,
+    AuthKeyUnregisteredError, ChannelPrivateError, ChatAdminRequiredError,
+    FloodError, FloodWaitError, PhoneCodeExpiredError, PhoneCodeInvalidError,
+    PhoneNumberInvalidError, SessionPasswordNeededError, UserNotParticipantError,
+    UserPrivacyRestrictedError
 )
 from telethon.sessions import StringSession
 
@@ -38,10 +40,10 @@ logger = logging.getLogger(__name__)
 
 # --- Конфиг ---
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOU_BOT_TOKET")
-    API_ID: int = int(os.getenv("API_ID", YOU_API_ID))
-    API_HASH: str = os.getenv("API_HASH", "YOU_API_HASH")
-    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "YOU_ADMIN_ID").split(",")]
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN") # Замените на ваш токен бота
+    API_ID: int = int(os.getenv("API_ID", YOUR_API_ID)) # Замените на ваш API_ID
+    API_HASH: str = os.getenv("API_HASH", "YOUR_API_HASH") # Замените на ваш API_HASH
+    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "YOUR_ADMIN_USER_IDS").split(",")] # Замените на ID администраторов через запятую
     MAX_CONCURRENT_TASKS: int = int(os.getenv("MAX_CONCURRENT_TASKS", 10))
     SESSIONS_DIR: str = os.getenv("SESSIONS_DIR", "sessions")
     DATA_DIR: str = os.getenv("DATA_DIR", "data")
@@ -95,6 +97,13 @@ class ScrapingStates(StatesGroup):
 
 class KeyGeneration(StatesGroup):
     waiting_user_id = State()
+
+class BulkMailStates(StatesGroup):
+    waiting_chats = State()
+    waiting_delay = State()
+    waiting_text = State()
+    waiting_sender = State()
+    waiting_count = State()
 
 # --- AuthManager ---
 class AuthManager:
@@ -222,6 +231,45 @@ class AccountPoolManager:
                     account['in_use'] = False
                     logger.info(f"Released account: {account['session_file']}")
 
+    @asynccontextmanager
+    async def acquire_specific_account(self, session_file: str):
+        account = None
+        async with self.lock:
+            now = datetime.now()
+            for acc in self.accounts:
+                if acc['session_file'] == session_file:
+                    if acc['in_use']:
+                        raise Exception("Указанный аккаунт в данный момент используется")
+                    if not acc['is_valid']:
+                        raise Exception("Указанный аккаунт невалиден")
+                    if acc.get('flood_wait_until') and acc['flood_wait_until'] > now:
+                        raise Exception("Указанный аккаунт в режиме ожидания из-за flood")
+                    acc['in_use'] = True
+                    acc['last_used'] = now
+                    account = acc
+                    break
+            if not account:
+                raise Exception("Указанный аккаунт не найден")
+            if not account['client'] or not account['client'].is_connected():
+                try:
+                    if account['client']:
+                        await account['client'].disconnect()
+                    account['client'] = await self._create_client(account['session_string'])
+                    me = await account['client'].get_me()
+                    if not me:
+                        raise Exception("Not authorized")
+                except Exception as e:
+                    account['is_valid'] = False
+                    account['in_use'] = False
+                    raise Exception(f"Ошибка при подключении к аккаунту: {e}")
+            logger.info(f"Acquired specific account: {account['session_file']}")
+        try:
+            yield account
+        finally:
+            async with self.lock:
+                account['in_use'] = False
+                logger.info(f"Released specific account: {account['session_file']}")
+
     def add_account(self, session_string: str, session_name: str):
         session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
         with open(session_path, 'w') as f:
@@ -315,6 +363,7 @@ async def cmd_start(message: Message):
             "/list_accounts - Список доступных аккаунтов\n"
             "/genkey - Сгенерировать ключ доступа\n"
             "/start_scraping - Начать сбор пользователей\n"
+            "/bulk_mailing - Массовая рассылка сообщений\n"
             "/task_stats - Показать статистику задач\n"
             "/help - Показать справку\n"
             "/ref - Зарабатывай на приглашениях\n\n"
@@ -329,6 +378,7 @@ async def cmd_start(message: Message):
             "/add_account - Добавить аккаунт Telegram\n"
             "/list_accounts - Список доступных аккаунтов\n"
             "/start_scraping - Начать сбор пользователей\n"
+            "/bulk_mailing - Массовая рассылка сообщений\n"
             "/task_stats - Показать статистику задач\n"
             "/help - Показать справку\n"
             "/ref - Зарабатывай на приглашениях\n\n"
@@ -366,35 +416,6 @@ async def process_auth_key(message: Message):
             "Администраторы уведомлены о попытке входа.\n"
             "Пожалуйста, свяжитесь с администратором для получения действительного ключа."
         )
-
-@router.message(Command("help"))
-async def cmd_help(message: Message):
-    text = (
-        "📚 <b>Руководство по использованию бота</b>\n\n"
-        "1. <b>Добавление аккаунтов</b> - используйте /add_account для добавления ваших аккаунтов Telegram\n"
-        "2. <b>Начать сбор</b> - используйте /start_scraping для начала сбора пользователей\n"
-        "3. <b>Приглашение пользователей</b> - собранные пользователи будут приглашены в вашу целевую группу\n\n"
-        "⚙️ <b>Как это работает:</b>\n"
-        "- Я анализирую сообщения в исходном чате\n"
-        "- Собираю активных пользователей\n"
-        "- Приглашаю их в вашу целевую группу\n\n"
-        "⚠️ <b>Безопасность:</b>\n"
-        "- Ваши другие сессии Telegram НЕ будут завершены\n"
-        "- Сессии надежно хранятся и никогда не передаются третьим лицам"
-    )
-    await message.answer(text)
-
-@router.message(Command("ref"))
-async def cmd_ref(message: Message):
-    text = (
-        "💸 <b>Зарабатывай с рефералкой:</b>\n\n"
-        "👥 <b>1 человек</b> = +200₽\n"
-        "👥 <b>3 человека</b> = +700₽\n"
-        "👥 <b>5 человек</b> = +1500₽\n"
-        "👥 <b>10 человек</b> = +4000₽\n\n"
-        "Чтобы реферал считался приведённым вами он должен при регистрации сообщить ваш юзернейм."
-    )
-    await message.answer(text)
 
 @router.message(Command("add_account"))
 async def cmd_add_account(message: Message, state: FSMContext):
@@ -554,6 +575,23 @@ async def process_password(message: Message, state: FSMContext):
         await client.disconnect()
         await state.clear()
 
+@router.message(Command("list_accounts"))
+async def cmd_list_accounts(message: Message):
+    if not account_pool.accounts:
+        return await message.answer("ℹ️ Нет доступных аккаунтов. Используйте /add_account, чтобы добавить.")
+    text = "📋 <b>Доступные аккаунты:</b>\n\n"
+    for i, acc in enumerate(account_pool.accounts, 1):
+        status = "🟢 Свободен" if not acc['in_use'] else "🔴 Используется"
+        validity = "🟢 Рабочий" if acc['is_valid'] else "🔴 Не рабочий"
+        flood = f"⏳ FloodWait до {acc['flood_wait_until']}" if acc.get('flood_wait_until') else ""
+        text += (
+            f"{i}. <code>{acc['session_file']}</code>\n"
+            f"   Статус: {status} | {validity} {flood}\n"
+            f"   Последнее использование: {acc['last_used'] or 'Никогда'}\n\n"
+        )
+    await message.answer(text)
+    return None
+
 @router.message(Command("genkey"))
 async def cmd_genkey(message: Message, state: FSMContext):
     if message.from_user.id not in Config.ADMIN_USER_IDS:
@@ -579,23 +617,6 @@ async def process_user_id(message: Message, state: FSMContext):
         await state.clear()
     except ValueError:
         await message.answer("❌ ID должен быть числом. Попробуйте снова:")
-
-@router.message(Command("list_accounts"))
-async def cmd_list_accounts(message: Message):
-    if not account_pool.accounts:
-        return await message.answer("ℹ️ Нет доступных аккаунтов. Используйте /add_account, чтобы добавить.")
-    text = "📋 <b>Доступные аккаунты:</b>\n\n"
-    for i, acc in enumerate(account_pool.accounts, 1):
-        status = "🟢 Свободен" if not acc['in_use'] else "🔴 Используется"
-        validity = "🟢 Рабочий" if acc['is_valid'] else "🔴 Не рабочий"
-        flood = f"⏳ FloodWait до {acc['flood_wait_until']}" if acc.get('flood_wait_until') else ""
-        text += (
-            f"{i}. <code>{acc['session_file']}</code>\n"
-            f"   Статус: {status} | {validity} {flood}\n"
-            f"   Последнее использование: {acc['last_used'] or 'Никогда'}\n\n"
-        )
-    await message.answer(text)
-    return None
 
 @router.message(Command("start_scraping"))
 async def cmd_start_scraping(message: Message, state: FSMContext):
@@ -705,6 +726,154 @@ async def process_user_count(message: Message, state: FSMContext):
     await state.clear()
     return None
 
+# Новая команда для массовой рассылки
+@router.message(Command("bulk_mailing"))
+async def cmd_bulk_mailing(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    if not auth_manager.is_authorized(user_id):
+        return await message.answer("🚫 У вас нет прав для запуска рассылки.")
+    await message.answer(
+        "✉️ <b>Массовая рассылка</b>\n\n"
+        "Шаг 1/4\n"
+        "Отправьте список чатов/каналов, через пробел, запятую или с новой строки.\n"
+        "Формат: @chat1 @chat2 https://t.me/joinchat/xxxx"
+    )
+    await state.set_state(BulkMailStates.waiting_chats)
+
+@router.message(BulkMailStates.waiting_chats)
+async def bm_waiting_chats(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    parts = [p.strip() for p in raw.replace(',', ' ').split() if p.strip()]
+    if not parts:
+        return await message.answer("⚠️ Список чатов пуст. Пожалуйста, отправьте корректный список.")
+    await state.update_data(chats=parts)
+    await message.answer(
+        "⏱️ Шаг 2/4\n"
+        "Введите задержку между отправками в секундах в формате: <code>min max</code>\n"
+        "Пример: <code>10 20</code> (будет случайная задержка от 10 до 20 секунд)"
+    )
+    await state.set_state(BulkMailStates.waiting_delay)
+
+@router.message(BulkMailStates.waiting_delay)
+async def bm_waiting_delay(message: Message, state: FSMContext):
+    parts = message.text.strip().split()
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        dmin = int(parts[0])
+        dmax = int(parts[1])
+        if dmin < 0 or dmax < 0 or dmin > dmax:
+            raise ValueError
+    except ValueError:
+        return await message.answer("⚠️ Неверный формат. Введите две неотрицательные цифры: min max (min <= max).")
+    await state.update_data(delay_min=dmin, delay_max=dmax)
+    await message.answer(
+        "📝 Шаг 3/4\n"
+        "Отправьте текст сообщения, которое нужно разослать."
+    )
+    await state.set_state(BulkMailStates.waiting_text)
+
+@router.message(BulkMailStates.waiting_text)
+async def bm_waiting_text(message: Message, state: FSMContext):
+    text = message.text
+    if not text or not text.strip():
+        return await message.answer("⚠️ Сообщение не может быть пустым. Введите текст сообщения.")
+    await state.update_data(message_text=text)
+    accounts_list = account_pool.accounts
+    if not accounts_list:
+        await message.answer(
+            "🔢 Шаг 4/4\n"
+            "Нет доступных аккаунтов — рассылка будет выполняться автоматически из пула.\n"
+            "Введите общее количество отправок (целое число, например 100)."
+        )
+        await state.set_state(BulkMailStates.waiting_count)
+        return
+    lines = ["🧾 Выберите аккаунт-отправитель или введите 'auto' для автоматического распределения:"]
+    for i, acc in enumerate(accounts_list, 1):
+        status = "🔴" if acc['in_use'] else "🟢" if acc['is_valid'] else "⚫"
+        flood = f" ⏳ flood" if acc.get('flood_wait_until') else ""
+        lines.append(f"{i}. {acc['session_file']} {status}{flood}")
+    lines.append("\nВведите номер аккаунта (например 1) или 'auto':")
+    await message.answer("\n".join(lines))
+    await state.set_state(BulkMailStates.waiting_sender)
+
+@router.message(BulkMailStates.waiting_sender)
+async def bm_waiting_sender(message: Message, state: FSMContext):
+    text = message.text.strip().lower()
+    data = await state.get_data()
+    accounts = account_pool.accounts
+    if text == 'auto' or text == 'a':
+        await state.update_data(sender_session=None)
+        await message.answer(
+            "Автоматический режим выбран — рассылка будет распределяться по доступным аккаунтам.\n\n"
+            "Теперь введите общее количество отправок (целое число, например 100)."
+        )
+        await state.set_state(BulkMailStates.waiting_count)
+        return
+    try:
+        idx = int(text)
+        if idx < 1 or idx > len(accounts):
+            raise ValueError
+        chosen = accounts[idx - 1]['session_file']
+        await state.update_data(sender_session=chosen)
+        await message.answer(
+            f"Выбран аккаунт: <code>{chosen}</code>\n\n"
+            "Теперь введите общее количество отправок (целое число, например 100)."
+        )
+        await state.set_state(BulkMailStates.waiting_count)
+        return
+    except ValueError:
+        possible = text if text.endswith('.session') else f"{text}.session"
+        for acc in accounts:
+            if acc['session_file'] == possible:
+                await state.update_data(sender_session=acc['session_file'])
+                await message.answer(
+                    f"Выбран аккаунт: <code>{acc['session_file']}</code>\n\n"
+                    "Теперь введите общее количество отправок (целое число, например 100)."
+                )
+                await state.set_state(BulkMailStates.waiting_count)
+                return
+        await message.answer("⚠️ Неверный ввод. Введите номер аккаунта, имя файла сессии или 'auto'.")
+
+@router.message(BulkMailStates.waiting_count)
+async def bm_waiting_count(message: Message, state: FSMContext):
+    try:
+        total = int(message.text.strip())
+        if total <= 0:
+            raise ValueError
+    except ValueError:
+        return await message.answer("⚠️ Неверное число. Введите положительное целое количество отправок.")
+    data = await state.get_data()
+    chats = data.get('chats', [])
+    delay_min = data.get('delay_min', 1)
+    delay_max = data.get('delay_max', 1)
+    message_text = data.get('message_text', '')
+    sender_session = data.get('sender_session', None)  # может быть None (auto) или "account_xxx.session"
+    await task_queue.add_task(
+        bulk_mailing_task,
+        chats=chats,
+        delay_min=delay_min,
+        delay_max=delay_max,
+        message_text=message_text,
+        total_sends=total,
+        user_id=message.from_user.id,
+        sender_session_file=sender_session
+    )
+
+    safe_preview = html.escape((message_text[:200] + '...') if len(message_text) > 200 else message_text)
+    sender_info = f"• Отправитель: {sender_session}" if sender_session else "• Отправитель: авто (пул аккаунтов)"
+    await message.answer(
+        f"✅ <b>Задача массовой рассылки запущена!</b>\n\n"
+        f"• Чатов: {len(chats)}\n"
+        f"• Задержка: {delay_min}-{delay_max} сек\n"
+        f"{sender_info}\n"
+        f"• Текст сообщения: (показаны первые 200 символов)\n\n"
+        f"{safe_preview}\n\n"
+        f"• Всего отправок: {total}\n\n"
+        "Вы получите отчет по завершении."
+    )
+    await state.clear()
+
 @router.message(Command("task_stats"))
 async def cmd_task_stats(message: Message):
     stats = (
@@ -714,6 +883,35 @@ async def cmd_task_stats(message: Message):
         f"• Доступные аккаунты: {len([a for a in account_pool.accounts if not a['in_use'] and a['is_valid']])}/{len(account_pool.accounts)}"
     )
     await message.answer(stats)
+
+@router.message(Command("help"))
+async def cmd_help(message: Message):
+    text = (
+        "📚 <b>Руководство по использованию бота</b>\n\n"
+        "1. <b>Добавление аккаунтов</b> - используйте /add_account для добавления ваших аккаунтов Telegram\n"
+        "2. <b>Начать сбор</b> - используйте /start_scraping для начала сбора пользователей\n"
+        "3. <b>Приглашение пользователей</b> - собранные пользователи будут приглашены в вашу целевую группу\n\n"
+        "⚙️ <b>Как это работает:</b>\n"
+        "- Я анализирую сообщения в исходном чате\n"
+        "- Собираю активных пользователей\n"
+        "- Приглашаю их в вашу целевую группу\n\n"
+        "⚠️ <b>Безопасность:</b>\n"
+        "- Ваши другие сессии Telegram НЕ будут завершены\n"
+        "- Сессии надежно хранятся и никогда не передаются третьим лицам"
+    )
+    await message.answer(text)
+
+@router.message(Command("ref"))
+async def cmd_ref(message: Message):
+    text = (
+        "💸 <b>Зарабатывай с рефералкой:</b>\n\n"
+        "👥 <b>1 человек</b> = +200₽\n"
+        "👥 <b>3 человека</b> = +700₽\n"
+        "👥 <b>5 человек</b> = +1500₽\n"
+        "👥 <b>10 человек</b> = +4000₽\n\n"
+        "Чтобы реферал считался приведённым вами он должен при регистрации сообщить ваш юзернейм."
+    )
+    await message.answer(text)
 
 # --- Задачи ---
 invited_cache: Set[int] = set()
@@ -886,6 +1084,98 @@ async def invite_users(account, client: TelegramClient, user_ids: List[int], tar
         logger.error(f"Error inviting users: {str(e)}")
         raise
 
+async def bulk_mailing_task(chats: List[str], delay_min: int, delay_max: int, message_text: str, total_sends: int, user_id: int, sender_session_file: Optional[str] = None):
+    logger.info(f"Starting bulk mailing: chats={len(chats)} total_sends={total_sends} delay={delay_min}-{delay_max} sender={sender_session_file or 'auto'}")
+    sent = 0
+    per_chat_sent = {c: 0 for c in chats}
+    try:
+        if sender_session_file:
+            try:
+                async with account_pool.acquire_specific_account(sender_session_file) as account:
+                    client = account['client']
+                    for chat in chats:
+                        if sent >= total_sends:
+                            break
+                        try:
+                            target = await client.get_entity(chat)
+                            await client.send_message(target, message_text)
+                            sent += 1
+                            per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
+                            logger.info(f"Sent #{sent} to {chat} using {account['session_file']}")
+                            await asyncio.sleep(random.randint(delay_min, delay_max))
+                        except (FloodWaitError, FloodError) as e:
+                            wait_seconds = getattr(e, "seconds", None) or (int(str(e)) if str(e).isdigit() else 60)
+                            account['flood_wait_until'] = datetime.now() + timedelta(seconds=wait_seconds + 10)
+                            logger.warning(f"Flood on {account['session_file']}, wait {wait_seconds}s")
+                            await asyncio.sleep(wait_seconds + 10)
+                            break
+                        except AuthKeyUnregisteredError:
+                            account['is_valid'] = False
+                            logger.error(f"Session invalid: {account['session_file']}")
+                            break
+                        except Exception as e:
+                            logger.error(f"Error sending to {chat}: {e}")
+                            await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"Ошибка при использовании указанного аккаунта: {e}")
+                await notify_user(user_id, f"❌ Ошибка использования аккаунта-отправителя: {e}\nЗадача отменена.")
+                return
+        else:
+            while sent < total_sends:
+                async with account_pool.acquire_account() as account:
+                    client = account['client']
+                    for chat in chats:
+                        if sent >= total_sends:
+                            break
+                        try:
+                            target = await client.get_entity(chat)
+                            await client.send_message(target, message_text)
+                            sent += 1
+                            per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
+                            logger.info(f"Sent #{sent} to {chat} using {account['session_file']}")
+                            await asyncio.sleep(random.randint(delay_min, delay_max))
+                        except (FloodWaitError, FloodError) as e:
+                            wait_seconds = getattr(e, "seconds", None) or (int(str(e)) if str(e).isdigit() else 60)
+                            account['flood_wait_until'] = datetime.now() + timedelta(seconds=wait_seconds + 10)
+                            logger.warning(f"Flood on {account['session_file']}, wait {wait_seconds}s")
+                            await asyncio.sleep(wait_seconds + 10)
+                            break
+                        except AuthKeyUnregisteredError:
+                            account['is_valid'] = False
+                            logger.error(f"Session invalid: {account['session_file']}")
+                            break
+                        except Exception as e:
+                            logger.error(f"Error sending to {chat}: {e}")
+                            await asyncio.sleep(1)
+                    await asyncio.sleep(1)
+
+        report_lines = [
+            "📬 <b>Массовая рассылка завершена!</b>",
+            f"• Всего отправлено: {sent}",
+            "• Отправлено по чатам:"
+        ]
+        for c, cnt in per_chat_sent.items():
+            report_lines.append(f"  - {c}: {cnt}")
+        await notify_user(user_id, "\n".join(report_lines))
+    except Exception as e:
+        logger.exception("Bulk mailing task failed")
+        await notify_user(user_id, f"🔥 <b>Задача рассылки не выполнена!</b>\n\nОшибка: {e}")
+
+async def safe_send_message(bot: Bot, user_id: int, message: str):
+    try:
+        await bot.send_message(user_id, message, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest as e:
+        logger.warning(f"HTML parse error for user {user_id}: {e}. Trying escaped HTML then plain text.")
+        try:
+            await bot.send_message(user_id, html.escape(message), parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await bot.send_message(user_id, message)
+            except Exception as e2:
+                logger.error(f"Ошибка отправки plain message {user_id}: {e2}")
+    except Exception as e:
+        logger.error(f"Ошибка отправки сообщения {user_id}: {str(e)}")
+
 # --- Запуск ---
 
 async def main():
@@ -937,5 +1227,4 @@ async def main():
         logger.info("All accounts released. Bot shutdown complete.")
 
 if __name__ == "__main__":
-
     asyncio.run(main())
