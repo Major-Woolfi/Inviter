@@ -40,10 +40,10 @@ logger = logging.getLogger(__name__)
 
 # --- Конфиг ---
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN") # Замените на ваш токен бота
-    API_ID: int = int(os.getenv("API_ID", YOUR_API_ID)) # Замените на ваш API_ID
-    API_HASH: str = os.getenv("API_HASH", "YOUR_API_HASH") # Замените на ваш API_HASH
-    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "YOUR_ADMIN_USER_IDS").split(",")] # Замените на ID администраторов через запятую
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8156204303:AAGYs2PQg3fuz7hmQ7e1QIOGa0da_qFdw9M")
+    API_ID: int = int(os.getenv("API_ID", 24718107))
+    API_HASH: str = os.getenv("API_HASH", "1ebce04a58cb4078483907f42aee6bb2")
+    ADMIN_USER_IDS: List[int] = [int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "5225159977, 5169476688").split(",")]
     MAX_CONCURRENT_TASKS: int = int(os.getenv("MAX_CONCURRENT_TASKS", 10))
     SESSIONS_DIR: str = os.getenv("SESSIONS_DIR", "sessions")
     DATA_DIR: str = os.getenv("DATA_DIR", "data")
@@ -56,6 +56,15 @@ os.makedirs(Config.DATA_DIR, exist_ok=True)
 async def safe_send_message(bot: Bot, user_id: int, message: str):
     try:
         await bot.send_message(user_id, message, parse_mode=ParseMode.HTML)
+    except TelegramBadRequest as e:
+        logger.warning(f"HTML parse error for user {user_id}: {e}. Trying escaped HTML then plain text.")
+        try:
+            await bot.send_message(user_id, html.escape(message), parse_mode=ParseMode.HTML)
+        except Exception:
+            try:
+                await bot.send_message(user_id, message)
+            except Exception as e2:
+                logger.error(f"Ошибка отправки plain message {user_id}: {e2}")
     except Exception as e:
         logger.error(f"Ошибка отправки сообщения {user_id}: {str(e)}")
 
@@ -590,7 +599,6 @@ async def cmd_list_accounts(message: Message):
             f"   Последнее использование: {acc['last_used'] or 'Никогда'}\n\n"
         )
     await message.answer(text)
-    return None
 
 @router.message(Command("genkey"))
 async def cmd_genkey(message: Message, state: FSMContext):
@@ -601,7 +609,6 @@ async def cmd_genkey(message: Message, state: FSMContext):
         "Пожалуйста, введите ID пользователя, для которого нужно сгенерировать ключ:"
     )
     await state.set_state(KeyGeneration.waiting_user_id)
-    return None
 
 @router.message(KeyGeneration.waiting_user_id)
 async def process_user_id(message: Message, state: FSMContext):
@@ -627,7 +634,6 @@ async def cmd_start_scraping(message: Message, state: FSMContext):
         "Отправьте @username или пригласительную ссылку чата/канала, из которого нужно собрать пользователей:"
     )
     await state.set_state(ScrapingStates.waiting_source)
-    return None
 
 @router.message(ScrapingStates.waiting_source)
 async def process_source(message: Message, state: FSMContext):
@@ -696,7 +702,6 @@ async def process_limit(message: Message, state: FSMContext):
         "Вы получите отчет по завершении."
     )
     await state.clear()
-    return None
 
 @router.message(ScrapingStates.waiting_user_count)
 async def process_user_count(message: Message, state: FSMContext):
@@ -724,19 +729,14 @@ async def process_user_count(message: Message, state: FSMContext):
         "Вы получите отчет по завершении."
     )
     await state.clear()
-    return None
 
-# Новая команда для массовой рассылки
 @router.message(Command("bulk_mailing"))
 async def cmd_bulk_mailing(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    if not auth_manager.is_authorized(user_id):
-        return await message.answer("🚫 У вас нет прав для запуска рассылки.")
     await message.answer(
         "✉️ <b>Массовая рассылка</b>\n\n"
         "Шаг 1/4\n"
         "Отправьте список чатов/каналов, через пробел, запятую или с новой строки.\n"
-        "Формат: @chat1 @chat2 https://t.me/joinchat/xxxx"
+        "Формат: @chat1 @chat2 https://t.me/xxxx"
     )
     await state.set_state(BulkMailStates.waiting_chats)
 
@@ -848,7 +848,7 @@ async def bm_waiting_count(message: Message, state: FSMContext):
     delay_min = data.get('delay_min', 1)
     delay_max = data.get('delay_max', 1)
     message_text = data.get('message_text', '')
-    sender_session = data.get('sender_session', None)  # может быть None (auto) или "account_xxx.session"
+    sender_session = data.get('sender_session', None)
     await task_queue.add_task(
         bulk_mailing_task,
         chats=chats,
@@ -1033,7 +1033,7 @@ async def invite_users(account, client: TelegramClient, user_ids: List[int], tar
     results = {'success': 0, 'failed': 0, 'privacy_errors': 0, 'already_members': 0}
     try:
         target = await client.get_entity(target_entity)
-        if not hasattr(account, 'participants_cache'):
+        if 'participants_cache' not in account:
             current_participants = set()
             async for user in client.iter_participants(target):
                 current_participants.add(user.id)
@@ -1088,66 +1088,67 @@ async def bulk_mailing_task(chats: List[str], delay_min: int, delay_max: int, me
     logger.info(f"Starting bulk mailing: chats={len(chats)} total_sends={total_sends} delay={delay_min}-{delay_max} sender={sender_session_file or 'auto'}")
     sent = 0
     per_chat_sent = {c: 0 for c in chats}
+    idx = 0
     try:
         if sender_session_file:
             try:
                 async with account_pool.acquire_specific_account(sender_session_file) as account:
                     client = account['client']
-                    for chat in chats:
-                        if sent >= total_sends:
-                            break
+                    while sent < total_sends:
+                        chat = chats[idx % len(chats)]
                         try:
                             target = await client.get_entity(chat)
                             await client.send_message(target, message_text)
                             sent += 1
                             per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
                             logger.info(f"Sent #{sent} to {chat} using {account['session_file']}")
+                            idx += 1
                             await asyncio.sleep(random.randint(delay_min, delay_max))
                         except (FloodWaitError, FloodError) as e:
-                            wait_seconds = getattr(e, "seconds", None) or (int(str(e)) if str(e).isdigit() else 60)
+                            wait_seconds = getattr(e, 'seconds', None) or 60
                             account['flood_wait_until'] = datetime.now() + timedelta(seconds=wait_seconds + 10)
                             logger.warning(f"Flood on {account['session_file']}, wait {wait_seconds}s")
-                            await asyncio.sleep(wait_seconds + 10)
-                            break
+                            raise
                         except AuthKeyUnregisteredError:
                             account['is_valid'] = False
                             logger.error(f"Session invalid: {account['session_file']}")
-                            break
+                            raise
                         except Exception as e:
-                            logger.error(f"Error sending to {chat}: {e}")
+                            logger.error(f"Error sending to {chat} with specific account: {e}")
                             await asyncio.sleep(1)
             except Exception as e:
-                logger.error(f"Ошибка при использовании указанного аккаунта: {e}")
-                await notify_user(user_id, f"❌ Ошибка использования аккаунта-отправителя: {e}\nЗадача отменена.")
-                return
-        else:
-            while sent < total_sends:
-                async with account_pool.acquire_account() as account:
-                    client = account['client']
-                    for chat in chats:
-                        if sent >= total_sends:
-                            break
-                        try:
-                            target = await client.get_entity(chat)
-                            await client.send_message(target, message_text)
-                            sent += 1
-                            per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
-                            logger.info(f"Sent #{sent} to {chat} using {account['session_file']}")
-                            await asyncio.sleep(random.randint(delay_min, delay_max))
-                        except (FloodWaitError, FloodError) as e:
-                            wait_seconds = getattr(e, "seconds", None) or (int(str(e)) if str(e).isdigit() else 60)
-                            account['flood_wait_until'] = datetime.now() + timedelta(seconds=wait_seconds + 10)
-                            logger.warning(f"Flood on {account['session_file']}, wait {wait_seconds}s")
-                            await asyncio.sleep(wait_seconds + 10)
-                            break
-                        except AuthKeyUnregisteredError:
-                            account['is_valid'] = False
-                            logger.error(f"Session invalid: {account['session_file']}")
-                            break
-                        except Exception as e:
-                            logger.error(f"Error sending to {chat}: {e}")
-                            await asyncio.sleep(1)
-                    await asyncio.sleep(1)
+                logger.error(f"Error with specific account: {e}, switching to auto mode")
+                try:
+                    await notify_user(user_id, f"⚠️ Ошибка с указанным аккаунтом: {e}\nПереключаюсь на автоматический режим для оставшихся отправок.")
+                except Exception:
+                    pass
+
+        while sent < total_sends:
+            async with account_pool.acquire_account() as account:
+                client = account['client']
+                while sent < total_sends:
+                    chat = chats[idx % len(chats)]
+                    try:
+                        target = await client.get_entity(chat)
+                        await client.send_message(target, message_text)
+                        sent += 1
+                        per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
+                        logger.info(f"Sent #{sent} to {chat} using {account['session_file']}")
+                        idx += 1
+                        await asyncio.sleep(random.randint(delay_min, delay_max))
+                    except (FloodWaitError, FloodError) as e:
+                        wait_seconds = getattr(e, 'seconds', None) or 60
+                        account['flood_wait_until'] = datetime.now() + timedelta(seconds=wait_seconds + 10)
+                        logger.warning(f"Flood on {account['session_file']}, wait {wait_seconds}s")
+                        break
+                    except AuthKeyUnregisteredError:
+                        account['is_valid'] = False
+                        logger.error(f"Session invalid: {account['session_file']}")
+                        break
+                    except Exception as e:
+                        logger.error(f"Error sending to {chat}: {e}")
+                        await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
         report_lines = [
             "📬 <b>Массовая рассылка завершена!</b>",
@@ -1160,21 +1161,6 @@ async def bulk_mailing_task(chats: List[str], delay_min: int, delay_max: int, me
     except Exception as e:
         logger.exception("Bulk mailing task failed")
         await notify_user(user_id, f"🔥 <b>Задача рассылки не выполнена!</b>\n\nОшибка: {e}")
-
-async def safe_send_message(bot: Bot, user_id: int, message: str):
-    try:
-        await bot.send_message(user_id, message, parse_mode=ParseMode.HTML)
-    except TelegramBadRequest as e:
-        logger.warning(f"HTML parse error for user {user_id}: {e}. Trying escaped HTML then plain text.")
-        try:
-            await bot.send_message(user_id, html.escape(message), parse_mode=ParseMode.HTML)
-        except Exception:
-            try:
-                await bot.send_message(user_id, message)
-            except Exception as e2:
-                logger.error(f"Ошибка отправки plain message {user_id}: {e2}")
-    except Exception as e:
-        logger.error(f"Ошибка отправки сообщения {user_id}: {str(e)}")
 
 # --- Запуск ---
 
