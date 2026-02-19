@@ -5,6 +5,8 @@ cd /root/bots/Inviter_bot/
 cat > requirements.txt << EOF
 aiogram
 telethon
+aiofiles
+aiosqlite
 python-dotenv
 EOF
 
