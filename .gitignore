@@ -1,13 +1,6 @@
 .env
-.env.*
 *.session
 sessions/
 data/
 logs/
 __pycache__/
-*.pyc
-*.log
-.venv/
-venv/
-.vscode/
-.idea/
