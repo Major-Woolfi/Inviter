@@ -186,7 +186,6 @@ async def smart_answer(
 async def update_message(
     bot: Bot, chat_id: int, message_id: int, text: str, reply_markup=None
 ) -> bool:
-    """Авто-обновление сообщения без создания нового"""
     try:
         await bot.edit_message_text(
             text,
@@ -219,7 +218,6 @@ def create_telegram_client(session_string: Optional[str] = None) -> TelegramClie
 
 
 def format_progress_bar(percentage: float, length: int = 15) -> str:
-    """Создает красивый прогресс-бар с эмодзи"""
     filled = int(length * percentage / 100)
     bar = "🟩" * filled + "⬜" * (length - filled)
     return f"{bar} {percentage:.1f}%"
@@ -231,7 +229,6 @@ cache_lock = asyncio.Lock()
 
 
 async def get_cached_entity(client: TelegramClient, user_id: int) -> Optional[Any]:
-    """Кэширование сущностей для ускорения работы"""
     async with cache_lock:
         if user_id in entity_cache:
             return entity_cache[user_id]
@@ -246,7 +243,6 @@ async def get_cached_entity(client: TelegramClient, user_id: int) -> Optional[An
 
 
 async def clear_entity_cache():
-    """Очистка кэша сущностей"""
     async with cache_lock:
         count = len(entity_cache)
         entity_cache.clear()
@@ -505,11 +501,9 @@ class AccountPoolManager:
         self._health_check_task = None
 
     async def start_health_check(self):
-        """Запускает фоновый health-check для аккаунтов"""
         self._health_check_task = asyncio.create_task(self._periodic_health_check())
 
     async def stop_health_check(self):
-        """Останавливает health-check"""
         if self._health_check_task:
             self._health_check_task.cancel()
             try:
@@ -518,7 +512,6 @@ class AccountPoolManager:
                 pass
 
     async def _periodic_health_check(self):
-        """Периодическая проверка аккаунтов"""
         while True:
             try:
                 await asyncio.sleep(Config.HEALTH_CHECK_INTERVAL)
@@ -529,7 +522,6 @@ class AccountPoolManager:
                 logger.error(f"Health check error: {e}")
 
     async def _check_all_accounts(self):
-        """Проверка всех аккаунтов"""
         async with self.lock:
             for acc in self.accounts:
                 if not acc["in_use"]:
@@ -577,12 +569,10 @@ class AccountPoolManager:
                     logger.error(f"Error loading session {filename}: {e}")
 
     async def _reset_account_errors(self, acc: Dict):
-        """Сбрасывает счётчик ошибок"""
         acc["error_count"] = 0
         acc["invite_count"] = 0
 
     async def _handle_flood_wait(self, acc: Dict, wait_time: float):
-        """Обрабатывает FloodWait с увеличенным временем ожидания"""
         extended_wait = wait_time * Config.FLOOD_WAIT_MULTIPLIER
         acc["flood_wait_until"] = datetime.now() + timedelta(seconds=extended_wait)
         logger.warning(
@@ -590,7 +580,6 @@ class AccountPoolManager:
         )
 
     async def _check_account_flood(self, acc: Dict) -> bool:
-        """Проверяет, не в flood wait ли аккаунт"""
         if acc.get("flood_wait_until"):
             if acc["flood_wait_until"] > datetime.now():
                 remaining = (acc["flood_wait_until"] - datetime.now()).total_seconds()
@@ -603,7 +592,6 @@ class AccountPoolManager:
         return True
 
     async def _check_account_rate_limit(self, acc: Dict) -> bool:
-        """Проверяет rate limit аккаунта"""
         if acc.get("last_used"):
             elapsed = (datetime.now() - acc["last_used"]).total_seconds()
             if elapsed < Config.MIN_INVITE_DELAY:
@@ -614,7 +602,6 @@ class AccountPoolManager:
         return True
 
     async def _detect_bot_user(self, user: Any) -> bool:
-        """Определяет, является ли пользователь ботом"""
         if hasattr(user, "bot") and user.bot:
             return True
         if hasattr(user, "is_bot") and user.is_bot:
@@ -624,7 +611,6 @@ class AccountPoolManager:
     async def _safe_get_user(
         self, client: TelegramClient, user_id: int
     ) -> Optional[Any]:
-        """Безопасно получает пользователя с retry logic"""
         for attempt in range(Config.MAX_RETRIES):
             try:
                 return await client.get_entity(user_id)
@@ -654,7 +640,6 @@ class AccountPoolManager:
     async def _safe_invite(
         self, client: TelegramClient, chat_id: str, user_id: int
     ) -> bool:
-        """Безопасно приглашает пользователя с retry и анти-бан механизмами"""
         for attempt in range(Config.MAX_RETRIES):
             try:
                 await client(
@@ -700,7 +685,6 @@ class AccountPoolManager:
     async def _random_delay(
         self, min_delay: Optional[int] = None, max_delay: Optional[int] = None
     ):
-        """Случайная задержка для имитации человеческого поведения"""
         delay = random.uniform(
             min_delay or Config.MIN_INVITE_DELAY, max_delay or Config.MAX_INVITE_DELAY
         )
@@ -708,20 +692,15 @@ class AccountPoolManager:
         await asyncio.sleep(delay)
 
     async def human_delay(self):
-        """Генерация человеческого паттерна поведения"""
-        # 80% обычный интервал, 20% "перерыв на кофе"
         if random.random() < 0.8:
             await self._random_delay()
         else:
-            # "Перерыв" 5-15 минут
             break_time = random.uniform(300, 900)
             logger.info(f"☕ Human break: {break_time:.0f}s")
             await asyncio.sleep(break_time)
 
     async def simulate_activity(self, client: TelegramClient):
-        """Эмуляция активности аккаунта для защиты от detection"""
         try:
-            # Чтение сообщений из диалогов
             dialogs = await client.get_dialogs()
             if dialogs:
                 sample = random.sample(dialogs, min(5, len(dialogs)))
@@ -749,18 +728,14 @@ class AccountPoolManager:
         try:
             async with self.lock:
                 now = datetime.now()
-                # Сортировка по последнему использованию (round-robin)
                 self.accounts.sort(key=lambda x: x["last_used"] or datetime.min)
 
                 for acc in self.accounts:
                     if not acc["in_use"] and acc["is_valid"]:
-                        # Проверка flood wait
                         if not await self._check_account_flood(acc):
                             continue
-                        # Проверка rate limit
                         if not await self._check_account_rate_limit(acc):
                             continue
-                        # Проверка лимита инвайтов
                         if acc.get("invite_count", 0) >= Config.MAX_ACCOUNTS_PER_TASK:
                             await self._reset_account_errors(acc)
 
@@ -892,7 +867,6 @@ class TaskQueueManager:
             self._worker_tasks.append(task)
 
     async def stop_workers(self):
-        """Останавливает всех воркеров"""
         for task in self._worker_tasks:
             task.cancel()
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
@@ -1021,10 +995,6 @@ class BulkMailStates(StatesGroup):
     waiting_text = State()
     waiting_sender = State()
     waiting_count = State()
-
-
-class ClearCacheStates(StatesGroup):
-    waiting_confirmation = State()
 
 
 # --- Инициализация объектов ---
@@ -1596,7 +1566,6 @@ async def ask_for_account(event, state: FSMContext):
         return
 
     if len(accounts_list) == 1:
-        # Авто-выбор единственного аккаунта
         await state.update_data(sender_session=accounts_list[0]["session_file"])
         await smart_answer(
             event,
@@ -1991,7 +1960,6 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
 async def show_task_details(
     bot: Bot, user_id: int, task: Dict[str, Any], for_admin: bool = False
 ):
-    """Показывает детали задачи в отдельном сообщении (как в VPN-боте)"""
     task_id = task.get("task_id", "unknown")
     task_type = task.get("type", "unknown")
     status = task.get("status", "unknown")
@@ -1999,7 +1967,6 @@ async def show_task_details(
     progress = task.get("progress", 0)
     progress_text = task.get("progress_text", "0/0")
 
-    # Иконки статусов
     status_icons = {
         "pending": "⏳",
         "running": "🔄",
@@ -2015,7 +1982,6 @@ async def show_task_details(
     except Exception:
         time_str = created
 
-    # Прогресс-бар
     progress_bar = format_progress_bar(progress)
 
     text = f"{icon} <b>Задача ID:</b> <code>{task_id}</code>\n"
@@ -2096,7 +2062,6 @@ async def show_task_details(
         [{"text": "🔄 Обновить", "callback_data": f"refresh_task:{task_id}"}]
     )
 
-    # Для администратора - информация о пользователе
     if for_admin:
         task_user_id = task.get("user_id")
         keyboard.append(
@@ -2139,7 +2104,6 @@ async def cmd_my_tasks(event: CallbackQuery):
         )
         return
 
-    # Разделяем задачи на активные и неактивные
     active_tasks = [
         t for t in user_tasks if t.get("status") in ["pending", "running", "paused"]
     ]
@@ -2147,9 +2111,8 @@ async def cmd_my_tasks(event: CallbackQuery):
         t for t in user_tasks if t.get("status") not in ["pending", "running", "paused"]
     ]
 
-    # Сначала показываем активные задачи
     if active_tasks:
-        for task in active_tasks[-5:]:  # Последние 5 активных задач
+        for task in active_tasks[-5:]:
             text, keyboard = await show_task_details(
                 bot, user_id, task, for_admin=False
             )
@@ -2167,7 +2130,6 @@ async def cmd_my_tasks(event: CallbackQuery):
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
 
-    # Показываем неактивные задачи списком (если есть)
     if inactive_tasks:
         text = "📁 <b>Завершенные задачи:</b>\n\n"
         for i, task in enumerate(inactive_tasks[-10:], 1):
@@ -2228,8 +2190,7 @@ async def cmd_task_list(event: CallbackQuery):
         )
         return
 
-    # Показываем каждую активную задачу в отдельном сообщении
-    for task in active_tasks[-10:]:  # Последние 10 активных задач
+    for task in active_tasks[-10:]:
         text, keyboard = await show_task_details(bot, user_id, task, for_admin=True)
         await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
 
@@ -2317,14 +2278,12 @@ async def process_cancel_task(event: CallbackQuery):
     user_id = event.from_user.id
     task_user_id = task_data.get("user_id")
 
-    # Проверяем права
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
         await smart_answer(
             event, bot, "❌ У вас нет прав для отмены этой задачи", show_alert=True
         )
         return
 
-    # Обновляем статус задачи
     await tasks_storage.update_by_id(
         task_id,
         {
@@ -2335,13 +2294,10 @@ async def process_cancel_task(event: CallbackQuery):
         id_field="task_id",
     )
 
-    # Пытаемся отменить задачу в очереди
     cancelled = await task_queue.cancel_task(task_id)
 
-    # Удаляем задачу из пользовательских
     task_queue.remove_user_task(task_user_id, task_id)
 
-    # Уведомляем пользователя
     if user_id == task_user_id:
         await notify_user(bot, user_id, f"✅ Ваша задача {task_id} отменена!")
     else:
@@ -2354,7 +2310,6 @@ async def process_cancel_task(event: CallbackQuery):
 
     await smart_answer(event, bot, f"✅ Задача {task_id} отменена!", show_alert=True)
 
-    # Обновляем отображение задачи
     task_data["status"] = "cancelled"
     text, keyboard = await show_task_details(
         bot, user_id, task_data, for_admin=(user_id in Config.ADMIN_USER_IDS)
@@ -2532,7 +2487,6 @@ async def ensure_join_target(
                     raise
         entity = await client.get_entity(target)
         logger.info(f"Account {account['session_file']} joined {target}")
-        # сохраняем joined chat в задачу
         try:
             task = await tasks_storage.find_by_id(task_id, id_field="task_id")
             if task is not None:
@@ -2589,13 +2543,11 @@ async def get_active_users(
 ) -> List[int]:
     logger.info(f"Collecting users from: {source_entity}")
     users: Set[int] = set()
-    # Попробуем взять из кэша, если ранее уже собирали этот чат
     cached_source = await cache_manager.get_cached_participants(source_entity)
     try:
         entity = await client.get_entity(source_entity)
         processed = 0
 
-        # Асинхронный сбор с параллельной обработкой
         messages_buffer = []
         batch_size = 100
 
@@ -2615,7 +2567,6 @@ async def get_active_users(
             messages_buffer.append(message)
             processed += 1
 
-            # Периодическое обновление прогресса
             if processed % batch_size == 0:
                 progress = min(95, (processed / max(1, limit)) * 100)
                 progress_text = format_progress_bar(progress)
@@ -2638,7 +2589,6 @@ async def get_active_users(
                 break
 
         logger.info(f"Collected {len(users)} users from {source_entity}")
-        # Кэшируем собранных (для повторного использования при отсутствии прав в будущем)
         try:
             await cache_manager.cache_participants(source_entity, list(users))
         except Exception as e:
@@ -2678,9 +2628,8 @@ async def invite_users(
     total_users = len(user_ids)
     processed = 0
     invite_buffer = []
-    buffer_size = 10  # Буферизация инвайтов
+    buffer_size = 10
 
-    # Защита от детекта: 5% шанс пропустить пользователя (имитация ошибки)
     def should_skip_user():
         return random.random() < 0.05
 
@@ -2716,7 +2665,6 @@ async def invite_users(
 
             await control.pause_event.wait()
 
-            # Проверка на уже приглашённых
             if (
                 await cache_manager.is_invited(target_entity, current_user_id)
                 or current_user_id in current_participants
@@ -2726,7 +2674,6 @@ async def invite_users(
                 idx += 1
                 continue
 
-            # Защита от детекта: случайный пропуск
             if should_skip_user():
                 logger.info(
                     f"🎭 Simulating human error - skipping user {current_user_id}"
@@ -2736,12 +2683,10 @@ async def invite_users(
                 await asyncio.sleep(random.uniform(10, 30))
                 continue
 
-            # Человеческий паттерн между инвайтами
             if processed > 0 and processed % 5 == 0:
                 await account_pool.human_delay()
 
             try:
-                # Используем кэшированные сущности
                 user_entity = await get_cached_entity(client, current_user_id)
                 if not user_entity:
                     results["failed"] += 1
@@ -2749,17 +2694,14 @@ async def invite_users(
                     idx += 1
                     continue
 
-                # Проверка на бота
                 if await account_pool._detect_bot_user(user_entity):
                     logger.info(f"User {current_user_id} is a bot - skipping")
                     processed += 1
                     idx += 1
                     continue
 
-                # Буферизация инвайтов
                 invite_buffer.append(current_user_id)
 
-                # Отправка буфера
                 if len(invite_buffer) >= buffer_size:
                     for uid in invite_buffer:
                         try:
@@ -2797,7 +2739,6 @@ async def invite_users(
                             logger.error(f"Invite error for {uid}: {e}")
 
                     invite_buffer = []
-                    # Задержка после буфера
                     await asyncio.sleep(random.uniform(30, 60))
 
                 processed += 1
@@ -2843,7 +2784,6 @@ async def invite_users(
                     {"status": "running", "flood_wait": None},
                     id_field="task_id",
                 )
-                # Повторить текущего пользователя после паузы
                 continue
             except AuthKeyUnregisteredError:
                 account["is_valid"] = False
@@ -2856,7 +2796,6 @@ async def invite_users(
                 idx += 1
                 logger.error(f"Invite error for {current_user_id}: {e}")
 
-            # Обновление прогресса
             if processed % 20 == 0 or processed == total_users:
                 progress = (processed / max(1, total_users)) * 100
                 await tasks_storage.update_by_id(
@@ -2874,7 +2813,6 @@ async def invite_users(
                     id_field="task_id",
                 )
 
-        # Отправка оставшегося буфера
         if invite_buffer:
             for uid in invite_buffer:
                 try:
@@ -3340,7 +3278,6 @@ async def bulk_mailing_task(
 
                     chat = chats[next_chat_idx % len(chats)]
                     try:
-                        # Безопасно получаем сущность чата
                         target = (
                             await account_pool._safe_get_user(client, chat)
                             if isinstance(chat, int)
@@ -3349,15 +3286,11 @@ async def bulk_mailing_task(
                         if isinstance(chat, str):
                             target = await client.get_entity(chat)
 
-                        # Анти-блокировочная задержка
                         if sent > 0:
-                            delay = random.uniform(
-                                delay_min + 5, delay_max + 10  # Добавляем буфер
-                            )
+                            delay = random.uniform(delay_min + 5, delay_max + 10)
                             logger.info(f"Mailing delay: {delay:.1f}s")
                             await asyncio.sleep(delay)
 
-                        # Безопасная отправка с retry
                         for attempt in range(Config.MAX_RETRIES):
                             try:
                                 await client.send_message(target, message_text)
@@ -3385,7 +3318,6 @@ async def bulk_mailing_task(
                         per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
                         next_chat_idx += 1
 
-                        # Обновление прогресса каждые 10 отправок
                         if sent % 10 == 0 or sent == total_sends:
                             progress = (sent / max(1, total_sends)) * 100
                             await tasks_storage.update_by_id(
@@ -3585,6 +3517,91 @@ async def queue_task_from_storage(task: Dict[str, Any], resume: bool = False):
         control.pause_event.set()
 
 
+@router.callback_query(F.data.startswith("user_info:"))
+async def cmd_user_info(event: CallbackQuery):
+    if event.from_user.id not in Config.ADMIN_USER_IDS:
+        await smart_answer(
+            event, bot, "⛔ Доступ только для администраторов!", show_alert=True
+        )
+        return
+
+    target_user_id = int(event.data.split(":", 1)[1])
+    tasks = await tasks_storage.read_all()
+    user_tasks_list = [t for t in tasks if t.get("user_id") == target_user_id]
+
+    total_tasks = len(user_tasks_list)
+    completed = len([t for t in user_tasks_list if t.get("status") == "completed"])
+    failed = len([t for t in user_tasks_list if t.get("status") == "failed"])
+    cancelled = len([t for t in user_tasks_list if t.get("status") == "cancelled"])
+    running = len(
+        [
+            t
+            for t in user_tasks_list
+            if t.get("status") in ["pending", "running", "paused"]
+        ]
+    )
+
+    text = (
+        f"👤 <b>Информация о пользователе</b>\n\n"
+        f"• ID: <code>{target_user_id}</code>\n"
+        f"• Всего задач: {total_tasks}\n"
+        f"• ✅ Завершено: {completed}\n"
+        f"• ❌ Ошибок: {failed}\n"
+        f"• ⏸️ В работе: {running}\n"
+        f"• 🚫 Отменено: {cancelled}"
+    )
+    keyboard = [
+        [
+            {
+                "text": "📋 Все задачи",
+                "callback_data": f"user_tasks:{target_user_id}",
+            }
+        ],
+        [{"text": "🔙 Назад", "callback_data": "task_list"}],
+    ]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(F.data.startswith("user_tasks:"))
+async def cmd_user_tasks(event: CallbackQuery):
+    if event.from_user.id not in Config.ADMIN_USER_IDS:
+        await smart_answer(
+            event, bot, "⛔ Доступ только для администраторов!", show_alert=True
+        )
+        return
+
+    target_user_id = int(event.data.split(":", 1)[1])
+    tasks = await tasks_storage.read_all()
+    user_tasks_list = [t for t in tasks if t.get("user_id") == target_user_id]
+
+    if not user_tasks_list:
+        text = f"📭 У пользователя <code>{target_user_id}</code> нет задач."
+        keyboard = [[{"text": "🔙 Назад", "callback_data": "task_list"}]]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+        return
+
+    for task in user_tasks_list[-10:]:
+        text, keyboard = await show_task_details(
+            bot, target_user_id, task, for_admin=True
+        )
+        await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
+
+
+@router.callback_query(F.data.startswith("copy_ref:"))
+async def cmd_copy_ref(event: CallbackQuery):
+    ref_key = event.data.split(":", 1)[1]
+    bot_username = (
+        Config.BOT_TOKEN.split(":")[0].replace("_bot", "").replace("_Bot", "")
+    )
+    ref_link = f"https://t.me/{bot_username}?start=ref_{ref_key}"
+
+    text = f"📋 Ваша реферальная ссылка:\n\n<code>{ref_link}</code>\n\n📌 Нажмите на ссылку и выберите 'Копировать'"
+    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
 # --- Фоновые задачи ---
 async def restore_tasks_on_startup():
     tasks = await tasks_storage.read_all()
@@ -3613,14 +3630,11 @@ async def restore_tasks_on_startup():
         elif status == "pending" and task_user_id:
             task_queue.add_user_task(task_user_id, task_id)
 
-        # Paused задачи оставляем до ручного возобновления
-
 
 async def cleanup_entity_cache():
-    """Фоновая очистка кэша сущностей каждые 30 минут"""
     while True:
         try:
-            await asyncio.sleep(1800)  # 30 минут
+            await asyncio.sleep(1800)
             await clear_entity_cache()
         except asyncio.CancelledError:
             break
@@ -3630,10 +3644,9 @@ async def cleanup_entity_cache():
 
 
 async def simulate_account_activity():
-    """Фоновая эмуляция активности аккаунтов"""
     while True:
         try:
-            await asyncio.sleep(3600)  # Каждый час
+            await asyncio.sleep(3600)
 
             async with account_pool.lock:
                 for acc in account_pool.accounts:
@@ -3653,7 +3666,6 @@ async def simulate_account_activity():
 
 
 async def cleanup_old_tasks():
-    """Очистка старых задач из хранилища"""
     while True:
         try:
             tasks = await tasks_storage.read_all()
