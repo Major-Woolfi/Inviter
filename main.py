@@ -4,12 +4,16 @@ import json
 import logging
 import os
 import random
+import re
 import secrets
+import signal
 import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable, TypeVar
 
 import aiofiles
 import aiosqlite
@@ -45,25 +49,103 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
 
-# --- Логирование ---
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+# === Типы ===
+T = TypeVar("T")
+JSONValue = Union[
+    str, int, float, bool, None, List["JsonValue"], Dict[str, "JsonValue"]
+]
+JsonValue = Dict[str, JSONValue]
 
-LOG_DIR = os.path.join(BASE_DIR, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(
-            os.path.join(LOG_DIR, f"{datetime.now().strftime('%Y-%m-%d')}.log"),
-            encoding="utf-8",
-        ),
-    ],
-)
-logger = logging.getLogger(__name__)
+# === Настройка окружения ===
+BASE_DIR: Path = Path(__file__).parent
+load_dotenv(BASE_DIR / ".env")
+
+# === Настройка логирования ===
+LOGS_DIR: Path = BASE_DIR / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+LOG_FILE: Path = LOGS_DIR / f"bot_{datetime.now().strftime('%Y-%m-%d')}.log"
+
+logger = logging.getLogger("bot")
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+logger.info("=== Логгер инициализирован ===")
+
+# === Языки ===
+LANGS_DIR: Path = BASE_DIR / "langs"
+DEFAULT_LANGUAGE: str = "ru"
+
+# === Языки и перевод ===
+_LANG_CACHE: Dict[str, Dict[str, Any]] = {}
+_LANG_CACHE_MAX_SIZE: int = 100
+
+
+def _load_language_file(code: str) -> Dict[str, Any]:
+    path = os.path.join(LANGS_DIR, f"{code}.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+        if raw[:3] == "\xef\xbb\xbf":
+            raw = raw[3:]
+        return json.loads(raw)
+    except Exception as e:
+        logger.warning(f"Ошибка загрузки языка {code}: {e}")
+        return {}
+
+
+def _resolve_key(data: Dict[str, Any], key: str) -> Optional[Any]:
+    node = data
+    for part in key.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def translate(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
+    language = (lang or DEFAULT_LANGUAGE).strip().lower()
+    data = _LANG_CACHE.get(language)
+    if data is None:
+        data = _load_language_file(language)
+        if len(_LANG_CACHE) >= _LANG_CACHE_MAX_SIZE:
+            first_key = next(iter(_LANG_CACHE), None)
+            if first_key and first_key != DEFAULT_LANGUAGE:
+                del _LANG_CACHE[first_key]
+        _LANG_CACHE[language] = data
+    text = _resolve_key(data, key)
+    if text is None and language != DEFAULT_LANGUAGE:
+        data = _LANG_CACHE.get(DEFAULT_LANGUAGE) or _load_language_file(
+            DEFAULT_LANGUAGE
+        )
+        text = _resolve_key(data, key)
+    if text is None:
+        return key
+    if kwargs and isinstance(text, str):
+        try:
+            return text.format(**kwargs)
+        except Exception:
+            return text
+    return str(text)
+
+
+# Загрузка языков при старте
+for _lang_code in ("ru", "en"):
+    _LANG_CACHE[_lang_code] = _load_language_file(_lang_code)
+logger.info(f"Языковая система инициализирована: {list(_LANG_CACHE.keys())}")
 
 
 # --- Конфиг ---
@@ -72,9 +154,9 @@ def str_to_bool(val: str) -> bool:
 
 
 class Config:
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
     API_ID: int = int(os.getenv("API_ID", "0"))
-    API_HASH: str = os.getenv("API_HASH", "")
+    API_HASH: str = os.getenv("API_HASH", "").strip()
     ADMIN_USER_IDS: List[int] = [
         int(x.strip()) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
     ]
@@ -85,6 +167,7 @@ class Config:
     AUTH_FILE: str = os.getenv("AUTH_FILE", os.path.join(DATA_DIR, "auth.json"))
     TASKS_FILE: str = os.getenv("TASKS_FILE", os.path.join(DATA_DIR, "tasks.json"))
     CACHE_DB_PATH: str = os.getenv("CACHE_DB_PATH", os.path.join(DATA_DIR, "cache.db"))
+    CHATS_DB_PATH: str = os.getenv("CHATS_DB_PATH", os.path.join(DATA_DIR, "chats.db"))
     AUTO_LEAVE_AFTER_INVITE: bool = str_to_bool(
         os.getenv("AUTO_LEAVE_AFTER_INVITE", "false")
     )
@@ -98,37 +181,98 @@ class Config:
     MAX_ACCOUNTS_PER_TASK: int = int(os.getenv("MAX_ACCOUNTS_PER_TASK", "3"))
     SESSION_TIMEOUT: int = int(os.getenv("SESSION_TIMEOUT", "1800"))  # 30 min
 
+    @classmethod
+    def validate(cls) -> None:
+        errors: List[str] = []
+        if not cls.BOT_TOKEN:
+            errors.append("BOT_TOKEN не установлен")
+        if cls.API_ID == 0:
+            errors.append("API_ID не установлен")
+        if not cls.API_HASH:
+            errors.append("API_HASH не установлен")
+        if errors:
+            raise ConfigError(
+                "Ошибка конфигурации:\n" + "\n".join(f"  • {e}" for e in errors)
+            )
 
-for path in [Config.SESSIONS_DIR, Config.DATA_DIR, LOG_DIR]:
+
+for path in [Config.SESSIONS_DIR, Config.DATA_DIR, LOGS_DIR]:
     try:
         os.makedirs(path, exist_ok=True)
     except Exception as e:
         logger.warning(f"Не удалось создать папку {path}: {e}")
 
 
-# --- Утилиты ---
-def kb(rows: List[List[Dict[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(**button) for button in row] for row in rows
-        ]
-    )
+# === Кастомные исключения ===
+class BotError(Exception):
+
+    def __init__(self, message: str, code: int = 500):
+        self.message = message
+        self.code = code
+        super().__init__(self.message)
 
 
+class ConfigError(BotError):
+    def __init__(self, message: str):
+        super().__init__(message, code=400)
+
+
+class DatabaseError(BotError):
+    def __init__(self, message: str, original_error: Optional[Exception] = None):
+        self.original_error = original_error
+        super().__init__(message, code=500)
+
+
+class ValidationError(BotError):
+    def __init__(self, message: str, field: Optional[str] = None):
+        self.field = field
+        super().__init__(message, code=400)
+
+
+# === Утилиты логирования ===
+def log_error(func: Callable) -> Callable:
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.error(f"Ошибка в {func.__name__}: {e}", exc_info=True)
+            raise
+
+    return wrapper
+
+
+def log_warning(func: Callable) -> Callable:
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except Exception as e:
+            logger.warning(f"Предупреждение в {func.__name__}: {e}")
+            raise
+
+    return wrapper
+
+
+# === Утилиты для работы с событиями ===
 async def safe_send_message(
     bot: Bot,
     user_id: int,
     message: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-):
+) -> bool:
+    if not bot.session:
+        logger.error(
+            f"safe_send_message: сессия бота не инициализирована для user {user_id}"
+        )
+        return False
     try:
         await bot.send_message(
             user_id, message, parse_mode=ParseMode.HTML, reply_markup=reply_markup
         )
+        return True
     except TelegramBadRequest as e:
-        logger.warning(
-            f"HTML parse error for user {user_id}: {e}. Trying escaped HTML then plain text."
-        )
+        error_msg = str(e).lower()
+        if "blocked" in error_msg or "bot was blocked" in error_msg:
+            return False
         try:
             await bot.send_message(
                 user_id,
@@ -136,18 +280,88 @@ async def safe_send_message(
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
             )
+            return True
         except Exception:
             try:
                 await bot.send_message(user_id, message, reply_markup=reply_markup)
+                return True
             except Exception as e2:
-                logger.error(f"Ошибка отправки plain message {user_id}: {e2}")
+                logger.error(f"Ошибка отправки сообщения {user_id}: {e2}")
+                return False
     except Exception as e:
-        logger.error(f"Ошибка отправки сообщения {user_id}: {str(e)}")
+        logger.error(f"Ошибка отправки {user_id}: {e}")
+        return False
+
+
+# === Клавиатуры ===
+def kb(rows: List[List[Dict[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(**btn) for btn in row] for row in rows]
+    )
+
+
+# === Retry паттерн ===
+async def retry_async(
+    func: Callable,
+    max_retries: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0,
+    exceptions: Tuple[type, ...] = (Exception,),
+) -> Any:
+    last_exception: Optional[Exception] = None
+    for attempt in range(max_retries):
+        try:
+            return await func()
+        except exceptions as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                wait_time = delay * (backoff**attempt)
+                logger.warning(
+                    f"Повторная попытка {attempt + 1}/{max_retries} "
+                    f"через {wait_time:.1f}с: {type(e).__name__}: {e}"
+                )
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(
+                    f"Все {max_retries} попытки исчерпаны: {type(e).__name__}: {e}",
+                    exc_info=True,
+                )
+    if last_exception:
+        raise last_exception
+    raise BotError("Неизвестная ошибка в retry_async")
+
+
+# === Утилиты-конвертеры ===
+def to_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        try:
+            return int(float(value))
+        except Exception:
+            return default
+
+
+def to_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def format_number(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:.2f}".rstrip("0").rstrip(".")
 
 
 async def notify_admins(
     bot: Bot, message: str, reply_markup: Optional[InlineKeyboardMarkup] = None
-):
+) -> None:
     for admin_id in Config.ADMIN_USER_IDS:
         await safe_send_message(bot, admin_id, message, reply_markup=reply_markup)
 
@@ -157,30 +371,8 @@ async def notify_user(
     user_id: int,
     message: str,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
-):
+) -> None:
     await safe_send_message(bot, user_id, message, reply_markup=reply_markup)
-
-
-async def smart_answer(
-    event, bot: Bot, text: str, reply_markup=None, delete_origin=False, show_alert=False
-):
-    try:
-        if isinstance(event, Message):
-            await event.answer(text, reply_markup=reply_markup)
-        elif isinstance(event, CallbackQuery):
-            if event.message:
-                await event.message.answer(text, reply_markup=reply_markup)
-                if delete_origin:
-                    try:
-                        await event.message.delete()
-                    except Exception:
-                        pass
-            try:
-                await event.answer(show_alert=show_alert)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error(f"Ошибка в smart_answer: {e}")
 
 
 async def update_message(
@@ -196,10 +388,40 @@ async def update_message(
             parse_mode=ParseMode.HTML,
         )
         return True
-    except TelegramBadRequest:
+    except TelegramBadRequest as e:
+        error_msg = str(e).lower()
+        if "message is not modified" in error_msg:
+            return True
         return False
     except Exception as e:
         logger.debug(f"Error updating message: {e}")
+        return False
+
+
+async def smart_answer(
+    event: Union[Message, CallbackQuery],
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+    delete_origin: bool = False,
+) -> bool:
+    try:
+        if isinstance(event, Message):
+            await event.answer(text, reply_markup=reply_markup)
+        elif isinstance(event, CallbackQuery):
+            if event.message:
+                await event.message.answer(text, reply_markup=reply_markup)
+                if delete_origin:
+                    try:
+                        await event.message.delete()
+                    except Exception:
+                        pass
+            try:
+                await event.answer()
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        logger.error(f"smart_answer error: {e}")
         return False
 
 
@@ -254,10 +476,327 @@ async def clear_entity_cache():
 
 
 # --- JSON Storage ---
+# === TasksDB (SQLite) ===
+class TasksDB:
+    """База данных задач на SQLite (замена JSONStorage)"""
+
+    def __init__(self, db_path: str):
+        self.db_path: str = db_path
+        self.conn: Optional[aiosqlite.Connection] = None
+        self.lock: asyncio.Lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        try:
+            parent = os.path.dirname(self.db_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+
+            async def _connect() -> aiosqlite.Connection:
+                conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+                return conn
+
+            self.conn = await retry_async(
+                _connect,
+                max_retries=3,
+                delay=1.0,
+                exceptions=(aiosqlite.Error, Exception),
+            )
+            self.conn.row_factory = aiosqlite.Row
+            await self.conn.execute("PRAGMA foreign_keys = ON")
+            await self.conn.execute("PRAGMA journal_mode = WAL")
+            await self.conn.execute("PRAGMA busy_timeout = 5000")
+            await self.init_db()
+            logger.info(f"База данных задач подключена: {self.db_path}")
+        except Exception as e:
+            logger.critical(f"Не удалось подключиться к БД задач: {e}")
+            raise DatabaseError(f"Ошибка подключения к БД задач: {e}") from e
+
+    async def close(self) -> None:
+        if self.conn:
+            try:
+                await self.conn.close()
+                logger.info("База данных задач закрыта")
+            except Exception as e:
+                logger.warning(f"Ошибка закрытия БД задач: {e}")
+            finally:
+                self.conn = None
+
+    async def init_db(self) -> None:
+        if not self.conn:
+            return
+        async with self.lock:
+            try:
+                await self.conn.execute("""
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        task_id TEXT PRIMARY KEY,
+                        type TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        user_id INTEGER NOT NULL,
+                        data TEXT NOT NULL DEFAULT '{}',
+                        results TEXT DEFAULT 'null',
+                        error TEXT DEFAULT '',
+                        progress REAL DEFAULT 0.0,
+                        progress_text TEXT DEFAULT '',
+                        sent INTEGER DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        completed_at TIMESTAMP,
+                        checkpoints TEXT DEFAULT 'null'
+                    )
+                """)
+                await self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)"
+                )
+                await self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
+                )
+                await self.conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)"
+                )
+                await self.conn.commit()
+                logger.info("Таблица tasks создана/проверена")
+            except Exception as e:
+                logger.error(f"Ошибка инициализации БД задач: {e}")
+                raise DatabaseError(f"Ошибка init_db задач: {e}") from e
+
+    @log_error
+    async def add_task(self, task_data: Dict[str, Any]) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                await self.conn.execute(
+                    "INSERT OR IGNORE INTO tasks (task_id, type, status, user_id, data) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        task_data.get("task_id", ""),
+                        task_data.get("type", ""),
+                        task_data.get("status", "pending"),
+                        task_data.get("user_id", 0),
+                        json.dumps(task_data.get("data", {}), ensure_ascii=False),
+                    ),
+                )
+                await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"add_task: {e}")
+            return False
+
+    @log_error
+    async def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        if not self.conn:
+            return None
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+                )
+                row = await cur.fetchone()
+                if row:
+                    data = dict(row)
+                    # Парсим JSON поля
+                    if data.get("data"):
+                        try:
+                            data["data"] = json.loads(data["data"])
+                        except Exception:
+                            data["data"] = {}
+                    if data.get("results"):
+                        try:
+                            data["results"] = json.loads(data["results"])
+                        except Exception:
+                            data["results"] = None
+                    if data.get("checkpoints"):
+                        try:
+                            data["checkpoints"] = json.loads(data["checkpoints"])
+                        except Exception:
+                            data["checkpoints"] = None
+                    return data
+                return None
+        except Exception as e:
+            logger.error(f"get_task {task_id}: {e}")
+            return None
+
+    @log_error
+    async def update_task(self, task_id: str, updates: Dict[str, Any]) -> bool:
+        if not self.conn or not updates:
+            return False
+        try:
+            async with self.lock:
+                set_clause = []
+                values = []
+                for key, value in updates.items():
+                    if key in ("data", "results", "checkpoints") and isinstance(
+                        value, (dict, list)
+                    ):
+                        set_clause.append(f"{key} = ?")
+                        values.append(json.dumps(value, ensure_ascii=False))
+                    else:
+                        set_clause.append(f"{key} = ?")
+                        values.append(value)
+                values.append(task_id)
+                set_clause.append("task_id = ?")
+                await self.conn.execute(
+                    f"UPDATE tasks SET {', '.join(set_clause)} WHERE task_id = ?",
+                    values,
+                )
+                await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"update_task {task_id}: {e}")
+            return False
+
+    @log_error
+    async def get_tasks_by_user(self, user_id: int) -> List[Dict[str, Any]]:
+        if not self.conn:
+            return []
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM tasks WHERE user_id = ? ORDER BY created_at DESC",
+                    (user_id,),
+                )
+                rows = await cur.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"get_tasks_by_user {user_id}: {e}")
+            return []
+
+    @log_error
+    async def get_active_tasks(self) -> List[Dict[str, Any]]:
+        if not self.conn:
+            return []
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM tasks WHERE status IN ('pending', 'running', 'paused') ORDER BY created_at DESC"
+                )
+                rows = await cur.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"get_active_tasks: {e}")
+            return []
+
+    @log_error
+    async def cancel_task(self, task_id: str) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                await self.conn.execute(
+                    "UPDATE tasks SET status = 'cancelled', completed_at = ? WHERE task_id = ?",
+                    (datetime.now().isoformat(), task_id),
+                )
+                await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"cancel_task {task_id}: {e}")
+            return False
+
+    @log_error
+    async def cancel_all_user_tasks(self, user_id: int) -> int:
+        if not self.conn:
+            return 0
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "UPDATE tasks SET status = 'cancelled', completed_at = ? WHERE user_id = ? AND status IN ('pending', 'running', 'paused')",
+                    (datetime.now().isoformat(), user_id),
+                )
+                await self.conn.commit()
+                return cur.rowcount
+        except Exception as e:
+            logger.error(f"cancel_all_user_tasks {user_id}: {e}")
+            return 0
+
+    @log_error
+    async def delete_task(self, task_id: str) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "DELETE FROM tasks WHERE task_id = ?", (task_id,)
+                )
+                await self.conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error(f"delete_task {task_id}: {e}")
+            return False
+
+    # === Методы-алиасы для совместимости с JSONStorage ===
+    async def add(self, item: Dict[str, Any]) -> bool:
+        """Алиас для add_task"""
+        return await self.add_task(item)
+
+    async def update_by_id(
+        self, item_id: str, updates: Dict[str, Any], id_field: str = "id"
+    ) -> bool:
+        """Алиас для update_task"""
+        return await self.update_task(item_id, updates)
+
+    async def find_by_id(
+        self, item_id: str, id_field: str = "id"
+    ) -> Optional[Dict[str, Any]]:
+        """Алиас для get_task"""
+        return await self.get_task(item_id)
+
+    async def read_all(self) -> List[Dict[str, Any]]:
+        """Алиас для получения всех задач"""
+        if not self.conn:
+            return []
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM tasks ORDER BY created_at DESC"
+                )
+                rows = await cur.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"read_all: {e}")
+            return []
+
+    async def write_all(self, data: List[Dict[str, Any]]) -> None:
+        """Алиас для полной перезаписи задач (не рекомендуется для производительности)"""
+        if not self.conn:
+            return
+        try:
+            async with self.lock:
+                # Удаляем все задачи
+                await self.conn.execute("DELETE FROM tasks")
+                # Добавляем новые
+                for task in data:
+                    task_data = task.get("data", {})
+                    if isinstance(task_data, str):
+                        task_data = json.loads(task_data) if task_data else {}
+                    await self.conn.execute(
+                        "INSERT OR REPLACE INTO tasks (task_id, type, status, user_id, data, results, error, progress, progress_text, sent, created_at, completed_at, checkpoints) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            task.get("task_id", ""),
+                            task.get("type", ""),
+                            task.get("status", "pending"),
+                            task.get("user_id", 0),
+                            json.dumps(task.get("data", {}), ensure_ascii=False),
+                            json.dumps(task.get("results"), ensure_ascii=False),
+                            task.get("error", ""),
+                            task.get("progress", 0.0),
+                            task.get("progress_text", ""),
+                            task.get("sent", 0),
+                            task.get("created_at", datetime.now().isoformat()),
+                            task.get("completed_at"),
+                            json.dumps(task.get("checkpoints"), ensure_ascii=False),
+                        ),
+                    )
+                await self.conn.commit()
+        except Exception as e:
+            logger.error(f"write_all: {e}")
+
+
+# --- JSONStorage (legacy) ---
 class JSONStorage:
     def __init__(self, path: str):
         self.path = path
         self._lock = asyncio.Lock()
+        self._backup_path = f"{path}.bak"
+        self._max_retries = 3
+        self._retry_delay = 0.5
 
     async def _ensure_file(self) -> None:
         if os.path.exists(self.path):
@@ -271,24 +810,81 @@ class JSONStorage:
         async with aiofiles.open(self.path, "w", encoding="utf-8") as f:
             await f.write("[]")
 
+    async def _backup_file(self) -> None:
+        """Создаёт резервную копию файла"""
+        try:
+            if os.path.exists(self.path):
+                async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
+                    content = await f.read()
+                async with aiofiles.open(self._backup_path, "w", encoding="utf-8") as f:
+                    await f.write(content)
+                logger.debug(f"Backup created for {self.path}")
+        except Exception as e:
+            logger.warning(f"Failed to create backup for {self.path}: {e}")
+
+    async def _safe_write(self, content: str) -> bool:
+        """Безопасная запись с retry и atomic write"""
+        for attempt in range(self._max_retries):
+            try:
+                temp_path = f"{self.path}.tmp"
+                async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
+                    await f.write(content)
+                await asyncio.to_thread(os.replace, temp_path, self.path)
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"Write attempt {attempt + 1} failed for {self.path}: {e}"
+                )
+                if attempt < self._max_retries - 1:
+                    await asyncio.sleep(self._retry_delay * (2**attempt))
+                else:
+                    try:
+                        async with aiofiles.open(self.path, "w", encoding="utf-8") as f:
+                            await f.write(content)
+                        logger.warning(f"Fallback write succeeded for {self.path}")
+                        return True
+                    except Exception as e2:
+                        logger.error(f"All write attempts failed for {self.path}: {e2}")
+                        return False
+        return False
+
     async def read_all(self) -> List[Dict[str, Any]]:
         await self._ensure_file()
         async with self._lock:
-            async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
-                content = await f.read()
-        if not content:
-            return []
-        try:
-            data = json.loads(content)
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+            for attempt in range(self._max_retries):
+                try:
+                    async with aiofiles.open(self.path, "r", encoding="utf-8") as f:
+                        content = await f.read()
+                    if not content:
+                        return []
+                    data = json.loads(content)
+                    return data if isinstance(data, list) else []
+                except json.JSONDecodeError:
+                    logger.warning(
+                        f"JSON decode error for {self.path}, attempting recovery"
+                    )
+                    if os.path.exists(self._backup_path):
+                        async with aiofiles.open(
+                            self._backup_path, "r", encoding="utf-8"
+                        ) as f:
+                            content = await f.read()
+                        data = json.loads(content)
+                        return data if isinstance(data, list) else []
+                    return []
+                except Exception as e:
+                    if attempt < self._max_retries - 1:
+                        await asyncio.sleep(self._retry_delay)
+                    else:
+                        logger.error(f"Read error for {self.path}: {e}")
+                        return []
+        return []
 
     async def write_all(self, data: List[Dict[str, Any]]) -> None:
         await self._ensure_file()
         async with self._lock:
-            async with aiofiles.open(self.path, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
+            await self._backup_file()
+            content = json.dumps(data, ensure_ascii=False, indent=2)
+            await self._safe_write(content)
 
     async def add(self, item: Dict[str, Any]) -> None:
         data = await self.read_all()
@@ -496,6 +1092,460 @@ class CacheManager:
         return row is not None
 
 
+# --- ChatDB (БД собранных чатов) ---
+class ChatDB:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn: Optional[aiosqlite.Connection] = None
+        self.lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        self.conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+        self.conn.row_factory = aiosqlite.Row
+        await self.conn.execute("PRAGMA journal_mode = WAL")
+        await self.conn.execute("PRAGMA busy_timeout = 5000")
+        await self.init_db()
+        logger.info(f"ChatDB подключена: {self.db_path}")
+
+    async def close(self) -> None:
+        if self.conn:
+            try:
+                await self.conn.close()
+                logger.info("ChatDB закрыта")
+            except Exception as e:
+                logger.warning(f"Ошибка закрытия ChatDB: {e}")
+            finally:
+                self.conn = None
+
+    async def init_db(self) -> None:
+        if not self.conn:
+            return
+        async with self.lock:
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS collected_chats (
+                    chat_id TEXT PRIMARY KEY,
+                    chat_name TEXT DEFAULT '',
+                    chat_url TEXT DEFAULT '',
+                    chat_type TEXT DEFAULT 'unknown',
+                    user_count INTEGER DEFAULT 0,
+                    can_write INTEGER DEFAULT 0,
+                    verified INTEGER DEFAULT 0,
+                    last_check TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    status TEXT DEFAULT 'active'
+                )
+            """)
+            await self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chats_status
+                ON collected_chats(status)
+            """)
+            await self.conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_chats_can_write
+                ON collected_chats(can_write)
+            """)
+            await self.conn.commit()
+
+    async def add_chat(
+        self,
+        chat_id: str,
+        chat_name: str,
+        chat_url: str,
+        chat_type: str,
+        user_count: int,
+        can_write: bool = True,
+    ) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                await self.conn.execute(
+                    """INSERT OR REPLACE INTO collected_chats
+                    (chat_id, chat_name, chat_url, chat_type, user_count, can_write, verified, last_check, status)
+                    VALUES (?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, 'active')""",
+                    (
+                        str(chat_id),
+                        chat_name,
+                        chat_url,
+                        chat_type,
+                        user_count,
+                        1 if can_write else 0,
+                    ),
+                )
+                await self.conn.commit()
+            logger.info(f"✅ Чат {chat_name} ({chat_id}) добавлен в ChatDB")
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка добавления чата {chat_id} в ChatDB: {e}")
+            return False
+
+    async def remove_chat(self, chat_id: str) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "DELETE FROM collected_chats WHERE chat_id = ?", (str(chat_id),)
+                )
+                await self.conn.commit()
+                removed = cur.rowcount > 0
+            if removed:
+                logger.info(f"🗑️ Чат {chat_id} удалён из ChatDB")
+            return removed
+        except Exception as e:
+            logger.error(f"Ошибка удаления чата {chat_id} из ChatDB: {e}")
+            return False
+
+    async def update_chat_status(self, chat_id: str, status: str) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                await self.conn.execute(
+                    "UPDATE collected_chats SET status = ?, last_check = CURRENT_TIMESTAMP WHERE chat_id = ?",
+                    (status, str(chat_id)),
+                )
+                await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Ошибка обновления статуса чата {chat_id}: {e}")
+            return False
+
+    async def get_all_chats(self) -> List[Dict[str, Any]]:
+        if not self.conn:
+            return []
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM collected_chats WHERE status = 'active'"
+                )
+                rows = await cur.fetchall()
+            return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Ошибка получения чатов из ChatDB: {e}")
+            return []
+
+    async def get_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        if not self.conn:
+            return None
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM collected_chats WHERE chat_id = ?", (str(chat_id),)
+                )
+                row = await cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Ошибка получения чата {chat_id} из ChatDB: {e}")
+            return None
+
+    async def get_total_users(self) -> int:
+        if not self.conn:
+            return 0
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT COALESCE(SUM(user_count), 0) as total FROM collected_chats WHERE status = 'active'"
+                )
+                row = await cur.fetchone()
+            return int(row["total"]) if row else 0
+        except Exception as e:
+            logger.error(f"Ошибка подсчёта пользователей ChatDB: {e}")
+            return 0
+
+    async def get_active_chats_count(self) -> int:
+        if not self.conn:
+            return 0
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT COUNT(*) as count FROM collected_chats WHERE status = 'active'"
+                )
+                row = await cur.fetchone()
+            return int(row["count"]) if row else 0
+        except Exception as e:
+            logger.error(f"Ошибка подсчёта чатов ChatDB: {e}")
+            return 0
+
+    async def clear_db(self) -> int:
+        if not self.conn:
+            return 0
+        try:
+            async with self.lock:
+                cur = await self.conn.execute("DELETE FROM collected_chats")
+                await self.conn.commit()
+                return cur.rowcount
+        except Exception as e:
+            logger.error(f"Ошибка очистки ChatDB: {e}")
+            return 0
+
+
+# === Regex для извлечения ссылок Telegram ===
+_TELEGRAM_LINK_RE = re.compile(
+    r"(?:https?://)?"  # протокол (опционально)
+    r"(?:www\.)?"  # www (опционально)
+    r"(?:t\.me/|telegram\.me/|telegram\.dog/)"  # домен
+    r"([A-Za-z0-9_+/=-]{2,32})"  # юзернейм/хеш
+    r"(?:\?|/|$|[^A-Za-z0-9_])",  # конец
+    re.IGNORECASE,
+)
+
+_TELEGRAM_SHORT_RE = re.compile(
+    r"t\.me/([A-Za-z0-9_+/=-]{2,32})",
+    re.IGNORECASE,
+)
+
+_TELEGRAM_USERNAME_RE = re.compile(
+    r"@([A-Za-z0-9_]{2,32})\b",
+    re.IGNORECASE,
+)
+
+
+def extract_telegram_links(text: str) -> List[str]:
+    """Извлекает все t.me ссылки из текста"""
+    if not text:
+        return []
+    links: List[str] = []
+    seen: Set[str] = set()
+
+    # Полные ссылки
+    for match in _TELEGRAM_LINK_RE.finditer(text):
+        link = f"https://t.me/{match.group(1)}"
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
+
+    # Короткие ссылки
+    for match in _TELEGRAM_SHORT_RE.finditer(text):
+        link = f"https://t.me/{match.group(1)}"
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
+
+    # @username
+    for match in _TELEGRAM_USERNAME_RE.finditer(text):
+        username = match.group(1)
+        # Пропускаем служебные слова
+        if username.lower() in ("all", "channel", "bot", "support", "help", "admin"):
+            continue
+        link = f"https://t.me/{username}"
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
+
+    return links
+
+
+def extract_links_from_text(text: str) -> List[str]:
+    """Универсальный парсинг ссылок из текста (включая вложенные)"""
+    if not text:
+        return []
+    return extract_telegram_links(text)
+
+
+def parse_link_to_identifier(link: str) -> Optional[str]:
+    """Парсит ссылку и возвращает идентификатор чата (username или хеш)"""
+    if not link:
+        return None
+    link = link.strip()
+    # https://t.me/username
+    # https://t.me/+hash
+    # t.me/username
+    for pattern in [
+        r"https?://t\.me/[+]?([A-Za-z0-9_+/=-]{2,32})",
+        r"t\.me/[+]?([A-Za-z0-9_+/=-]{2,32})",
+    ]:
+        m = re.search(pattern, link, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
+async def validate_and_test_chat(
+    client: TelegramClient,
+    account: Dict[str, Any],
+    chat_identifier: str,
+    task_id: str,
+    user_id: int,
+    bot_telegram: Bot,
+    bot_user_id: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Проверяет чат:
+    1. Получает сущность чата
+    2. Проверяет что это чат/канал
+    3. Пытается отправить тестовое сообщение
+    4. Ждёт 5 секунд, проверяет удалено ли
+    5. Если нет - удаляет и возвращает статистику
+    """
+    try:
+        # Получаем сущность чата
+        entity = await client.get_entity(chat_identifier)
+    except Exception as e:
+        logger.warning(f"Не удалось получить чат {chat_identifier}: {e}")
+        return None
+
+    # Проверяем тип
+    is_channel = isinstance(entity, telethon_types.Channel)
+    is_chat = isinstance(entity, telethon_types.Chat)
+    is_user = isinstance(entity, telethon_types.User)
+
+    if is_user:
+        logger.info(f"Пропуск пользователя: {chat_identifier}")
+        return None
+
+    if not is_channel and not is_chat:
+        logger.info(f"Пропуск неизвестного типа: {chat_identifier}")
+        return None
+
+    chat_id = str(entity.id)
+    chat_name = str(entity.title or entity.first_name or chat_identifier)
+    chat_type = "channel" if is_channel else ("group" if is_chat else "unknown")
+
+    # Получаем username/ссылку
+    chat_username = getattr(entity, "username", None)
+    if chat_username:
+        chat_url = f"https://t.me/{chat_username}"
+    else:
+        # Для приватных чатов используем хеш ссылки
+        chat_url = f"https://t.me/{chat_identifier}"
+
+    # Получаем количество пользователей
+    user_count = 0
+    try:
+        if is_channel:
+            user_count = entity.users_count or 0
+        elif is_chat:
+            user_count = entity.users_count or 0
+    except Exception:
+        pass
+
+    # Проверяем can_write — пробуем отправить тестовое сообщение
+    test_msg_id = None
+    can_write = False
+    msg_deleted = False
+
+    try:
+        test_text = "🐛 Test message from Inviter Bot"
+        sent_msg = await client.send_message(entity, test_text)
+        test_msg_id = sent_msg.id
+        can_write = True
+        logger.info(f"Тестовое сообщение отправлено в {chat_name} ({chat_id})")
+
+        # Ждём 5 секунд
+        await asyncio.sleep(5)
+
+        # Проверяем, не удалено ли сообщение
+        try:
+            updated = await client.get_messages(entity, ids=test_msg_id)
+            if not updated or len(updated) == 0:
+                msg_deleted = True
+                logger.info(f"Тестовое сообщение удалено в {chat_name}")
+        except Exception:
+            msg_deleted = True
+            logger.info(f"Сообщение не найдено в {chat_name} (возможно удалено)")
+
+        # Если не удалено — удаляем сами
+        if not msg_deleted and test_msg_id:
+            try:
+                await client.delete_messages(entity, test_msg_id)
+                logger.info(f"Тестовое сообщение удалено вручную в {chat_name}")
+            except Exception as e:
+                logger.warning(
+                    f"Не удалось удалить тестовое сообщение в {chat_name}: {e}"
+                )
+
+    except (ChatAdminRequiredError, FloodWaitError) as e:
+        logger.warning(f"Бот не может писать в {chat_name}: {e}")
+        can_write = False
+        msg_deleted = False
+    except Exception as e:
+        logger.warning(f"Ошибка проверки писания в {chat_name}: {e}")
+        can_write = False
+        msg_deleted = False
+
+    # Если бот не может писать или сообщение удалено — не добавляем
+    if not can_write or msg_deleted:
+        return None
+
+    # Возвращаем данные чата для добавления в БД
+    return {
+        "chat_id": chat_id,
+        "chat_name": chat_name,
+        "chat_url": chat_url,
+        "chat_type": chat_type,
+        "user_count": user_count,
+        "can_write": True,
+    }
+
+
+async def check_and_clean_banned_chats(
+    client: TelegramClient,
+    bot_telegram: Bot,
+    bot_user_id: int,
+) -> Dict[str, int]:
+    """
+    Проверяет все чаты в БД:
+    - Если бот забанен — удаляет чат из БД
+    - Возвращает статистику
+    """
+    result = {"checked": 0, "removed": 0, "errors": 0}
+    chats = await chat_db.get_all_chats()
+    result["checked"] = len(chats)
+
+    for chat in chats:
+        try:
+            chat_id = chat["chat_id"]
+            chat_name = chat["chat_name"]
+            chat_url = chat["chat_url"]
+
+            # Проверяем можно ли получить сущность
+            try:
+                entity = await client.get_entity(chat_url)
+            except Exception:
+                # Если не можем получить — возможно забанен
+                removed = await chat_db.remove_chat(chat_id)
+                if removed:
+                    result["removed"] += 1
+                    logger.info(f"🗑️ Чат {chat_name} удалён (недоступен)")
+                continue
+
+            # Проверяем тип — если это пользователь, удаляем
+            if isinstance(entity, telethon_types.User):
+                removed = await chat_db.remove_chat(chat_id)
+                if removed:
+                    result["removed"] += 1
+                    logger.info(f"🗑️ Чат {chat_name} удалён (пользователь)")
+                continue
+
+            # Проверяем can_send_messages через бота aiogram
+            try:
+                await bot_telegram.get_chat(chat_id)
+                # Если бот aiogram может получить чат — он активен
+            except TelegramBadRequest as e:
+                if "not found" in str(e).lower() or "migrate" not in str(e).lower():
+                    # Возможно забанен
+                    logger.info(f"Бот aiogram не может получить чат {chat_name}: {e}")
+                    # Для телефон-клиента проверяем через отправление сообщения
+                    try:
+                        test_msg = await client.send_message(entity, "🐛 Health check")
+                        await client.delete_messages(entity, test_msg)
+                    except (ChatAdminRequiredError, FloodWaitError):
+                        removed = await chat_db.remove_chat(chat_id)
+                        if removed:
+                            result["removed"] += 1
+                            logger.info(f"🗑️ Чат {chat_name} удалён (бан)")
+                        continue
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            result["errors"] += 1
+            logger.error(
+                f"Ошибка проверки чата {chat.get('chat_name', 'unknown')}: {e}"
+            )
+
+    return result
+
+
 # --- AccountPoolManager ---
 class AccountPoolManager:
     def __init__(self):
@@ -503,6 +1553,12 @@ class AccountPoolManager:
         self.lock = asyncio.Lock()
         self._load_accounts()
         self._health_check_task = None
+        # Smart metrics
+        self._account_success_rate: Dict[str, float] = {}
+        self._account_last_error: Dict[str, datetime] = {}
+        self._max_consecutive_errors: int = 5
+        self._adaptive_delay_base: float = 5.0
+        self._adaptive_delay_max: float = 120.0
 
     async def start_health_check(self):
         """Запускает фоновый health-check для аккаунтов"""
@@ -518,18 +1574,21 @@ class AccountPoolManager:
                 pass
 
     async def _periodic_health_check(self):
-        """Периодическая проверка аккаунтов"""
+        """Периодическая проверка аккаунтов с adaptive delay"""
         while True:
             try:
-                await asyncio.sleep(Config.HEALTH_CHECK_INTERVAL)
+                # Adaptive delay между проверками
+                delay = max(60, Config.HEALTH_CHECK_INTERVAL / 2)
+                await asyncio.sleep(delay)
                 await self._check_all_accounts()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Health check error: {e}")
+                await asyncio.sleep(30)  # Short delay on error
 
     async def _check_all_accounts(self):
-        """Проверка всех аккаунтов"""
+        """Проверка всех аккаунтов с recovery"""
         async with self.lock:
             for acc in self.accounts:
                 if not acc["in_use"]:
@@ -537,7 +1596,7 @@ class AccountPoolManager:
                         try:
                             if acc["client"]:
                                 await acc["client"].disconnect()
-                            acc["client"] = await self._create_client(
+                            acc["client"] = await self._create_client_with_retry(
                                 acc["session_string"]
                             )
                             me = await acc["client"].get_me()
@@ -545,12 +1604,35 @@ class AccountPoolManager:
                                 raise Exception("Not authorized")
                             acc["is_valid"] = True
                             acc["last_check"] = datetime.now()
+                            # Update success rate
+                            self._update_account_success_rate(acc["session_file"], True)
                             logger.info(f"Account health OK: {acc['session_file']}")
                         except Exception as e:
                             logger.error(
                                 f"Account health check failed {acc['session_file']}: {e}"
                             )
                             acc["is_valid"] = False
+                            self._update_account_success_rate(
+                                acc["session_file"], False
+                            )
+
+    async def _create_client_with_retry(self, session_string: str) -> TelegramClient:
+        """Создаёт клиент с retry logic"""
+        for attempt in range(3):
+            try:
+                client = create_telegram_client(session_string)
+                await asyncio.wait_for(client.connect(), timeout=30.0)
+                return client
+            except Exception as e:
+                if attempt < 2:
+                    wait_time = 2**attempt
+                    logger.warning(
+                        f"Client creation attempt {attempt + 1} failed: {e}, retrying in {wait_time}s"
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    raise
+        raise Exception("Failed to create client after 3 attempts")
 
     def _load_accounts(self):
         for filename in os.listdir(Config.SESSIONS_DIR):
@@ -571,8 +1653,11 @@ class AccountPoolManager:
                             "flood_wait_until": None,
                             "error_count": 0,
                             "invite_count": 0,
+                            "success_count": 0,
+                            "consecutive_errors": 0,
                         }
                     )
+                    self._account_success_rate[filename] = 1.0
                 except Exception as e:
                     logger.error(f"Error loading session {filename}: {e}")
 
@@ -580,11 +1665,27 @@ class AccountPoolManager:
         """Сбрасывает счётчик ошибок"""
         acc["error_count"] = 0
         acc["invite_count"] = 0
+        acc["consecutive_errors"] = 0
+
+    def _update_account_success_rate(self, session_file: str, success: bool):
+        """Обновляет статистику успеха аккаунта"""
+        if session_file not in self._account_success_rate:
+            self._account_success_rate[session_file] = 1.0
+
+        current_rate = self._account_success_rate[session_file]
+        # Exponential moving average
+        alpha = 0.1
+        new_rate = alpha * (1.0 if success else 0.0) + (1 - alpha) * current_rate
+        self._account_success_rate[session_file] = new_rate
+
+        if not success:
+            self._account_last_error[session_file] = datetime.now()
 
     async def _handle_flood_wait(self, acc: Dict, wait_time: float):
         """Обрабатывает FloodWait с увеличенным временем ожидания"""
         extended_wait = wait_time * Config.FLOOD_WAIT_MULTIPLIER
         acc["flood_wait_until"] = datetime.now() + timedelta(seconds=extended_wait)
+        acc["consecutive_errors"] += 1
         logger.warning(
             f"Flood wait for {acc['session_file']}: {extended_wait:.1f}s (original: {wait_time:.1f}s)"
         )
@@ -603,15 +1704,29 @@ class AccountPoolManager:
         return True
 
     async def _check_account_rate_limit(self, acc: Dict) -> bool:
-        """Проверяет rate limit аккаунта"""
+        """Проверяет rate limit аккаунта с adaptive delay"""
         if acc.get("last_used"):
             elapsed = (datetime.now() - acc["last_used"]).total_seconds()
-            if elapsed < Config.MIN_INVITE_DELAY:
+            # Adaptive delay based on success rate
+            success_rate = self._account_success_rate.get(acc["session_file"], 1.0)
+            adaptive_delay = self._adaptive_delay_base * (1.0 / max(success_rate, 0.1))
+            adaptive_delay = min(adaptive_delay, self._adaptive_delay_max)
+
+            if elapsed < adaptive_delay:
                 logger.info(
-                    f"Account {acc['session_file']} rate limited: {elapsed:.1f}s since last use"
+                    f"Account {acc['session_file']} rate limited: {elapsed:.1f}s since last use (adaptive: {adaptive_delay:.1f}s)"
                 )
                 return False
         return True
+
+    async def _get_adaptive_delay(self, acc: Dict) -> float:
+        """Получает adaptive delay для аккаунта"""
+        success_rate = self._account_success_rate.get(acc["session_file"], 1.0)
+        delay = self._adaptive_delay_base * (1.0 / max(success_rate, 0.1))
+        delay = min(delay, self._adaptive_delay_max)
+        # Add randomness
+        delay *= random.uniform(0.8, 1.2)
+        return delay
 
     async def _detect_bot_user(self, user: Any) -> bool:
         """Определяет, является ли пользователь ботом"""
@@ -622,24 +1737,26 @@ class AccountPoolManager:
         return False
 
     async def _safe_get_user(
-        self, client: TelegramClient, user_id: int
+        self, client: TelegramClient, user_id: int, max_retries: int = None
     ) -> Optional[Any]:
-        """Безопасно получает пользователя с retry logic"""
-        for attempt in range(Config.MAX_RETRIES):
+        """Безопасно получает пользователя с retry logic и adaptive delay"""
+        if max_retries is None:
+            max_retries = Config.MAX_RETRIES
+
+        for attempt in range(max_retries):
             try:
                 return await client.get_entity(user_id)
             except FloodWaitError as e:
                 logger.warning(f"Flood wait on get_entity {user_id}: {e.value}s")
-                await self._handle_flood_wait(
-                    next(
-                        (acc for acc in self.accounts if acc.get("client") == client),
-                        None,
-                    ),
-                    e.value,
+                acc = next(
+                    (acc for acc in self.accounts if acc.get("client") == client),
+                    None,
                 )
+                if acc:
+                    await self._handle_flood_wait(acc, e.value)
                 raise
             except Exception as e:
-                if attempt < Config.MAX_RETRIES - 1:
+                if attempt < max_retries - 1:
                     wait_time = 2**attempt  # Exponential backoff
                     logger.warning(
                         f"Retry get_entity {user_id} attempt {attempt + 1}: {e}"
@@ -647,12 +1764,12 @@ class AccountPoolManager:
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(
-                        f"Failed to get entity {user_id} after {Config.MAX_RETRIES} attempts: {e}"
+                        f"Failed to get entity {user_id} after {max_retries} attempts: {e}"
                     )
                     return None
 
     async def _safe_invite(
-        self, client: TelegramClient, chat_id: str, user_id: int
+        self, client: TelegramClient, chat_id: str, user_id: int, acc: Dict = None
     ) -> bool:
         """Безопасно приглашает пользователя с retry и анти-бан механизмами"""
         for attempt in range(Config.MAX_RETRIES):
@@ -662,6 +1779,11 @@ class AccountPoolManager:
                         channel=chat_id, users=[user_id]
                     )
                 )
+                # Update success rate
+                if acc:
+                    self._update_account_success_rate(acc["session_file"], True)
+                    acc["success_count"] = acc.get("success_count", 0) + 1
+                    acc["consecutive_errors"] = 0
                 return True
             except UserPrivacyRestrictedError:
                 logger.info(f"User {user_id} privacy restricted - skipping")
@@ -674,18 +1796,18 @@ class AccountPoolManager:
                 return False
             except FloodWaitError as e:
                 logger.warning(f"Flood wait on invite {user_id}: {e.value}s")
-                await self._handle_flood_wait(
-                    next(
-                        (acc for acc in self.accounts if acc.get("client") == client),
-                        None,
-                    ),
-                    e.value,
-                )
+                if acc:
+                    await self._handle_flood_wait(acc, e.value)
                 raise
             except ChatAdminRequiredError:
                 logger.error(f"Need admin rights for chat {chat_id}")
                 return False
             except Exception as e:
+                # Update error rate
+                if acc:
+                    self._update_account_success_rate(acc["session_file"], False)
+                    acc["consecutive_errors"] = acc.get("consecutive_errors", 0) + 1
+
                 if attempt < Config.MAX_RETRIES - 1:
                     wait_time = 2**attempt
                     logger.warning(f"Retry invite {user_id} attempt {attempt + 1}: {e}")
@@ -749,15 +1871,24 @@ class AccountPoolManager:
         try:
             async with self.lock:
                 now = datetime.now()
-                # Сортировка по последнему использованию (round-robin)
-                self.accounts.sort(key=lambda x: x["last_used"] or datetime.min)
+
+                # Smart rotation: сортировка по success rate и последнему использованию
+                def account_sort_key(acc):
+                    success_rate = self._account_success_rate.get(
+                        acc["session_file"], 1.0
+                    )
+                    last_used = acc["last_used"] or datetime.min
+                    # Приоритет: success rate > last used > invite count
+                    return (-success_rate, last_used, acc.get("invite_count", 0))
+
+                self.accounts.sort(key=account_sort_key)
 
                 for acc in self.accounts:
                     if not acc["in_use"] and acc["is_valid"]:
                         # Проверка flood wait
                         if not await self._check_account_flood(acc):
                             continue
-                        # Проверка rate limit
+                        # Проверка rate limit с adaptive delay
                         if not await self._check_account_rate_limit(acc):
                             continue
                         # Проверка лимита инвайтов
@@ -770,7 +1901,7 @@ class AccountPoolManager:
                             try:
                                 if acc["client"]:
                                     await acc["client"].disconnect()
-                                acc["client"] = await self._create_client(
+                                acc["client"] = await self._create_client_with_retry(
                                     acc["session_string"]
                                 )
                                 me = await acc["client"].get_me()
@@ -794,7 +1925,7 @@ class AccountPoolManager:
                     account["in_use"] = False
                     account["invite_count"] = account.get("invite_count", 0) + 1
                     logger.info(
-                        f"Released account: {account['session_file']} (invites: {account['invite_count']})"
+                        f"Released account: {account['session_file']} (invites: {account['invite_count']}, success_rate: {self._account_success_rate.get(account['session_file'], 0):.2f})"
                     )
 
     @asynccontextmanager
@@ -824,7 +1955,7 @@ class AccountPoolManager:
                 try:
                     if account["client"]:
                         await account["client"].disconnect()
-                    account["client"] = await self._create_client(
+                    account["client"] = await self._create_client_with_retry(
                         account["session_string"]
                     )
                     me = await account["client"].get_me()
@@ -870,6 +2001,17 @@ class TaskControl:
         self.pause_event.set()
         self.cancelled = False
         self.start_time = datetime.now()
+        self.last_activity = datetime.now()
+        self.timeout: int = 3600  # 1 hour default timeout
+
+    def update_activity(self):
+        """Обновляет timestamp последней активности"""
+        self.last_activity = datetime.now()
+
+    def is_timed_out(self) -> bool:
+        """Проверяет, не истёк ли таймаут задачи"""
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        return elapsed > self.timeout
 
 
 class TaskQueueManager:
@@ -880,23 +2022,59 @@ class TaskQueueManager:
         self.task_controls: Dict[str, TaskControl] = {}
         self.user_tasks: Dict[int, Set[str]] = {}
         self.logger = logging.getLogger("task_queue")
-        self.tasks_storage: Optional[JSONStorage] = None
+        self.tasks_storage: Optional[TasksDB] = None
         self._worker_tasks = []
+        self._health_check_task = None
+        self._task_timeout: int = 3600  # 1 hour default
 
-    def set_storage(self, storage: JSONStorage):
+    def set_storage(self, storage: TasksDB) -> None:
         self.tasks_storage = storage
 
     def start_workers(self):
         for i in range(self.max_concurrent_tasks):
             task = asyncio.create_task(self._worker(f"worker-{i + 1}"))
             self._worker_tasks.append(task)
+        # Start health check
+        self._health_check_task = asyncio.create_task(self._task_health_check())
 
     async def stop_workers(self):
         """Останавливает всех воркеров"""
+        if self._health_check_task:
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                pass
         for task in self._worker_tasks:
             task.cancel()
         await asyncio.gather(*self._worker_tasks, return_exceptions=True)
         self._worker_tasks = []
+
+    async def _task_health_check(self):
+        """Проверка здоровья задач (таймауты, зависания)"""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                for task_id, control in list(self.task_controls.items()):
+                    if control.is_timed_out():
+                        self.logger.warning(f"Task {task_id} timed out, cancelling")
+                        control.cancelled = True
+                        # Update task status
+                        if self.tasks_storage:
+                            await self.tasks_storage.update_by_id(
+                                task_id,
+                                {
+                                    "status": "failed",
+                                    "error": "Task timeout",
+                                    "completed_at": datetime.now().isoformat(),
+                                },
+                                id_field="task_id",
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Task health check error: {e}")
+                await asyncio.sleep(30)
 
     async def _worker(self, name: str):
         self.logger.info(f"Worker {name} started")
@@ -904,11 +2082,39 @@ class TaskQueueManager:
             try:
                 task_func, task_id, args, kwargs = await self.queue.get()
                 control = self.task_controls.setdefault(task_id, TaskControl())
+                control.timeout = self._task_timeout
                 try:
                     self.active_tasks[task_id] = asyncio.current_task()
-                    await task_func(control, *args, **kwargs)
+                    # Wrap task with timeout and error handling
+                    try:
+                        await asyncio.wait_for(
+                            task_func(control, *args, **kwargs),
+                            timeout=self._task_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Task {task_id} timed out")
+                        control.cancelled = True
+                        if self.tasks_storage:
+                            await self.tasks_storage.update_by_id(
+                                task_id,
+                                {
+                                    "status": "failed",
+                                    "error": "Task timeout",
+                                    "completed_at": datetime.now().isoformat(),
+                                },
+                                id_field="task_id",
+                            )
                 except asyncio.CancelledError:
                     self.logger.info(f"Task {task_id} cancelled")
+                    if self.tasks_storage:
+                        await self.tasks_storage.update_by_id(
+                            task_id,
+                            {
+                                "status": "cancelled",
+                                "completed_at": datetime.now().isoformat(),
+                            },
+                            id_field="task_id",
+                        )
                 except Exception as e:
                     self.logger.exception(f"Task {task_id} error: {e}")
                     if self.tasks_storage:
@@ -1009,6 +2215,7 @@ class ScrapingStates(StatesGroup):
     waiting_message_limit = State()
     waiting_user_count = State()
     waiting_account = State()
+    waiting_source_type = State()  # Выбор источника: ручной или БД
 
 
 class KeyGeneration(StatesGroup):
@@ -1021,10 +2228,21 @@ class BulkMailStates(StatesGroup):
     waiting_text = State()
     waiting_sender = State()
     waiting_count = State()
+    waiting_texts = State()  # Множественные тексты для рассылки
+    waiting_db_source = State()  # Выбор источника (ручной или БД)
 
 
 class ClearCacheStates(StatesGroup):
     waiting_confirmation = State()
+
+
+class WormModeStates(StatesGroup):
+    waiting_source = State()
+    active = State()
+
+
+class AddChatsStates(StatesGroup):
+    waiting_links = State()
 
 
 # --- Инициализация объектов ---
@@ -1039,12 +2257,20 @@ dp.callback_query.middleware(CallbackAnswerMiddleware())
 
 auth_manager = AuthManager(Config.AUTH_FILE)
 cache_manager = CacheManager(Config.CACHE_DB_PATH)
-tasks_storage = JSONStorage(Config.TASKS_FILE)
+chat_db = ChatDB(os.path.join(Config.DATA_DIR, "chats.db"))
+tasks_storage = TasksDB(Config.TASKS_FILE)
 account_pool = AccountPoolManager()
 task_queue = TaskQueueManager(max_concurrent_tasks=Config.MAX_CONCURRENT_TASKS)
 task_queue.set_storage(tasks_storage)
 
 pending_auth = {}
+
+# --- Worm Mode state ---
+_worm_active: bool = False
+_worm_task: Optional[asyncio.Task] = None
+_worm_chat_id: Optional[str] = None
+_worm_stats: Dict[str, int] = {"messages": 0, "links": 0, "added": 0, "errors": 0}
+_worm_lock = asyncio.Lock()
 
 
 # --- Middleware ---
@@ -1068,14 +2294,14 @@ async def auth_middleware(handler, event, data):
     if isinstance(event, Message):
         if user_id not in pending_auth:
             pending_auth[user_id] = True
-            text = "🔑 <b>Требуется авторизация!</b>\nПожалуйста, введите ключ доступа, который вы получили от администратора:"
-            keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+            text = translate("auth_required")
+            keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
             await smart_answer(
                 event, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
         else:
             await smart_answer(
-                event, bot, "⌛️ Ожидаю ввода ключа доступа...", delete_origin=False
+                event, bot, translate("waiting_key"), delete_origin=False
             )
     return None
 
@@ -1100,34 +2326,104 @@ async def cmd_start(event, state: FSMContext):
 
     if not is_admin and not is_authorized:
         pending_auth[user_id] = True
-        text = "🔒 <b>Требуется авторизация!</b>\n\nДля использования бота вам необходим ключ доступа.\nПожалуйста, введите ключ, который вы получили от администратора:"
+        text = translate("auth_required")
         await smart_answer(event, bot, text, delete_origin=False)
         return
 
+    # Получаем статистику
+    accounts_count = len(account_pool.accounts)
+    chats_count = await chat_db.get_active_chats_count() if chat_db.conn else 0
+    total_users = await chat_db.get_total_users() if chat_db.conn else 0
+
     if is_admin:
-        text = "👑 <b>Добро пожаловать, администратор!</b>"
+        text = translate(
+            "welcome_admin",
+            accounts=accounts_count,
+            chats=chats_count,
+            users=total_users,
+        )
         keyboard = [
-            [{"text": "📋 Список задач", "callback_data": "task_list"}],
-            [{"text": "👥 Список аккаунтов", "callback_data": "list_accounts"}],
-            [{"text": "🔑 Генерация ключа", "callback_data": "genkey"}],
-            [{"text": "🗑️ Сброс кэша", "callback_data": "clear_cache"}],
-            [{"text": "📊 Статистика", "callback_data": "task_stats"}],
-            [{"text": "📱 Добавить аккаунт", "callback_data": "add_account"}],
-            [{"text": "🔍 Начать сбор", "callback_data": "start_scraping"}],
-            [{"text": "📨 Массовая рассылка", "callback_data": "bulk_mailing"}],
-            [{"text": "❓ Помощь", "callback_data": "help"}],
-            [{"text": "💸 Рефералка", "callback_data": "ref"}],
+            [{"text": translate("buttons.task_list"), "callback_data": "task_list"}],
+            [
+                {
+                    "text": translate("buttons.cancel_all_tasks"),
+                    "callback_data": "cancel_all_tasks",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.list_accounts"),
+                    "callback_data": "list_accounts",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.add_chats_to_db"),
+                    "callback_data": "add_chats_to_db",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.update_chats_db"),
+                    "callback_data": "update_chats_db",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.clear_cache"),
+                    "callback_data": "clear_cache",
+                }
+            ],
+            [{"text": translate("buttons.worm_mode"), "callback_data": "worm_mode"}],
+            [{"text": translate("buttons.genkey"), "callback_data": "genkey"}],
+            [
+                {
+                    "text": translate("buttons.start_scraping"),
+                    "callback_data": "start_scraping",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.bulk_mailing"),
+                    "callback_data": "bulk_mailing",
+                }
+            ],
         ]
     else:
-        text = "👋 <b>Добро пожаловать в бота-инвайтера!</b>"
+        text = translate("welcome_user")
         keyboard = [
-            [{"text": "📱 Добавить аккаунт", "callback_data": "add_account"}],
-            [{"text": "👥 Мои аккаунты", "callback_data": "list_accounts"}],
-            [{"text": "🔍 Начать сбор", "callback_data": "start_scraping"}],
-            [{"text": "📨 Массовая рассылка", "callback_data": "bulk_mailing"}],
-            [{"text": "📊 Мои задачи", "callback_data": "my_tasks"}],
-            [{"text": "❓ Помощь", "callback_data": "help"}],
-            [{"text": "💸 Рефералка", "callback_data": "ref"}],
+            [
+                {
+                    "text": translate("buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.list_accounts"),
+                    "callback_data": "list_accounts",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.start_scraping"),
+                    "callback_data": "start_scraping",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.bulk_mailing"),
+                    "callback_data": "bulk_mailing",
+                }
+            ],
+            [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
+            [{"text": translate("buttons.worm_mode"), "callback_data": "worm_mode"}],
         ]
 
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
@@ -1147,22 +2443,26 @@ async def process_auth_key(message: Message):
     if await auth_manager.verify_key(user_id, key):
         await auth_manager.add_authorized_user(user_id)
         del pending_auth[user_id]
-        text = "✅ <b>Авторизация успешна!</b>\n\nТеперь вы можете использовать все функции бота."
+        text = translate("auth_success")
         await smart_answer(message, bot, text, delete_origin=False)
         await cmd_start(message, None)
     else:
         await notify_admins(
             bot,
-            f"⚠️ <b>Попытка несанкционированного доступа!</b>\n• Пользователь: {user_id}\n• Введенный ключ: {key}",
+            translate(
+                "admin_notif_unauthorized",
+                user_id=user_id,
+                key=key,
+            ),
         )
-        text = "❌ <b>Неверный ключ доступа!</b>\n\nАдминистраторы уведомлены о попытке входа.\nПожалуйста, свяжитесь с администратором для получения действительного ключа."
+        text = translate("auth_invalid")
         await smart_answer(message, bot, text, delete_origin=False)
 
 
 @router.callback_query(F.data == "add_account")
 async def cmd_add_account(event: CallbackQuery, state: FSMContext):
-    text = "📱 <b>Шаг 1/3</b>\nПожалуйста, отправьте ваш номер телефона в международном формате (например, +71234567890):"
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate("waiting_phone")
+    keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(AddAccountStates.waiting_phone)
 
@@ -1171,10 +2471,10 @@ async def cmd_add_account(event: CallbackQuery, state: FSMContext):
 async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     await state.update_data(phone=phone)
-    text = "⚠️ <b>Уведомление о безопасности</b>\n\nДобавляя ваш аккаунт:\n• Этот бот будет использовать ваш аккаунт Telegram\n• Ваши другие сессии НЕ будут завершены\n• Вы можете продолжать использовать Telegram как обычно\n\nВы согласны продолжить? (да/нет)"
+    text = translate("safety_notice")
     keyboard = [
-        [{"text": "✅ Да", "callback_data": "confirm_yes"}],
-        [{"text": "❌ Нет", "callback_data": "cancel"}],
+        [{"text": translate("buttons.confirm_yes"), "callback_data": "confirm_yes"}],
+        [{"text": translate("buttons.confirm_no"), "callback_data": "cancel"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -1205,8 +2505,8 @@ async def process_confirmation_yes(event: CallbackQuery, state: FSMContext):
             phone_code_hash=sent_code.phone_code_hash,
             password_attempts=0,
         )
-        text = f"🔑 <b>Шаг 2/3</b>\nTelegram отправил код на ваш телефон ({phone}).\nПожалуйста, введите код в формате: <code>12345</code>"
-        keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+        text = translate("waiting_code", phone=phone)
+        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
@@ -1253,16 +2553,24 @@ async def process_code(message: Message, state: FSMContext):
                 raise Exception("Authorization failed after reconnect")
             session_name = f"account_{me.id}"
             account_pool.add_account(session_string, session_name)
-            text = f"✅ <b>Аккаунт успешно добавлен!</b>\n• Имя: {me.first_name or ''} {me.last_name or ''}\n• Имя пользователя: @{me.username}\n• Телефон: {phone}\n\n⚠️ <b>Помните:</b> Ваши другие сессии останутся активными."
-            keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            text = translate(
+                "account_added",
+                name=name,
+                username=me.username or "none",
+                phone=phone,
+            )
+            keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
             await persistent_client.disconnect()
             await state.clear()
         else:
-            text = "🔒 <b>Шаг 3/3</b>\nПожалуйста, введите ваш пароль двухфакторной аутентификации:"
-            keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+            text = translate("waiting_password")
+            keyboard = [
+                [{"text": translate("buttons.cancel"), "callback_data": "cancel"}]
+            ]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
@@ -1336,8 +2644,14 @@ async def process_password(message: Message, state: FSMContext):
                 raise Exception("Authorization failed after reconnect")
             session_name = f"account_{me.id}"
             account_pool.add_account(session_string, session_name)
-            text = f"✅ <b>Аккаунт успешно добавлен!</b>\n• Имя: {me.first_name or ''} {me.last_name or ''}\n• Имя пользователя: @{me.username}\n• Телефон: {phone}\n\n⚠️ <b>Помните:</b> Ваши другие сессии останутся активными."
-            keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+            name = f"{me.first_name or ''} {me.last_name or ''}".strip()
+            text = translate(
+                "account_added",
+                name=name,
+                username=me.username or "none",
+                phone=phone,
+            )
+            keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
@@ -1380,17 +2694,22 @@ async def process_password(message: Message, state: FSMContext):
 @router.callback_query(F.data == "list_accounts")
 async def cmd_list_accounts(event: CallbackQuery):
     if not account_pool.accounts:
-        text = "ℹ️ Нет доступных аккаунтов. Используйте кнопку 'Добавить аккаунт', чтобы добавить."
+        text = translate("no_accounts")
         keyboard = [
-            [{"text": "📱 Добавить аккаунт", "callback_data": "add_account"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate("buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = "📋 <b>Доступные аккаунты:</b>\n\n"
+    lines = [translate("accounts_list")]
     for i, acc in enumerate(account_pool.accounts, 1):
         status = "🟢 Свободен" if not acc["in_use"] else "🔴 Используется"
         validity = "🟢 Рабочий" if acc["is_valid"] else "🔴 Не рабочий"
@@ -1399,9 +2718,14 @@ async def cmd_list_accounts(event: CallbackQuery):
             if acc.get("flood_wait_until")
             else ""
         )
-        text += f"{i}. <code>{acc['session_file']}</code>\nСтатус: {status} | {validity} {flood}\nПоследнее использование: {acc['last_used'] or 'Никогда'}\n\n"
+        lines.append(
+            f"{i}. <code>{acc['session_file']}</code>\n"
+            f"Статус: {status} | {validity} {flood}\n"
+            f"Последнее использование: {acc['last_used'] or 'Никогда'}\n"
+        )
 
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    text = "\n".join(lines)
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
     if event.from_user.id in Config.ADMIN_USER_IDS:
         keyboard.insert(
             0, [{"text": "🔄 Обновить список", "callback_data": "list_accounts"}]
@@ -1413,16 +2737,11 @@ async def cmd_list_accounts(event: CallbackQuery):
 @router.callback_query(F.data == "genkey")
 async def cmd_genkey(event: CallbackQuery, state: FSMContext):
     if event.from_user.id not in Config.ADMIN_USER_IDS:
-        await smart_answer(
-            event,
-            bot,
-            "🚫 Только администраторы могут генерировать ключи доступа!",
-            show_alert=True,
-        )
+        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
         return
 
-    text = "🔑 <b>Генерация ключа доступа</b>\n\nПожалуйста, введите ID пользователя, для которого нужно сгенерировать ключ:"
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate("genkey_title")
+    keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(KeyGeneration.waiting_user_id)
 
@@ -1432,8 +2751,12 @@ async def process_user_id(message: Message, state: FSMContext):
     try:
         user_id = int(message.text.strip())
         key = await auth_manager.generate_key(user_id)
-        text = f"✅ <b>Ключ успешно сгенерирован!</b>\n\n• ID пользователя: <code>{user_id}</code>\n• Ключ доступа: <code>{key}</code>\n\nПередайте этот ключ пользователю. После ввода ключа пользователь получит доступ к боту."
-        keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+        text = translate(
+            "genkey_success",
+            user_id=user_id,
+            key=key,
+        )
+        keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
         await smart_answer(
             message, bot, text, reply_markup=kb(keyboard), delete_origin=False
         )
@@ -1450,10 +2773,15 @@ async def process_user_id(message: Message, state: FSMContext):
 @router.callback_query(F.data == "start_scraping")
 async def cmd_start_scraping(event: CallbackQuery, state: FSMContext):
     if not account_pool.accounts:
-        text = "❌ Нет доступных аккаунтов! Сначала добавьте аккаунты с помощью кнопки 'Добавить аккаунт'"
+        text = translate("no_available_accounts_btn")
         keyboard = [
-            [{"text": "📱 Добавить аккаунт", "callback_data": "add_account"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate("buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -1461,20 +2789,84 @@ async def cmd_start_scraping(event: CallbackQuery, state: FSMContext):
         return
 
     if not task_queue.can_user_add_task(event.from_user.id):
-        text = f"❌ Вы уже имеете максимальное количество активных задач ({Config.MAX_TASKS_PER_USER}).\nДождитесь завершения текущей задачи."
+        text = translate(
+            "max_tasks_reached",
+            max_tasks=Config.MAX_TASKS_PER_USER,
+        )
         keyboard = [
-            [{"text": "📊 Мои задачи", "callback_data": "my_tasks"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = "🔍 <b>Шаг 1/4</b>\nОтправьте @username или пригласительную ссылку чата/канала, из которого нужно собрать пользователей:"
+    text = translate("scraping_source_select")
+    keyboard = [
+        [
+            {
+                "text": translate("scraping_source_manual"),
+                "callback_data": "scraping_source:manual",
+            }
+        ],
+        [
+            {
+                "text": translate("scraping_source_db_btn"),
+                "callback_data": "scraping_source:db",
+            }
+        ],
+        [{"text": translate("scraping_source_cancel"), "callback_data": "cancel"}],
+    ]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+    await state.set_state(ScrapingStates.waiting_source_type)
+
+
+@router.callback_query(
+    F.data.startswith("scraping_source:"), ScrapingStates.waiting_source_type
+)
+async def scraping_source_select(event: CallbackQuery, state: FSMContext):
+    source_type = event.data.split(":")[1]
+    await state.update_data(scraping_source_type=source_type)
+
+    if source_type == "manual":
+        text = translate("waiting_source")
+        keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+        await state.set_state(ScrapingStates.waiting_source)
+    elif source_type == "db":
+        chats = await chat_db.get_all_chats()
+        if not chats:
+            await smart_answer(
+                event, bot, translate("scraping_db_empty"), show_alert=True
+            )
+            return
+        await state.update_data(db_chats_count=len(chats))
+        text = translate("scraping_source_db", count=len(chats))
+        keyboard = [
+            [
+                {
+                    "text": translate("buttons.continue"),
+                    "callback_data": "scraping_db_continue",
+                }
+            ],
+            [{"text": "Отмена", "callback_data": "cancel"}],
+        ]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+
+
+@router.callback_query(
+    F.data == "scraping_db_continue", ScrapingStates.waiting_source_type
+)
+async def scraping_db_continue(event: CallbackQuery, state: FSMContext):
+    text = translate("waiting_target")
     keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
-    await state.set_state(ScrapingStates.waiting_source)
+    await state.set_state(ScrapingStates.waiting_target)
 
 
 @router.message(ScrapingStates.waiting_source)
@@ -1713,8 +3105,8 @@ async def launch_scraping_task(event, state: FSMContext):
         f"• Аккаунт: {sender_session or 'авто'}"
     )
     keyboard = [
-        [{"text": "📊 Мои задачи", "callback_data": "my_tasks"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
+        [{"text": translate("buttons.main"), "callback_data": "start"}],
     ]
     await smart_answer(
         event,
@@ -1731,18 +3123,75 @@ async def cmd_bulk_mailing(event: CallbackQuery, state: FSMContext):
     if not task_queue.can_user_add_task(event.from_user.id):
         text = f"❌ Вы уже имеете максимальное количество активных задач ({Config.MAX_TASKS_PER_USER}).\nДождитесь завершения текущей задачи."
         keyboard = [
-            [{"text": "📊 Мои задачи", "callback_data": "my_tasks"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = "✉️ <b>Массовая рассылка</b>\n\n<b>Шаг 1/4</b>\nОтправьте список чатов/каналов, через пробел, запятую или с новой строки.\n\n<b>Формат:</b>\n@chat1 @chat2\nhttps://t.me/xxxx"
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate("bulkmail_source_select")
+    keyboard = [
+        [{"text": "✏️ Ввести чаты вручную", "callback_data": "bulkmail_source:manual"}],
+        [{"text": "📦 Использовать чаты из БД", "callback_data": "bulkmail_source:db"}],
+        [{"text": "Отмена", "callback_data": "cancel"}],
+    ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
-    await state.set_state(BulkMailStates.waiting_chats)
+    await state.set_state(BulkMailStates.waiting_db_source)
+
+
+@router.callback_query(
+    F.data.startswith("bulkmail_source:"), BulkMailStates.waiting_db_source
+)
+async def bm_source_select(event: CallbackQuery, state: FSMContext):
+    source_type = event.data.split(":")[1]
+    await state.update_data(chats_source_type=source_type)
+
+    if source_type == "manual":
+        text = translate("bulkmail_step1_manual")
+        keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+        await state.set_state(BulkMailStates.waiting_chats)
+    elif source_type == "db":
+        chats = await chat_db.get_all_chats()
+        if not chats:
+            await smart_answer(
+                event, bot, translate("bulkmail_db_empty"), show_alert=True
+            )
+            return
+        await state.update_data(db_chats_count=len(chats))
+        text = translate("bulkmail_step1_db", count=len(chats))
+        keyboard = [
+            [
+                {
+                    "text": translate("buttons.continue"),
+                    "callback_data": "bulkmail_db_continue",
+                }
+            ],
+            [{"text": "Отмена", "callback_data": "cancel"}],
+        ]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+
+
+@router.callback_query(
+    F.data == "bulkmail_db_continue", BulkMailStates.waiting_db_source
+)
+async def bm_db_continue(event: CallbackQuery, state: FSMContext):
+    text = translate("bulkmail_step2_delay")
+    keyboard = [
+        [{"text": "5 10", "callback_data": "delay:5:10"}],
+        [{"text": "10 20", "callback_data": "delay:10:20"}],
+        [{"text": "20 30", "callback_data": "delay:20:30"}],
+        [{"text": "30 60", "callback_data": "delay:30:60"}],
+        [{"text": "Отмена", "callback_data": "cancel"}],
+    ]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+    await state.set_state(BulkMailStates.waiting_delay)
 
 
 @router.message(BulkMailStates.waiting_chats)
@@ -1753,13 +3202,13 @@ async def bm_waiting_chats(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            "⚠️ Список чатов пуст. Пожалуйста, отправьте корректный список.",
+            translate("bulkmail_empty_chats"),
             delete_origin=False,
         )
         return
 
     await state.update_data(chats=parts)
-    text = "⏱️ <b>Шаг 2/4</b>\nВведите задержку между отправками в секундах в формате: <code>min max</code>\n\n<b>Пример:</b>\n<code>10 20</code> (будет случайная задержка от 10 до 20 секунд)"
+    text = translate("bulkmail_step2_delay")
     keyboard = [
         [{"text": "5 10", "callback_data": "delay:5:10"}],
         [{"text": "10 20", "callback_data": "delay:10:20"}],
@@ -1779,8 +3228,11 @@ async def bm_waiting_delay_callback(event: CallbackQuery, state: FSMContext):
     dmin = int(parts[1])
     dmax = int(parts[2])
     await state.update_data(delay_min=dmin, delay_max=dmax)
-    text = "📝 <b>Шаг 3/4</b>\nОтправьте текст сообщения, которое нужно разослать."
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate("bulkmail_step3_text_first")
+    keyboard = [
+        [{"text": "✅ Готово, продолжить", "callback_data": "bulkmail_texts_done"}],
+        [{"text": "Отмена", "callback_data": "cancel"}],
+    ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BulkMailStates.waiting_text)
 
@@ -1799,14 +3251,17 @@ async def bm_waiting_delay(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            "⚠️ Неверный формат. Введите две неотрицательные цифры: min max (min <= max).",
+            translate("bulkmail_invalid_delay"),
             delete_origin=False,
         )
         return
 
     await state.update_data(delay_min=dmin, delay_max=dmax)
-    text = "📝 <b>Шаг 3/4</b>\nОтправьте текст сообщения, которое нужно разослать."
-    keyboard = [[{"text": "Отмена", "callback_data": "cancel"}]]
+    text = translate("bulkmail_step3_text_first")
+    keyboard = [
+        [{"text": "✅ Готово, продолжить", "callback_data": "bulkmail_texts_done"}],
+        [{"text": "Отмена", "callback_data": "cancel"}],
+    ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
     )
@@ -1815,21 +3270,62 @@ async def bm_waiting_delay(message: Message, state: FSMContext):
 
 @router.message(BulkMailStates.waiting_text)
 async def bm_waiting_text(message: Message, state: FSMContext):
-    text_msg = message.text
-    if not text_msg or not text_msg.strip():
+    if message.text == "/done" or message.text == "/закончить":
         await smart_answer(
             message,
             bot,
-            "⚠️ Сообщение не может быть пустым. Введите текст сообщения.",
+            translate("bulkmail_texts_confirm"),
             delete_origin=False,
         )
         return
 
-    await state.update_data(message_text=text_msg)
+    data = await state.get_data()
+    texts = data.get("texts", [])
+    texts.append(message.text)
+    await state.update_data(texts=texts)
+
+    current_count = len(texts)
+    text = translate("bulkmail_texts_received", count=current_count)
+    keyboard = [
+        [{"text": "➕ Добавить ещё текст", "callback_data": "bulkmail_add_text"}],
+        [{"text": "✅ Готово, продолжить", "callback_data": "bulkmail_texts_done"}],
+        [{"text": "Отмена", "callback_data": "cancel"}],
+    ]
+    await smart_answer(
+        message, bot, text, reply_markup=kb(keyboard), delete_origin=False
+    )
+
+
+@router.callback_query(F.data == "bulkmail_add_text", BulkMailStates.waiting_text)
+async def bm_add_text_callback(event: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    texts = data.get("texts", [])
+    text = translate("bulkmail_step3_text_next", count=len(texts))
+    keyboard = [
+        [{"text": "➕ Добавить ещё текст", "callback_data": "bulkmail_add_text"}],
+        [{"text": "✅ Готово, продолжить", "callback_data": "bulkmail_texts_done"}],
+        [{"text": "Отмена", "callback_data": "cancel"}],
+    ]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+
+
+@router.callback_query(F.data == "bulkmail_texts_done", BulkMailStates.waiting_text)
+async def bm_texts_done_callback(event: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    texts = data.get("texts", [])
+    if not texts:
+        await smart_answer(event, bot, translate("bulkmail_no_texts"), show_alert=True)
+        return
+    await state.update_data(message_text=texts[0])  # For backward compatibility
+    await _proceed_to_sender_selection(event, state)
+
+
+async def _proceed_to_sender_selection(event, state: FSMContext):
+    """Переход к выбору аккаунта-отправителя"""
     accounts_list = account_pool.accounts
 
     if not accounts_list:
-        text = "🔢 <b>Шаг 4/4</b>\nНет доступных аккаунтов — рассылка будет выполняться автоматически из пула.\nВведите общее количество отправок (целое число, например 100)."
+        text = translate("bulkmail_no_accounts")
         keyboard = [
             [{"text": "50", "callback_data": "total:50"}],
             [{"text": "100", "callback_data": "total:100"}],
@@ -1838,14 +3334,12 @@ async def bm_waiting_text(message: Message, state: FSMContext):
             [{"text": "Отмена", "callback_data": "cancel"}],
         ]
         await smart_answer(
-            message, bot, text, reply_markup=kb(keyboard), delete_origin=False
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=False
         )
         await state.set_state(BulkMailStates.waiting_count)
         return
 
-    lines = [
-        "🧾 <b>Шаг 4/4</b>\nВыберите аккаунт-отправитель или введите 'auto' для автоматического распределения:"
-    ]
+    lines = [translate("bulkmail_step4_account")]
     for i, acc in enumerate(accounts_list, 1):
         status = "🔴" if acc["in_use"] else "🟢" if acc["is_valid"] else "⚫"
         flood = f" ⏳ flood" if acc.get("flood_wait_until") else ""
@@ -1868,7 +3362,7 @@ async def bm_waiting_text(message: Message, state: FSMContext):
     )
 
     await smart_answer(
-        message, bot, "\n".join(lines), reply_markup=kb(keyboard), delete_origin=False
+        event, bot, "\n".join(lines), reply_markup=kb(keyboard), delete_origin=False
     )
     await state.set_state(BulkMailStates.waiting_sender)
 
@@ -1917,11 +3411,32 @@ async def bm_waiting_count(message: Message, state: FSMContext):
 async def process_bulk_mailing_final(event, state: FSMContext, total: int):
     data = await state.get_data()
     chats = data.get("chats", [])
+    chats_source_type = data.get("chats_source_type", "manual")
     delay_min = data.get("delay_min", 1)
     delay_max = data.get("delay_max", 1)
-    message_text = data.get("message_text", "")
+    texts = data.get("texts", [])
+    message_text = texts[0] if texts else data.get("message_text", "")
     sender_session = data.get("sender_session", None)
     user_id = event.from_user.id
+
+    # Если используем чаты из БД
+    if chats_source_type == "db":
+        chats = await chat_db.get_all_chats()
+        if not chats:
+            await smart_answer(
+                event, bot, translate("bulkmail_db_empty"), show_alert=True
+            )
+            await state.clear()
+            return
+        chats = [c["chat_url"] or c["chat_id"] for c in chats]
+
+    if not chats:
+        await smart_answer(event, bot, translate("bulkmail_no_chats"), show_alert=True)
+        await state.clear()
+        return
+
+    if not texts:
+        texts = [message_text]
 
     task_id = f"mail_{user_id}_{int(time.time())}"
     task_data = {
@@ -1929,11 +3444,14 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
         "user_id": user_id,
         "type": "mailing",
         "chats": chats,
+        "chats_source_type": chats_source_type,
         "delay_min": delay_min,
         "delay_max": delay_max,
-        "message_text": (
-            message_text[:200] + "..." if len(message_text) > 200 else message_text
+        "message_texts": [t[:500] for t in texts],  # Сохраняем все тексты
+        "message_text_preview": (
+            texts[0][:200] + "..." if len(texts[0]) > 200 else texts[0]
         ),
+        "texts_count": len(texts),
         "sender_session": sender_session,
         "total_sends": total,
         "sent": 0,
@@ -1953,26 +3471,45 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
         chats=chats,
         delay_min=delay_min,
         delay_max=delay_max,
-        message_text=message_text,
+        message_texts=texts,  # Передаём список текстов
         total_sends=total,
         user_id=user_id,
         sender_session_file=sender_session,
         task_id=task_id,
     )
 
-    safe_preview = html.escape(
-        message_text[:200] + "..." if len(message_text) > 200 else message_text
+    texts_preview = "\n".join(
+        [
+            f"{i+1}. {t[:100]}{'...' if len(t) > 100 else ''}"
+            for i, t in enumerate(texts[:3])
+        ]
     )
+    if len(texts) > 3:
+        texts_preview += f"\n...и ещё {len(texts) - 3} текстов"
+
     sender_info = (
         f"• Отправитель: {sender_session}"
         if sender_session
         else "• Отправитель: авто (пул аккаунтов)"
     )
+    source_info = (
+        "📦 Из БД" if chats_source_type == "db" else f"✏️ Вручную: {len(chats)} чатов"
+    )
 
-    text = f"✅ <b>Задача массовой рассылки запущена!</b>\n\n• ID задачи: <code>{task_id}</code>\n• Чатов: {len(chats)}\n• Задержка: {delay_min}-{delay_max} сек\n{sender_info}\n• Текст сообщения: (первые 200 символов)\n\n{safe_preview}\n\n• Всего отправок: {total}\n\nВы получите отчет по завершении."
+    text = (
+        f"✅ <b>Задача массовой рассылки запущена!</b>\n\n"
+        f"• ID задачи: <code>{task_id}</code>\n"
+        f"• Чатов: {len(chats)} ({source_info})\n"
+        f"• Текстов: {len(texts)}\n"
+        f"• Задержка: {delay_min}-{delay_max} сек\n"
+        f"{sender_info}\n"
+        f"• Всего отправок: {total}\n\n"
+        f"📝 <b>Тексты для рассылки:</b>\n{texts_preview}\n\n"
+        f"Вы получите отчет по завершении."
+    )
     keyboard = [
-        [{"text": "📊 Мои задачи", "callback_data": "my_tasks"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
+        [{"text": translate("buttons.main"), "callback_data": "start"}],
     ]
 
     if isinstance(event, CallbackQuery):
@@ -2055,15 +3592,27 @@ async def show_task_details(
     if status == "running" and can_control:
         keyboard.append(
             [
-                {"text": "⏸ Пауза", "callback_data": f"pause_task:{task_id}"},
-                {"text": "❌ Отмена", "callback_data": f"cancel_task_id:{task_id}"},
+                {
+                    "text": translate("task_pause"),
+                    "callback_data": f"pause_task:{task_id}",
+                },
+                {
+                    "text": translate("task_cancel_btn"),
+                    "callback_data": f"cancel_task_id:{task_id}",
+                },
             ]
         )
     elif status == "paused" and can_control:
         keyboard.append(
             [
-                {"text": "▶️ Возобновить", "callback_data": f"resume_task:{task_id}"},
-                {"text": "❌ Отмена", "callback_data": f"cancel_task_id:{task_id}"},
+                {
+                    "text": translate("task_resume"),
+                    "callback_data": f"resume_task:{task_id}",
+                },
+                {
+                    "text": translate("task_cancel_btn"),
+                    "callback_data": f"cancel_task_id:{task_id}",
+                },
             ]
         )
     elif status == "pending" and can_control:
@@ -2086,14 +3635,19 @@ async def show_task_details(
             keyboard.append(
                 [
                     {
-                        "text": "🚪 Выйти из чатов",
+                        "text": translate("task_leave_chats"),
                         "callback_data": f"leave_chats:{task_id}",
                     }
                 ]
             )
 
     keyboard.append(
-        [{"text": "🔄 Обновить", "callback_data": f"refresh_task:{task_id}"}]
+        [
+            {
+                "text": translate("task_refresh"),
+                "callback_data": f"refresh_task:{task_id}",
+            }
+        ]
     )
 
     # Для администратора - информация о пользователе
@@ -2111,12 +3665,12 @@ async def show_task_details(
     keyboard.append(
         [
             {
-                "text": "📋 Все задачи",
+                "text": translate("task_all_tasks"),
                 "callback_data": "task_list" if for_admin else "my_tasks",
             }
         ]
     )
-    keyboard.append([{"text": "Главная", "callback_data": "start"}])
+    keyboard.append([{"text": translate("buttons.main"), "callback_data": "start"}])
 
     return text, kb(keyboard)
 
@@ -2130,9 +3684,19 @@ async def cmd_my_tasks(event: CallbackQuery):
     if not user_tasks:
         text = "📭 <b>У вас нет задач</b>\n\nНачните новую задачу, используя меню."
         keyboard = [
-            [{"text": "🔍 Начать сбор", "callback_data": "start_scraping"}],
-            [{"text": "📨 Массовая рассылка", "callback_data": "bulk_mailing"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate("buttons.start_scraping"),
+                    "callback_data": "start_scraping",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.bulk_mailing"),
+                    "callback_data": "bulk_mailing",
+                }
+            ],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -2157,11 +3721,21 @@ async def cmd_my_tasks(event: CallbackQuery):
                 event, bot, text, reply_markup=keyboard, delete_origin=True
             )
     else:
-        text = "📭 <b>У вас нет активных задач</b>"
+        text = translate("no_active_tasks")
         keyboard = [
-            [{"text": "🔍 Начать сбор", "callback_data": "start_scraping"}],
-            [{"text": "📨 Массовая рассылка", "callback_data": "bulk_mailing"}],
-            [{"text": "Главная", "callback_data": "start"}],
+            [
+                {
+                    "text": translate("buttons.start_scraping"),
+                    "callback_data": "start_scraping",
+                }
+            ],
+            [
+                {
+                    "text": translate("buttons.bulk_mailing"),
+                    "callback_data": "bulk_mailing",
+                }
+            ],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -2195,7 +3769,7 @@ async def cmd_my_tasks(event: CallbackQuery):
                     ),
                 }
             ],
-            [{"text": "Главная", "callback_data": "start"}],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
         ]
 
         await smart_answer(
@@ -2222,7 +3796,7 @@ async def cmd_task_list(event: CallbackQuery):
 
     if not active_tasks:
         text = "📭 <b>Нет активных задач</b>"
-        keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+        keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
@@ -2442,28 +4016,21 @@ async def cmd_task_stats(event: CallbackQuery):
     scraping = len([t for t in tasks if t.get("type") == "scraping"])
     mailing = len([t for t in tasks if t.get("type") == "mailing"])
 
-    stats = (
-        "📊 <b>Статистика задач</b>\n\n"
-        f"• Всего задач: {total}\n"
-        f"• В ожидании: {pending}\n"
-        f"• Выполняются: {running}\n"
-        f"• На паузе: {paused}\n"
-        f"• Завершены: {completed}\n"
-        f"• Отменены: {cancelled}\n"
-        f"• Ошибки: {failed}\n\n"
-        "<b>По типам:</b>\n"
-        f"• Сбор пользователей: {scraping}\n"
-        f"• Массовая рассылка: {mailing}\n\n"
-        "<b>Очередь:</b>\n"
-        f"• Активные задачи: {len(task_queue.active_tasks)}\n"
-        f"• Задачи в очереди: {task_queue.queue.qsize()}\n"
-        f"• Доступные аккаунты: {len([a for a in account_pool.accounts if not a['in_use'] and a['is_valid']])}/{len(account_pool.accounts)}"
+    stats = translate(
+        "task_stats",
+        total=total,
+        pending=pending,
+        running=running,
+        paused=paused,
+        completed=completed,
+        cancelled=cancelled,
+        failed=failed,
     )
 
     keyboard = [
-        [{"text": "📋 Список задач", "callback_data": "task_list"}],
-        [{"text": "🔄 Обновить", "callback_data": "task_stats"}],
-        [{"text": "Главная", "callback_data": "start"}],
+        [{"text": translate("buttons.task_list"), "callback_data": "task_list"}],
+        [{"text": translate("task_refresh"), "callback_data": "task_stats"}],
+        [{"text": translate("buttons.main"), "callback_data": "start"}],
     ]
 
     await smart_answer(event, bot, stats, reply_markup=kb(keyboard), delete_origin=True)
@@ -2473,18 +4040,18 @@ async def cmd_task_stats(event: CallbackQuery):
 async def cmd_clear_cache(event: CallbackQuery, state: FSMContext):
     user_id = event.from_user.id
     if user_id not in Config.ADMIN_USER_IDS:
-        await smart_answer(
-            event,
-            bot,
-            "⛔ Эта команда доступна только администраторам!",
-            show_alert=True,
-        )
+        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
         return
 
-    text = "🗑️ <b>Сброс кэша</b>\n\nВы уверены, что хотите очистить весь кэш участников чатов?\nЭто действие нельзя отменить."
+    text = translate("clear_cache_confirm")
     keyboard = [
-        [{"text": "✅ Да, очистить", "callback_data": "clear_cache_confirm"}],
-        [{"text": "❌ Нет, отмена", "callback_data": "start"}],
+        [
+            {
+                "text": translate("buttons.confirm_yes"),
+                "callback_data": "clear_cache_confirm",
+            }
+        ],
+        [{"text": translate("buttons.confirm_no"), "callback_data": "start"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -2492,26 +4059,528 @@ async def cmd_clear_cache(event: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "clear_cache_confirm")
 async def process_clear_cache_confirm(event: CallbackQuery):
     cleared = await cache_manager.clear_cache()
-    text = f"✅ <b>Кэш очищен!</b>\n\nУдалено записей: {cleared}"
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+    text = translate("cache_cleared", count=cleared)
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
-@router.callback_query(F.data == "help")
-async def cmd_help(event: CallbackQuery):
-    text = "📚 <b>Руководство по использованию бота</b>\n\n1. <b>Добавление аккаунтов</b> - используйте кнопку 'Добавить аккаунт' для добавления ваших аккаунтов Telegram\n2. <b>Начать сбор</b> - используйте 'Начать сбор' для сбора пользователей\n3. <b>Приглашение пользователей</b> - собранные пользователи будут приглашены в вашу целевую группу\n\n⚙️ <b>Как это работает:</b>\n- Я анализирую сообщения в исходном чате\n- Собираю активных пользователей\n- Приглашаю их в вашу целевую группу\n\n⚠️ <b>Безопасность:</b>\n- Ваши другие сессии Telegram НЕ будут завершены\n- Сессии надежно хранятся и никогда не передаются третьим лицам"
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+# === Отменить все задачи ===
+@router.callback_query(F.data == "cancel_all_tasks")
+async def cmd_cancel_all_tasks(event: CallbackQuery):
+    if event.from_user.id not in Config.ADMIN_USER_IDS:
+        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        return
+
+    text = "🗑️ <b>Отмена всех задач</b>\n\nВы уверены, что хотите отменить все задачи?\nЭто действие нельзя отменить."
+    keyboard = [
+        [
+            {
+                "text": translate("task_confirm_yes"),
+                "callback_data": "cancel_all_tasks_confirm",
+            }
+        ],
+        [{"text": translate("task_confirm_no"), "callback_data": "start"}],
+    ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
-@router.callback_query(F.data == "ref")
-async def cmd_ref(event: CallbackQuery):
-    text = "💸 <b>Зарабатывай с рефералкой:</b>\n\n👥 <b>1 человек</b> = +200₽\n👥 <b>3 человека</b> = +700₽\n👥 <b>5 человек</b> = +1500₽\n👥 <b>10 человек</b> = +4000₽\n\nЧтобы реферал считался приведённым вами он должен при регистрации сообщить ваш юзернейм."
-    keyboard = [[{"text": "Главная", "callback_data": "start"}]]
+@router.callback_query(F.data == "cancel_all_tasks_confirm")
+async def process_cancel_all_tasks(event: CallbackQuery):
+    if event.from_user.id not in Config.ADMIN_USER_IDS:
+        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        return
+
+    cancelled = 0
+    for task_id in list(task_queue.active_tasks.keys()):
+        if await task_queue.cancel_task(task_id):
+            cancelled += 1
+
+    # Отменяем также все pending задачи
+    tasks = await tasks_storage.read_all()
+    for task in tasks:
+        if task.get("status") in ("pending", "running", "paused"):
+            tid = task.get("task_id")
+            if tid and tid not in task_queue.active_tasks:
+                await tasks_storage.update_by_id(
+                    tid,
+                    {"status": "cancelled", "cancelled_at": datetime.now().isoformat()},
+                    id_field="task_id",
+                )
+                cancelled += 1
+
+    text = f"✅ <b>Задачи отменены!</b>\n\nОтменено задач: {cancelled}"
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
-# --- Исправленные задачи ---
+# === Добавить чаты в БД ===
+@router.callback_query(F.data == "add_chats_to_db")
+async def cmd_add_chats_to_db(event: CallbackQuery, state: FSMContext):
+    if not account_pool.accounts:
+        text = translate("worm_no_account")
+        keyboard = [
+            [
+                {
+                    "text": translate("buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
+        ]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+        return
+
+    text = translate("worm_waiting_links")
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+    await state.set_state(AddChatsStates.waiting_links)
+
+
+@router.message(AddChatsStates.waiting_links)
+async def process_add_chats_links(message: Message, state: FSMContext):
+    await _process_chats_input(message, state, source="message")
+
+
+async def _process_chats_input(
+    event, state: FSMContext, source: str = "message"
+) -> None:
+    """Обработка ссылок — из сообщения или файла"""
+    raw_links: List[str] = []
+
+    if source == "message":
+        text = (getattr(event, "text", None) or "").strip()
+        if not text:
+            await smart_answer(
+                event, bot, translate("empty_input"), delete_origin=False
+            )
+            return
+        # Разбиваем по пробелам, запятым, новым строкам
+        parts = re.split(r"[\s,;\n]+", text)
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            # Убедимся что это ссылка или username
+            if part.startswith("http"):
+                raw_links.append(part)
+            elif part.startswith("t.me/"):
+                raw_links.append(f"https://{part}")
+            elif part.startswith("@"):
+                raw_links.append(f"https://t.me/{part[1:]}")
+            elif re.match(r"^[A-Za-z0-9_]{2,32}$", part):
+                raw_links.append(f"https://t.me/{part}")
+
+    elif source == "file":
+        # Читаем файл
+        if not event.document:
+            await smart_answer(
+                event, bot, translate("invalid_format"), delete_origin=False
+            )
+            return
+        file = await event.download()
+        content = file.read().decode("utf-8", errors="ignore")
+        parts = re.split(r"[\s,;\n]+", content)
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if part.startswith("http"):
+                raw_links.append(part)
+            elif part.startswith("t.me/"):
+                raw_links.append(f"https://{part}")
+            elif part.startswith("@"):
+                raw_links.append(f"https://t.me/{part[1:]}")
+            elif re.match(r"^[A-Za-z0-9_]{2,32}$", part):
+                raw_links.append(f"https://t.me/{part}")
+
+    if not raw_links:
+        await smart_answer(event, bot, translate("empty_input"), delete_origin=False)
+        return
+
+    # Убираем дубликаты
+    seen: Set[str] = set()
+    unique_links: List[str] = []
+    for link in raw_links:
+        parsed = parse_link_to_identifier(link)
+        if parsed and parsed not in seen:
+            seen.add(parsed)
+            unique_links.append(link)
+
+    if not unique_links:
+        await smart_answer(event, bot, translate("empty_input"), delete_origin=False)
+        return
+
+    # Получаем аккаунт
+    acc = account_pool.accounts[0]
+    for a in account_pool.accounts:
+        if not a["in_use"] and a["is_valid"]:
+            acc = a
+            break
+
+    if not acc["client"] or not acc["client"].is_connected():
+        try:
+            acc["client"] = await account_pool._create_client(acc["session_string"])
+            await acc["client"].get_me()
+        except Exception as e:
+            logger.error(
+                f"Не удалось подключиться к аккаунту {acc['session_file']}: {e}"
+            )
+            await smart_answer(
+                event, bot, translate("no_available_accounts"), delete_origin=False
+            )
+            return
+
+    client = acc["client"]
+    added = 0
+    errors = 0
+    results_text: List[str] = []
+
+    for link in unique_links[:50]:  # Лимит 50 чатов за раз
+        identifier = parse_link_to_identifier(link)
+        if not identifier:
+            errors += 1
+            continue
+
+        try:
+            result = await validate_and_test_chat(
+                client,
+                acc,
+                identifier,
+                "add_chats",
+                event.from_user.id,
+                bot,
+                event.from_user.id,
+            )
+            if result:
+                success = await chat_db.add_chat(
+                    result["chat_id"],
+                    result["chat_name"],
+                    result["chat_url"],
+                    result["chat_type"],
+                    result["user_count"],
+                    True,
+                )
+                if success:
+                    added += 1
+                    results_text.append(
+                        f"✅ {result['chat_name']} ({result['user_count']} пользователей)"
+                    )
+                else:
+                    errors += 1
+            else:
+                errors += 1
+        except Exception as e:
+            errors += 1
+            logger.error(f"Ошибка обработки чата {link}: {e}")
+
+    output = f"✅ <b>Добавление чатов завершено!</b>\n\n"
+    output += f"• Обработано ссылок: {len(unique_links)}\n"
+    output += f"• Добавлено в БД: {added}\n"
+    output += f"• Ошибок: {errors}\n\n"
+    if results_text:
+        output += "<b>Добавленные чаты:</b>\n" + "\n".join(results_text[:20])
+        if len(results_text) > 20:
+            output += f"\n\n...и ещё {len(results_text) - 20}"
+
+    keyboard = [
+        [{"text": translate("buttons.main"), "callback_data": "start"}],
+    ]
+    await smart_answer(
+        event, bot, output, reply_markup=kb(keyboard), delete_origin=False
+    )
+    await state.clear()
+
+
+# === Обновить БД чатов ===
+@router.callback_query(F.data == "update_chats_db")
+async def cmd_update_chats_db(event: CallbackQuery):
+    if event.from_user.id not in Config.ADMIN_USER_IDS:
+        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        return
+
+    if not account_pool.accounts:
+        await smart_answer(
+            event, bot, translate("no_available_accounts"), show_alert=True
+        )
+        return
+
+    chats = await chat_db.get_all_chats()
+    total = len(chats)
+    if total == 0:
+        await smart_answer(
+            event, bot, "ℹ️ БД чатов пуста. Добавьте чаты сначала.", show_alert=True
+        )
+        return
+
+    text = translate("update_db_start", total=total)
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    msg = await smart_answer(
+        event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+    )
+
+    # Запускаем проверку в фоне
+    asyncio.create_task(_run_update_chats_db(msg, event.from_user.id))
+
+
+async def _run_update_chats_db(msg: Any, user_id: int):
+    """Фоновая проверка всех чатов в БД"""
+    if not account_pool.accounts:
+        return
+
+    acc = None
+    for a in account_pool.accounts:
+        if not a["in_use"] and a["is_valid"]:
+            acc = a
+            break
+    if not acc:
+        return
+
+    client = acc["client"]
+    if not client or not client.is_connected():
+        try:
+            client = await account_pool._create_client(acc["session_string"])
+        except Exception:
+            return
+
+    result = await check_and_clean_banned_chats(client, bot, user_id)
+    chats = await chat_db.get_all_chats()
+    total_users = await chat_db.get_total_users()
+
+    text = translate(
+        "update_db_done",
+        checked=result["checked"],
+        added=0,
+        removed=result["removed"],
+        errors=result["errors"],
+    )
+    text += f"\n\n📊 <b>Текущая статистика:</b>\n• Чатов: {len(chats)}\n• Всего пользователей: {total_users}"
+
+    try:
+        if isinstance(msg, Message) and msg and msg.chat:
+            await msg.edit_text(text, parse_mode="HTML")
+        elif isinstance(msg, CallbackQuery) and msg.message:
+            await msg.message.edit_text(text, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"Ошибка обновления сообщения при обновлении БД: {e}")
+
+
+# === Режим червя ===
+@router.callback_query(F.data == "worm_mode")
+async def cmd_worm_mode(event: CallbackQuery, state: FSMContext):
+    if not account_pool.accounts:
+        text = translate("worm_no_account")
+        keyboard = [
+            [
+                {
+                    "text": translate("buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            [{"text": translate("buttons.main"), "callback_data": "start"}],
+        ]
+        await smart_answer(
+            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+        )
+        return
+
+    text = translate("worm_waiting_chat")
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+    await state.set_state(WormModeStates.waiting_source)
+
+
+@router.callback_query(F.data == "stop_worm")
+async def cmd_stop_worm(event: CallbackQuery):
+    global _worm_active, _worm_task
+
+    if not _worm_active:
+        await smart_answer(event, bot, "⚠️ Режим червя не запущен.", show_alert=True)
+        return
+
+    _worm_active = False
+    if _worm_task:
+        _worm_task.cancel()
+        try:
+            await _worm_task
+        except asyncio.CancelledError:
+            pass
+        _worm_task = None
+
+    async with _worm_lock:
+        stats = dict(_worm_stats)
+
+    text = translate(
+        "worm_stopped",
+        messages=stats.get("messages", 0),
+        links=stats.get("links", 0),
+        added=stats.get("added", 0),
+        errors=stats.get("errors", 0),
+    )
+    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
+
+    async with _worm_lock:
+        _worm_stats = {"messages": 0, "links": 0, "added": 0, "errors": 0}
+
+
+@router.message(WormModeStates.waiting_source)
+async def process_worm_source(message: Message, state: FSMContext):
+    global _worm_active, _worm_task, _worm_chat_id, _worm_stats
+
+    if _worm_active:
+        await smart_answer(
+            message,
+            bot,
+            translate("worm_already_running", chat=_worm_chat_id),
+            delete_origin=False,
+        )
+        return
+
+    source = message.text.strip()
+    if not source:
+        await smart_answer(message, bot, translate("empty_input"), delete_origin=False)
+        return
+
+    identifier = parse_link_to_identifier(source)
+    if not identifier:
+        await smart_answer(
+            message, bot, translate("invalid_format"), delete_origin=False
+        )
+        return
+
+    # Проверяем аккаунт
+    acc = None
+    for a in account_pool.accounts:
+        if not a["in_use"] and a["is_valid"]:
+            acc = a
+            break
+    if not acc:
+        await smart_answer(
+            message, bot, translate("no_available_accounts"), delete_origin=False
+        )
+        return
+
+    client = acc["client"]
+    if not client or not client.is_connected():
+        try:
+            acc["client"] = await account_pool._create_client(acc["session_string"])
+            await acc["client"].get_me()
+            client = acc["client"]
+        except Exception as e:
+            logger.error(f"Не удалось подключиться к аккаунту: {e}")
+            await smart_answer(
+                message, bot, translate("no_available_accounts"), delete_origin=False
+            )
+            return
+
+    # Запускаем червя
+    _worm_active = True
+    _worm_chat_id = identifier
+    async with _worm_lock:
+        _worm_stats = {"messages": 0, "links": 0, "added": 0, "errors": 0}
+
+    text = translate("worm_started", chat=identifier)
+    keyboard = [
+        [{"text": translate("buttons.stop_worm"), "callback_data": "stop_worm"}],
+        [{"text": translate("buttons.main"), "callback_data": "start"}],
+    ]
+    await smart_answer(
+        message, bot, text, reply_markup=kb(keyboard), delete_origin=False
+    )
+
+    await state.clear()
+
+    # Запускаем фоновую задачу
+    _worm_task = asyncio.create_task(
+        _run_worm_mode(client, acc, identifier, message.from_user.id)
+    )
+
+
+async def _run_worm_mode(
+    client: TelegramClient,
+    account: Dict[str, Any],
+    source_identifier: str,
+    user_id: int,
+):
+    """Основная логика режима червя"""
+    global _worm_active, _worm_stats
+    try:
+        entity = await client.get_entity(source_identifier)
+        logger.info(f"🐛 Червь запущен в чате {source_identifier}")
+
+        async for message in client.iter_messages(
+            entity, limit=0, offset=0, reverse=True
+        ):
+            if not _worm_active:
+                break
+
+            try:
+                text = getattr(message, "text", None) or ""
+                if not text.strip():
+                    continue
+
+                async with _worm_lock:
+                    _worm_stats["messages"] += 1
+
+                links = extract_links_from_text(text)
+                if not links:
+                    continue
+
+                async with _worm_lock:
+                    _worm_stats["links"] += len(links)
+
+                for link in links:
+                    if not _worm_active:
+                        break
+                    identifier = parse_link_to_identifier(link)
+                    if not identifier:
+                        continue
+
+                    try:
+                        result = await validate_and_test_chat(
+                            client,
+                            account,
+                            identifier,
+                            "worm",
+                            user_id,
+                            bot,
+                            user_id,
+                        )
+                        if result:
+                            success = await chat_db.add_chat(
+                                result["chat_id"],
+                                result["chat_name"],
+                                result["chat_url"],
+                                result["chat_type"],
+                                result["user_count"],
+                                True,
+                            )
+                            if success:
+                                async with _worm_lock:
+                                    _worm_stats["added"] += 1
+                    except Exception as e:
+                        async with _worm_lock:
+                            _worm_stats["errors"] += 1
+                        logger.error(f"Ошибка обработки ссылки {link}: {e}")
+
+                    # Анти-флуд
+                    await asyncio.sleep(random.uniform(1, 3))
+
+            except Exception as e:
+                logger.error(f"Ошибка обработки сообщения: {e}")
+                await asyncio.sleep(1)
+
+    except Exception as e:
+        logger.error(f"Ошибка режима червя: {e}")
+    finally:
+        logger.info(f"🐛 Червь остановлен: {_worm_stats}")
+        async with _worm_lock:
+            _worm_chat_id = None
+
+
+# === Исправленные задачи ---
 async def ensure_join_target(
     client: TelegramClient,
     target: str,
@@ -3272,15 +5341,20 @@ async def bulk_mailing_task(
     chats: List[str],
     delay_min: int,
     delay_max: int,
-    message_text: str,
+    message_texts: List[str],
     total_sends: int,
     user_id: int,
     sender_session_file: Optional[str] = None,
     task_id: Optional[str] = None,
     checkpoint: Optional[Dict[str, Any]] = None,
 ):
+    """
+    Массовая рассылка с поддержкой нескольких текстов.
+    Тексты циклически轮换ются при отправке.
+    Graceful degradation: продолжает работу даже при ошибках.
+    """
     logger.info(
-        f"Starting bulk mailing: chats={len(chats)} total_sends={total_sends} sender={sender_session_file or 'auto'}"
+        f"Starting bulk mailing: chats={len(chats)} texts={len(message_texts)} total_sends={total_sends} sender={sender_session_file or 'auto'}"
     )
 
     if control.cancelled:
@@ -3289,11 +5363,16 @@ async def bulk_mailing_task(
     sent = 0
     per_chat_sent = {c: 0 for c in chats}
     next_chat_idx = 0
+    text_index = 0  # Индекс текущего текста
+    consecutive_errors = 0
+    max_consecutive_errors = 10  # Graceful degradation threshold
 
     if checkpoint:
         sent = checkpoint.get("sent", 0)
         per_chat_sent.update(checkpoint.get("per_chat_sent", {}))
         next_chat_idx = checkpoint.get("next_chat_idx", 0)
+        text_index = checkpoint.get("text_index", 0)
+        consecutive_errors = checkpoint.get("consecutive_errors", 0)
 
     await tasks_storage.update_by_id(
         task_id,
@@ -3306,6 +5385,8 @@ async def bulk_mailing_task(
                 "sent": sent,
                 "per_chat_sent": per_chat_sent,
                 "next_chat_idx": next_chat_idx,
+                "text_index": text_index,
+                "consecutive_errors": consecutive_errors,
                 "sender_session": sender_session_file,
             },
         },
@@ -3339,6 +5420,8 @@ async def bulk_mailing_task(
                     await control.pause_event.wait()
 
                     chat = chats[next_chat_idx % len(chats)]
+                    current_text = message_texts[text_index % len(message_texts)]
+
                     try:
                         # Безопасно получаем сущность чата
                         target = (
@@ -3346,10 +5429,10 @@ async def bulk_mailing_task(
                             if isinstance(chat, int)
                             else chat
                         )
-                        if isinstance(chat, str):
+                        if isinstance(chat, str) and not isinstance(chat, int):
                             target = await client.get_entity(chat)
 
-                        # Анти-блокировочная задержка
+                        # Анти-блокировочная задержка с adaptive delay
                         if sent > 0:
                             delay = random.uniform(
                                 delay_min + 5, delay_max + 10  # Добавляем буфер
@@ -3360,7 +5443,8 @@ async def bulk_mailing_task(
                         # Безопасная отправка с retry
                         for attempt in range(Config.MAX_RETRIES):
                             try:
-                                await client.send_message(target, message_text)
+                                await client.send_message(target, current_text)
+                                consecutive_errors = 0  # Reset on success
                                 break
                             except FloodWaitError as e:
                                 wait_time = (
@@ -3376,6 +5460,7 @@ async def bulk_mailing_task(
                                     continue
                                 raise
                             except Exception as e:
+                                consecutive_errors += 1
                                 if attempt < Config.MAX_RETRIES - 1:
                                     await asyncio.sleep(2**attempt)
                                     continue
@@ -3384,6 +5469,7 @@ async def bulk_mailing_task(
                         sent += 1
                         per_chat_sent[chat] = per_chat_sent.get(chat, 0) + 1
                         next_chat_idx += 1
+                        text_index += 1
 
                         # Обновление прогресса каждые 10 отправок
                         if sent % 10 == 0 or sent == total_sends:
@@ -3399,6 +5485,8 @@ async def bulk_mailing_task(
                                         "sent": sent,
                                         "per_chat_sent": per_chat_sent,
                                         "next_chat_idx": next_chat_idx,
+                                        "text_index": text_index,
+                                        "consecutive_errors": consecutive_errors,
                                         "sender_session": account["session_file"],
                                     },
                                 },
@@ -3422,6 +5510,8 @@ async def bulk_mailing_task(
                                     "sent": sent,
                                     "per_chat_sent": per_chat_sent,
                                     "next_chat_idx": next_chat_idx,
+                                    "text_index": text_index,
+                                    "consecutive_errors": consecutive_errors,
                                     "sender_session": account["session_file"],
                                 },
                             },
@@ -3456,7 +5546,17 @@ async def bulk_mailing_task(
                         raise
                     except Exception as e:
                         logger.error(f"Error sending to {chat}: {e}")
-                        await asyncio.sleep(2)
+                        consecutive_errors += 1
+
+                        # Graceful degradation: если слишком много ошибок, продолжаем но с предупреждением
+                        if consecutive_errors > max_consecutive_errors:
+                            logger.warning(
+                                f"Too many consecutive errors ({consecutive_errors}), "
+                                f"continuing with longer delays"
+                            )
+                            await asyncio.sleep(30)  # Extended delay on errors
+                        else:
+                            await asyncio.sleep(2)
 
             await asyncio.sleep(0)
 
@@ -3470,6 +5570,8 @@ async def bulk_mailing_task(
                         "sent": sent,
                         "per_chat_sent": per_chat_sent,
                         "next_chat_idx": next_chat_idx,
+                        "text_index": text_index,
+                        "consecutive_errors": consecutive_errors,
                         "sender_session": sender_session_file,
                     },
                 },
@@ -3493,6 +5595,8 @@ async def bulk_mailing_task(
                     "sent": sent,
                     "per_chat_sent": per_chat_sent,
                     "next_chat_idx": next_chat_idx,
+                    "text_index": text_index,
+                    "consecutive_errors": consecutive_errors,
                     "sender_session": sender_session_file,
                 },
             },
@@ -3504,6 +5608,7 @@ async def bulk_mailing_task(
             "📬 <b>Массовая рассылка завершена!</b>",
             f"• Задача: <code>{task_id}</code>",
             f"• Всего отправлено: {sent}",
+            f"• Использовано текстов: {len(message_texts)}",
             "• Отправлено по чатам:",
         ]
         for c, cnt in per_chat_sent.items():
@@ -3519,13 +5624,201 @@ async def bulk_mailing_task(
                 "status": "failed",
                 "error": str(e),
                 "completed_at": datetime.now().isoformat(),
-                "progress": 100,
+                "progress": (sent / max(1, total_sends)) * 100,
+                "progress_text": f"{sent}/{total_sends}",
+                "sent": sent,
+                "checkpoints": {
+                    "sent": sent,
+                    "per_chat_sent": per_chat_sent,
+                    "next_chat_idx": next_chat_idx,
+                    "text_index": text_index,
+                    "consecutive_errors": consecutive_errors,
+                    "sender_session": sender_session_file,
+                },
             },
             id_field="task_id",
         )
         task_queue.remove_user_task(user_id, task_id)
         await notify_user(
-            bot, user_id, f"🔥 <b>Задача {task_id} не выполнена!</b>\n\nОшибка: {e}"
+            bot,
+            user_id,
+            f"❌ <b>Задача {task_id} завершилась ошибкой!</b>\n\n{str(e)}",
+        )
+
+
+async def db_scrape_and_invite_task(
+    control: TaskControl,
+    target: str,
+    message_limit: int,
+    user_id: int,
+    task_id: str,
+    sender_session: Optional[str] = None,
+    checkpoint: Optional[Dict[str, Any]] = None,
+):
+    """
+    Парсинг пользователей из всех чатов в БД с последующим приглашением в target.
+    """
+    logger.info(
+        f"Starting DB scraping: {target} ({message_limit}) via {sender_session or 'auto'}"
+    )
+
+    if control.cancelled:
+        return
+
+    # Получаем все чаты из БД
+    db_chats = await chat_db.get_all_chats()
+    if not db_chats:
+        await tasks_storage.update_by_id(
+            task_id,
+            {
+                "status": "failed",
+                "error": "Chats DB is empty",
+                "completed_at": datetime.now().isoformat(),
+            },
+            id_field="task_id",
+        )
+        task_queue.remove_user_task(user_id, task_id)
+        await notify_user(bot, user_id, translate("scraping_db_empty"))
+        return
+
+    logger.info(f"DB scraping: {len(db_chats)} chats from DB")
+
+    all_collected_users: List[int] = []
+    chats_processed = 0
+    chats_failed = 0
+
+    try:
+        async with (
+            account_pool.acquire_specific_account(sender_session)
+            if sender_session
+            else account_pool.acquire_account()
+        ) as account:
+            client = account["client"]
+            target_entity = await ensure_join_target(
+                client, target, account, task_id, user_id
+            )
+            if not target_entity:
+                task_queue.remove_user_task(user_id, task_id)
+                return
+
+            # Проходим по всем чатам в БД
+            for chat in db_chats:
+                if control.cancelled:
+                    break
+
+                chat_url = chat.get("chat_url") or chat.get("chat_id")
+                if not chat_url:
+                    chats_failed += 1
+                    continue
+
+                try:
+                    # Собираем пользователей из чата
+                    users = await get_active_users(
+                        control, client, chat_url, message_limit, task_id
+                    )
+                    all_collected_users.extend(users)
+                    chats_processed += 1
+
+                    logger.info(
+                        f"DB scraping: processed {chat_url}, collected {len(users)} users"
+                    )
+
+                except AuthKeyUnregisteredError:
+                    account["is_valid"] = False
+                    raise
+                except Exception as e:
+                    logger.error(f"Error scraping chat {chat_url}: {e}")
+                    chats_failed += 1
+                    continue
+
+            if control.cancelled:
+                await tasks_storage.update_by_id(
+                    task_id,
+                    {"status": "cancelled", "completed_at": datetime.now().isoformat()},
+                    id_field="task_id",
+                )
+                task_queue.remove_user_task(user_id, task_id)
+                return
+
+            if not all_collected_users:
+                await tasks_storage.update_by_id(
+                    task_id,
+                    {
+                        "status": "failed",
+                        "error": "No active users found in any chat",
+                        "completed_at": datetime.now().isoformat(),
+                        "progress": 100,
+                    },
+                    id_field="task_id",
+                )
+                task_queue.remove_user_task(user_id, task_id)
+                await notify_user(bot, user_id, translate("scraping_no_users"))
+                return
+
+            # Приглашаем пользователей
+            await tasks_storage.update_by_id(
+                task_id,
+                {
+                    "status": "running",
+                    "progress": 0,
+                    "progress_text": f"0/{len(all_collected_users)}",
+                    "checkpoints": {
+                        "remaining_users": all_collected_users,
+                        "sender_session": account["session_file"],
+                        "target": target,
+                        "source": f"DB ({len(db_chats)} chats)",
+                        "chats_processed": chats_processed,
+                        "chats_failed": chats_failed,
+                    },
+                },
+                id_field="task_id",
+            )
+
+            await notify_user(
+                bot,
+                user_id,
+                f"🔄 Задача {task_id}: приглашаю {len(all_collected_users)} пользователей из {chats_processed} чатов",
+            )
+
+            results, remaining = await invite_users(
+                control,
+                account,
+                client,
+                all_collected_users,
+                target,
+                task_id,
+                user_id,
+                source=f"DB ({len(db_chats)} chats)",
+            )
+
+    except AuthKeyUnregisteredError:
+        await tasks_storage.update_by_id(
+            task_id,
+            {
+                "status": "failed",
+                "error": "Session invalid",
+                "completed_at": datetime.now().isoformat(),
+            },
+            id_field="task_id",
+        )
+        task_queue.remove_user_task(user_id, task_id)
+        raise
+    except Exception as e:
+        logger.exception("DB scraping task failed")
+        await tasks_storage.update_by_id(
+            task_id,
+            {
+                "status": "failed",
+                "error": str(e),
+                "completed_at": datetime.now().isoformat(),
+            },
+            id_field="task_id",
+        )
+        task_queue.remove_user_task(user_id, task_id)
+        await notify_user(
+            bot,
+            user_id,
+            f"❌ <b>Задача {task_id} не выполнена!</b>\n\nОшибка: {e}",
         )
 
 
@@ -3539,12 +5832,12 @@ async def queue_task_from_storage(task: Dict[str, Any], resume: bool = False):
         return
 
     if task_type == "scraping":
-        mode = task.get("mode")
-        if mode == "messages":
+        source_type = task.get("chats_source_type", "manual")
+        if source_type == "db":
+            # DB scraping task
             await task_queue.add_task(
                 task_id,
-                scrape_and_invite_task,
-                source=task.get("source"),
+                db_scrape_and_invite_task,
                 target=task.get("target"),
                 message_limit=task.get("limit", 0),
                 user_id=user_id,
@@ -3553,17 +5846,31 @@ async def queue_task_from_storage(task: Dict[str, Any], resume: bool = False):
                 checkpoint=checkpoint,
             )
         else:
-            await task_queue.add_task(
-                task_id,
-                scrape_and_invite_by_user_count_task,
-                source=task.get("source"),
-                target=task.get("target"),
-                user_count=task.get("user_count", 0),
-                user_id=user_id,
-                task_id=task_id,
-                sender_session=task.get("sender_session"),
-                checkpoint=checkpoint,
-            )
+            mode = task.get("mode")
+            if mode == "messages":
+                await task_queue.add_task(
+                    task_id,
+                    scrape_and_invite_task,
+                    source=task.get("source"),
+                    target=task.get("target"),
+                    message_limit=task.get("limit", 0),
+                    user_id=user_id,
+                    task_id=task_id,
+                    sender_session=task.get("sender_session"),
+                    checkpoint=checkpoint,
+                )
+            else:
+                await task_queue.add_task(
+                    task_id,
+                    scrape_and_invite_by_user_count_task,
+                    source=task.get("source"),
+                    target=task.get("target"),
+                    user_count=task.get("user_count", 0),
+                    user_id=user_id,
+                    task_id=task_id,
+                    sender_session=task.get("sender_session"),
+                    checkpoint=checkpoint,
+                )
     elif task_type == "mailing":
         await task_queue.add_task(
             task_id,
@@ -3571,7 +5878,7 @@ async def queue_task_from_storage(task: Dict[str, Any], resume: bool = False):
             chats=task.get("chats", []),
             delay_min=task.get("delay_min", 1),
             delay_max=task.get("delay_max", 1),
-            message_text=task.get("message_text", ""),
+            message_texts=task.get("message_texts", [""]),
             total_sends=task.get("total_sends", 0),
             user_id=user_id,
             sender_session_file=task.get("sender_session"),
@@ -3703,6 +6010,8 @@ async def main():
     try:
         await auth_manager.load()
         await cache_manager.connect()
+        await chat_db.connect()
+        await tasks_storage.connect()
 
         task_queue.start_workers()
         await account_pool.start_health_check()
@@ -3714,11 +6023,15 @@ async def main():
         asyncio.create_task(simulate_account_activity())
 
         for admin_id in Config.ADMIN_USER_IDS:
+            chats_count = await chat_db.get_active_chats_count()
+            total_users = await chat_db.get_total_users()
             await notify_user(
                 bot,
                 admin_id,
                 f"🟢 <b>Бот успешно запущен!</b>\n\n"
                 f"• Загружено аккаунтов: {len(account_pool.accounts)}\n"
+                f"• Чатов в БД: {chats_count}\n"
+                f"• Всего пользователей в чатах: {total_users}\n"
                 f"• Максимум одновременных задач: {Config.MAX_CONCURRENT_TASKS}\n"
                 f"• Максимум задач на пользователя: {Config.MAX_TASKS_PER_USER}\n"
                 f"• Задержка приглашений: {Config.MIN_INVITE_DELAY}-{Config.MAX_INVITE_DELAY}с\n"
@@ -3759,6 +6072,8 @@ async def main():
                     )
 
         await cache_manager.close()
+        await chat_db.close()
+        await tasks_storage.close()
         await auth_manager.save()
 
         for admin_id in Config.ADMIN_USER_IDS:
