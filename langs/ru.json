@@ -1,7 +1,7 @@
 {
   "meta": {
     "code": "ru",
-    "name": "Русский"
+    "name": "🇷🇺 Русский"
   },
   "buttons": {
     "main": "Главная",
@@ -231,6 +231,15 @@
     "worm_max_sources": "⚠️ Максимум {count} источников для червя",
     "worm_started_multi": "🐛 Червь запущен в {chats} чатах:\n\n{sources}",
     "worm_stopped_multi": "🐛 Червь остановлен.\n\nВсего сообщений: {messages}\nСсылок найдено: {links}\nЧатов добавлено: {added}\nОшибок: {errors}",
-    "mailing_no_chats": "❌ Нет валидных чатов для рассылки"
+    "mailing_no_chats": "❌ Нет валидных чатов для рассылки",
+    "language_select_title": "🌐 Выберите язык / Select language",
+    "language_changed": "✅ Язык изменён на: {lang}",
+    "language_ru": "русский",
+    "language_en": "English",
+    "language_prompt": "🌐 Выберите язык:",
+    "language_selected": "✅ Язык изменён на: {language}",
+    "language_not_supported": "❌ Язык не поддерживается",
+    "admin_language_notice": "⚠️ Администраторы не меняют язык",
+    "language_decorative_notice": "🌐 Выбор языка доступен обычным пользователям"
   }
 }

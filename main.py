@@ -86,24 +86,48 @@ logger.info("=== Логгер инициализирован ===")
 LANGS_DIR: Path = BASE_DIR / "langs"
 DEFAULT_LANGUAGE: str = "ru"
 
+
+# === Загрузка всех языков ===
+def load_languages() -> Dict[str, Dict[str, Any]]:
+    languages: Dict[str, Dict[str, Any]] = {}
+    if not LANGS_DIR.exists():
+        logger.warning(f"Папка языков не найдена: {LANGS_DIR}")
+        return languages
+    for path in sorted(LANGS_DIR.glob("*.json")):
+        try:
+            raw = path.read_bytes()
+            if raw[:3] == b"\xef\xbb\xbf":
+                raw = raw[3:]
+            data = json.loads(raw.decode("utf-8"))
+            code = (
+                str(data.get("meta", {}).get("code", path.stem)).strip().lower()
+                or path.stem
+            )
+            languages[code] = data
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки {path.stem}: {e}")
+    if not languages:
+        logger.warning("Не удалось загрузить ни одного языка")
+    return languages
+
+
+LANGUAGES = load_languages()
+
+
+def get_available_languages() -> List[str]:
+    """Возвращает список доступных кодов языков"""
+    return list(LANGUAGES.keys())
+
+
+def get_language_display_name(code: str) -> str:
+    """Возвращает отображаемое имя языка из meta.name"""
+    data = LANGUAGES.get(code, {})
+    return str(data.get("meta", {}).get("name", code)).strip() or code
+
+
 # === Языки и перевод ===
 _LANG_CACHE: Dict[str, Dict[str, Any]] = {}
 _LANG_CACHE_MAX_SIZE: int = 100
-
-
-def _load_language_file(code: str) -> Dict[str, Any]:
-    path = os.path.join(LANGS_DIR, f"{code}.json")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            raw = f.read()
-        if raw[:3] == "\xef\xbb\xbf":
-            raw = raw[3:]
-        return json.loads(raw)
-    except Exception as e:
-        logger.warning(f"Ошибка загрузки языка {code}: {e}")
-        return {}
 
 
 def _resolve_key(data: Dict[str, Any], key: str) -> Optional[Any]:
@@ -119,16 +143,29 @@ def translate(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
     language: str = (lang or DEFAULT_LANGUAGE).strip().lower()
     data: Optional[Dict[str, Any]] = _LANG_CACHE.get(language)
     if data is None:
-        data = _load_language_file(language)
-        if len(_LANG_CACHE) >= _LANG_CACHE_MAX_SIZE:
-            first_key = next(iter(_LANG_CACHE), None)
-            if first_key and first_key != DEFAULT_LANGUAGE:
-                del _LANG_CACHE[first_key]
+        data = LANGUAGES.get(language)
+        if data is None:
+            path = LANGS_DIR / f"{language}.json"
+            if path.exists():
+                try:
+                    raw = path.read_bytes()
+                    if raw[:3] == b"\xef\xbb\xbf":
+                        raw = raw[3:]
+                    data = json.loads(raw.decode("utf-8"))
+                    _LANG_CACHE[language] = data
+                except Exception:
+                    data = None
+        if data is None and language != DEFAULT_LANGUAGE:
+            data = LANGUAGES.get(DEFAULT_LANGUAGE)
+            if data is None:
+                data = _LANG_CACHE.get(DEFAULT_LANGUAGE)
+        if data is None:
+            data = {}
         _LANG_CACHE[language] = data
     text: Optional[Any] = _resolve_key(data, key)
     if text is None and language != DEFAULT_LANGUAGE:
-        data = _LANG_CACHE.get(DEFAULT_LANGUAGE) or _load_language_file(
-            DEFAULT_LANGUAGE
+        data = (
+            LANGUAGES.get(DEFAULT_LANGUAGE) or _LANG_CACHE.get(DEFAULT_LANGUAGE) or {}
         )
         text = _resolve_key(data, key)
     if text is None:
@@ -142,8 +179,8 @@ def translate(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
 
 
 # Загрузка языков при старте
-for _lang_code in ("ru", "en"):
-    _LANG_CACHE[_lang_code] = _load_language_file(_lang_code)
+for _lang_code in get_available_languages():
+    _LANG_CACHE[_lang_code] = LANGUAGES.get(_lang_code, {})
 logger.info(f"Языковая система инициализирована: {list(_LANG_CACHE.keys())}")
 
 
@@ -1317,6 +1354,113 @@ class ChatDB:
             return 0
 
 
+# --- UserDB (БД пользователей и их настроек) ---
+class UserDB:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn: Optional[aiosqlite.Connection] = None
+        self.lock = asyncio.Lock()
+
+    async def connect(self) -> None:
+        self.conn = await aiosqlite.connect(self.db_path, timeout=30.0)
+        self.conn.row_factory = aiosqlite.Row
+        await self.conn.execute("PRAGMA journal_mode = WAL")
+        await self.conn.execute("PRAGMA busy_timeout = 5000")
+        await self.init_db()
+        logger.info(f"UserDB подключена: {self.db_path}")
+
+    async def close(self) -> None:
+        if self.conn:
+            try:
+                await self.conn.close()
+                logger.info("UserDB закрыта")
+            except Exception as e:
+                logger.warning(f"Ошибка закрытия UserDB: {e}")
+            finally:
+                self.conn = None
+
+    async def init_db(self) -> None:
+        if not self.conn:
+            return
+        async with self.lock:
+            await self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    language TEXT DEFAULT 'ru'
+                )
+            """)
+            await self.conn.commit()
+
+    async def add_user(self, user_id: int) -> bool:
+        if not self.conn:
+            return False
+        try:
+            async with self.lock:
+                await self.conn.execute(
+                    "INSERT OR IGNORE INTO users (user_id) VALUES (?)",
+                    (user_id,),
+                )
+                await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"add_user {user_id}: {e}")
+            return False
+
+    async def get_user(self, user_id: int) -> Optional[Dict[str, Any]]:
+        if not self.conn:
+            return None
+        try:
+            async with self.lock:
+                cur = await self.conn.execute(
+                    "SELECT * FROM users WHERE user_id = ?", (user_id,)
+                )
+                row = await cur.fetchone()
+            return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"get_user {user_id}: {e}")
+            return None
+
+    async def update_user(self, user_id: int, **kwargs) -> bool:
+        if not self.conn or not kwargs:
+            return False
+        allowed = {"language"}
+        values_by_column = {k: v for k, v in kwargs.items() if k in allowed}
+        if not values_by_column:
+            return False
+        set_clause = ", ".join(f"{k} = ?" for k in values_by_column)
+        values = list(values_by_column.values()) + [user_id]
+        try:
+            async with self.lock:
+                await self.conn.execute(
+                    f"UPDATE users SET {set_clause} WHERE user_id = ?",
+                    tuple(values),
+                )
+                await self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"update_user {user_id}: {e}")
+            return False
+
+    async def get_user_language(self, user_id: int) -> str:
+        if not self.conn:
+            return DEFAULT_LANGUAGE
+        try:
+            user = await self.get_user(user_id)
+            lang = str(user.get("language", "") if user else "").strip().lower()
+            available = get_available_languages()
+            return lang if lang in available else DEFAULT_LANGUAGE
+        except Exception as e:
+            logger.error(f"get_user_language {user_id}: {e}")
+            return DEFAULT_LANGUAGE
+
+    async def set_user_language(self, user_id: int, language: str) -> bool:
+        if not self.conn:
+            return False
+        await self.add_user(user_id)
+        return await self.update_user(user_id, language=language)
+
+
 # === Regex для извлечения ссылок Telegram ===
 _TELEGRAM_LINK_RE = re.compile(
     r"(?:https?://)?"  # протокол (опционально)
@@ -2421,6 +2565,7 @@ dp.callback_query.middleware(CallbackAnswerMiddleware())
 auth_manager = AuthManager(Config.AUTH_FILE)
 cache_manager = CacheManager(Config.CACHE_DB_PATH)
 chat_db = ChatDB(os.path.join(Config.DATA_DIR, "chats.db"))
+user_db = UserDB(os.path.join(Config.DATA_DIR, "users.db"))
 tasks_storage = TasksDB(Config.TASKS_FILE)
 account_pool = AccountPoolManager()
 task_queue = TaskQueueManager(max_concurrent_tasks=Config.MAX_CONCURRENT_TASKS)
@@ -2557,6 +2702,12 @@ async def cmd_start(event, state: FSMContext):
                     "callback_data": "bulk_mailing",
                 }
             ],
+            [
+                {
+                    "text": "🌐 Language",
+                    "callback_data": "language_select",
+                }
+            ],
         ]
     else:
         text = translate("welcome_user")
@@ -2587,6 +2738,12 @@ async def cmd_start(event, state: FSMContext):
             ],
             [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
             [{"text": translate("buttons.worm_mode"), "callback_data": "worm_mode"}],
+            [
+                {
+                    "text": "🌐 Language",
+                    "callback_data": "language_select",
+                }
+            ],
         ]
 
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
@@ -2596,6 +2753,79 @@ async def cmd_start(event, state: FSMContext):
 async def cmd_cancel(event, state: FSMContext):
     await state.clear()
     await cmd_start(event, state)
+
+
+def is_admin_user(user_id: int) -> bool:
+    """Проверяет, является ли пользователь администратором"""
+    return user_id in Config.ADMIN_USER_IDS
+
+
+# --- Language selection ---
+class LanguageStates(StatesGroup):
+    waiting_choice = State()
+
+
+def build_language_keyboard() -> InlineKeyboardMarkup:
+    """Создаёт клавиатуру выбора языка"""
+    rows: List[List[Dict[str, str]]] = []
+    lang_buttons: List[Dict[str, str]] = []
+    for code in get_available_languages():
+        display_name = get_language_display_name(code)
+        lang_buttons.append({"text": display_name, "callback_data": f"lang:{code}"})
+    if lang_buttons:
+        rows.append(lang_buttons)
+    rows.append([{"text": translate("buttons.cancel"), "callback_data": "cancel"}])
+    return kb(rows)
+
+
+async def get_lang(state: FSMContext, user_id: int) -> str:
+    """Получает язык пользователя из FSM или UserDB"""
+    try:
+        data = await state.get_data()
+        lang = data.get("language", "")
+        if lang:
+            return lang
+    except Exception:
+        pass
+    return await user_db.get_user_language(user_id)
+
+
+@router.callback_query(F.data == "language_select")
+async def cmd_language_select(event: CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+
+    if is_admin_user(user_id):
+        await event.answer(translate("texts.admin_language_notice"), show_alert=True)
+        return
+
+    await state.set_state(LanguageStates.waiting_choice)
+    text = translate("texts.language_prompt")
+    await event.answer(text, show_alert=False)
+    await event.message.edit_text(text, reply_markup=build_language_keyboard())
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def cmd_language_change(event: CallbackQuery, state: FSMContext):
+    user_id = event.from_user.id
+    lang = event.data.split(":", 1)[1]
+
+    if is_admin_user(user_id):
+        await event.answer(translate("texts.admin_language_notice"), show_alert=True)
+        return
+
+    if lang not in get_available_languages():
+        await event.answer(translate("texts.language_not_supported"), show_alert=True)
+        return
+
+    await user_db.add_user(user_id)
+    await user_db.set_user_language(user_id, lang)
+    logger.info(f"🌍 Пользователь {user_id} выбрал язык: {lang}")
+
+    lang_name = get_language_display_name(lang)
+    await event.answer(
+        translate("texts.language_selected", language=lang_name),
+        show_alert=True,
+    )
 
 
 @router.message(lambda message: message.from_user.id in pending_auth)
