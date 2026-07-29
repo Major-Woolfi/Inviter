@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import html
 import json
 import logging
@@ -85,6 +86,20 @@ logger.info("=== Логгер инициализирован ===")
 # === Языки ===
 LANGS_DIR: Path = BASE_DIR / "langs"
 DEFAULT_LANGUAGE: str = "ru"
+_CURRENT_LANGUAGE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "current_language", default=DEFAULT_LANGUAGE
+)
+
+
+class _LanguageProxy:
+    def __str__(self) -> str:
+        return _CURRENT_LANGUAGE.get(DEFAULT_LANGUAGE)
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+lang = _LanguageProxy()
 
 
 # === Загрузка всех языков ===
@@ -139,35 +154,52 @@ def _resolve_key(data: Dict[str, Any], key: str) -> Optional[Any]:
     return node
 
 
-def translate(key: str, lang: Optional[str] = None, **kwargs: Any) -> str:
-    language: str = (lang or DEFAULT_LANGUAGE).strip().lower()
-    data: Optional[Dict[str, Any]] = _LANG_CACHE.get(language)
-    if data is None:
-        data = LANGUAGES.get(language)
-        if data is None:
-            path = LANGS_DIR / f"{language}.json"
-            if path.exists():
-                try:
-                    raw = path.read_bytes()
-                    if raw[:3] == b"\xef\xbb\xbf":
-                        raw = raw[3:]
-                    data = json.loads(raw.decode("utf-8"))
-                    _LANG_CACHE[language] = data
-                except Exception:
-                    data = None
-        if data is None and language != DEFAULT_LANGUAGE:
-            data = LANGUAGES.get(DEFAULT_LANGUAGE)
-            if data is None:
-                data = _LANG_CACHE.get(DEFAULT_LANGUAGE)
-        if data is None:
-            data = {}
-        _LANG_CACHE[language] = data
-    text: Optional[Any] = _resolve_key(data, key)
-    if text is None and language != DEFAULT_LANGUAGE:
-        data = (
-            LANGUAGES.get(DEFAULT_LANGUAGE) or _LANG_CACHE.get(DEFAULT_LANGUAGE) or {}
+def _lookup_translation(data: Dict[str, Any], key: str) -> Optional[Any]:
+    text = _resolve_key(data, key)
+    if text is not None:
+        return text
+    if "." not in key:
+        for prefix in ("texts", "buttons"):
+            text = _resolve_key(data, f"{prefix}.{key}")
+            if text is not None:
+                return text
+    return None
+
+
+def translate(language_code: Any, key: Optional[str] = None, **kwargs: Any) -> str:
+    if key is None:
+        key = str(language_code)
+        language_code = _CURRENT_LANGUAGE.get(DEFAULT_LANGUAGE)
+
+    if isinstance(language_code, _LanguageProxy):
+        lang_code = _CURRENT_LANGUAGE.get(DEFAULT_LANGUAGE)
+    else:
+        lang_code = (
+            str(language_code or DEFAULT_LANGUAGE).strip().lower() or DEFAULT_LANGUAGE
         )
-        text = _resolve_key(data, key)
+
+    if lang_code not in _LANG_CACHE:
+        if len(_LANG_CACHE) >= _LANG_CACHE_MAX_SIZE:
+            first_key = next(iter(_LANG_CACHE), None)
+            if first_key and first_key != DEFAULT_LANGUAGE:
+                del _LANG_CACHE[first_key]
+        try:
+            path = LANGS_DIR / f"{lang_code}.json"
+            if path.exists():
+                raw = path.read_bytes()
+                if raw[:3] == b"\xef\xbb\xbf":
+                    raw = raw[3:]
+                _LANG_CACHE[lang_code] = json.loads(raw.decode("utf-8"))
+            else:
+                _LANG_CACHE[lang_code] = {}
+        except Exception:
+            _LANG_CACHE[lang_code] = {}
+
+    data = _LANG_CACHE.get(lang_code) or LANGUAGES.get(DEFAULT_LANGUAGE, {})
+    text = _lookup_translation(data, key)
+    if text is None and lang_code != DEFAULT_LANGUAGE:
+        data = LANGUAGES.get(DEFAULT_LANGUAGE, {})
+        text = _lookup_translation(data, key)
     if text is None:
         return key
     if kwargs and isinstance(text, str):
@@ -465,25 +497,35 @@ async def update_message(
 
 async def smart_answer(
     event: Union[Message, CallbackQuery],
-    text: str,
+    *args: Any,
     reply_markup: Optional[InlineKeyboardMarkup] = None,
     delete_origin: bool = False,
+    show_alert: bool = False,
 ) -> bool:
+    if not args:
+        raise TypeError("smart_answer requires a text argument")
+    if len(args) >= 2 and hasattr(args[0], "send_message"):
+        text = str(args[1])
+    else:
+        text = str(args[0])
     try:
         if isinstance(event, Message):
             await event.answer(text, reply_markup=reply_markup)
         elif isinstance(event, CallbackQuery):
-            if event.message:
+            if show_alert:
+                await event.answer(text, show_alert=True)
+            elif event.message:
                 await event.message.answer(text, reply_markup=reply_markup)
                 if delete_origin:
                     try:
                         await event.message.delete()
                     except Exception:
                         pass
-            try:
-                await event.answer()
-            except Exception:
-                pass
+            else:
+                try:
+                    await event.answer()
+                except Exception:
+                    pass
         return True
     except Exception as e:
         logger.error(f"smart_answer error: {e}")
@@ -1422,8 +1464,6 @@ class UserDB:
             return None
 
     async def update_user(self, user_id: int, **kwargs) -> bool:
-        if not self.conn or not kwargs:
-            return False
         allowed = {"language"}
         values_by_column = {k: v for k, v in kwargs.items() if k in allowed}
         if not values_by_column:
@@ -2445,7 +2485,6 @@ class TaskQueueManager:
                 await asyncio.sleep(1)
 
     async def add_task(self, queue_task_id: str, task_func, *args, **kwargs):
-        self.task_controls.setdefault(queue_task_id, TaskControl())
         await self.queue.put((task_func, queue_task_id, args, kwargs))
         self.logger.info(
             f"Task {queue_task_id} added to queue, queue size: {self.queue.qsize()}"
@@ -2602,18 +2641,45 @@ async def auth_middleware(handler, event, data):
     if isinstance(event, Message):
         if user_id not in pending_auth:
             pending_auth[user_id] = True
-            text = translate("auth_required")
-            keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+            text = translate(lang, "auth_required")
+            keyboard = [
+                [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
+            ]
             await smart_answer(
                 event, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
         else:
             await smart_answer(
-                event, bot, translate("waiting_key"), delete_origin=False
+                event, bot, translate(lang, "waiting_key"), delete_origin=False
             )
     return None
 
 
+async def language_middleware(
+    handler: Callable, event: Any, data: Dict[str, Any]
+) -> Any:
+    user = getattr(event, "from_user", None)
+    token = _CURRENT_LANGUAGE.set(DEFAULT_LANGUAGE)
+    try:
+        if user:
+            user_id = user.id
+            try:
+                current_language = await user_db.get_user_language(user_id)
+                if current_language and current_language in LANGUAGES:
+                    data["language"] = current_language
+                    token = _CURRENT_LANGUAGE.set(current_language)
+                else:
+                    data["language"] = DEFAULT_LANGUAGE
+            except Exception as e:
+                logger.error(f"Ошибка в language_middleware для {user_id}: {e}")
+                data["language"] = DEFAULT_LANGUAGE
+        return await handler(event, data)
+    finally:
+        _CURRENT_LANGUAGE.reset(token)
+
+
+router.message.middleware(language_middleware)
+router.callback_query.middleware(language_middleware)
 router.message.middleware(auth_middleware)
 router.callback_query.middleware(auth_middleware)
 
@@ -2634,7 +2700,7 @@ async def cmd_start(event, state: FSMContext):
 
     if not is_admin and not is_authorized:
         pending_auth[user_id] = True
-        text = translate("auth_required")
+        text = translate(lang, "auth_required")
         await smart_answer(event, bot, text, delete_origin=False)
         return
 
@@ -2651,96 +2717,116 @@ async def cmd_start(event, state: FSMContext):
             users=total_users,
         )
         keyboard = [
-            [{"text": translate("buttons.task_list"), "callback_data": "task_list"}],
             [
                 {
-                    "text": translate("buttons.cancel_all_tasks"),
+                    "text": translate(lang, "buttons.task_list"),
+                    "callback_data": "task_list",
+                }
+            ],
+            [
+                {
+                    "text": translate(lang, "buttons.cancel_all_tasks"),
                     "callback_data": "cancel_all_tasks",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.list_accounts"),
+                    "text": translate(lang, "buttons.list_accounts"),
                     "callback_data": "list_accounts",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.add_account"),
+                    "text": translate(lang, "buttons.add_account"),
                     "callback_data": "add_account",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.add_chats_to_db"),
+                    "text": translate(lang, "buttons.add_chats_to_db"),
                     "callback_data": "add_chats_to_db",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.update_chats_db"),
+                    "text": translate(lang, "buttons.update_chats_db"),
                     "callback_data": "update_chats_db",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.clear_cache"),
+                    "text": translate(lang, "buttons.clear_cache"),
                     "callback_data": "clear_cache",
                 }
             ],
-            [{"text": translate("buttons.worm_mode"), "callback_data": "worm_mode"}],
-            [{"text": translate("buttons.genkey"), "callback_data": "genkey"}],
             [
                 {
-                    "text": translate("buttons.start_scraping"),
+                    "text": translate(lang, "buttons.worm_mode"),
+                    "callback_data": "worm_mode",
+                }
+            ],
+            [{"text": translate(lang, "buttons.genkey"), "callback_data": "genkey"}],
+            [
+                {
+                    "text": translate(lang, "buttons.start_scraping"),
                     "callback_data": "start_scraping",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.bulk_mailing"),
+                    "text": translate(lang, "buttons.bulk_mailing"),
                     "callback_data": "bulk_mailing",
                 }
             ],
             [
                 {
-                    "text": "🌐 Language",
+                    "text": get_language_display_name(str(lang)),
                     "callback_data": "language_select",
                 }
             ],
         ]
     else:
-        text = translate("welcome_user")
+        text = translate(lang, "welcome_user")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.add_account"),
+                    "text": translate(lang, "buttons.add_account"),
                     "callback_data": "add_account",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.list_accounts"),
+                    "text": translate(lang, "buttons.list_accounts"),
                     "callback_data": "list_accounts",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.start_scraping"),
+                    "text": translate(lang, "buttons.start_scraping"),
                     "callback_data": "start_scraping",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.bulk_mailing"),
+                    "text": translate(lang, "buttons.bulk_mailing"),
                     "callback_data": "bulk_mailing",
                 }
             ],
-            [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
-            [{"text": translate("buttons.worm_mode"), "callback_data": "worm_mode"}],
             [
                 {
-                    "text": "🌐 Language",
+                    "text": translate(lang, "buttons.my_tasks"),
+                    "callback_data": "my_tasks",
+                }
+            ],
+            [
+                {
+                    "text": translate(lang, "buttons.worm_mode"),
+                    "callback_data": "worm_mode",
+                }
+            ],
+            [
+                {
+                    "text": get_language_display_name(str(lang)),
                     "callback_data": "language_select",
                 }
             ],
@@ -2774,7 +2860,9 @@ def build_language_keyboard() -> InlineKeyboardMarkup:
         lang_buttons.append({"text": display_name, "callback_data": f"lang:{code}"})
     if lang_buttons:
         rows.append(lang_buttons)
-    rows.append([{"text": translate("buttons.cancel"), "callback_data": "cancel"}])
+    rows.append(
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+    )
     return kb(rows)
 
 
@@ -2795,11 +2883,13 @@ async def cmd_language_select(event: CallbackQuery, state: FSMContext):
     user_id = event.from_user.id
 
     if is_admin_user(user_id):
-        await event.answer(translate("texts.admin_language_notice"), show_alert=True)
+        await event.answer(
+            translate(lang, "texts.admin_language_notice"), show_alert=True
+        )
         return
 
     await state.set_state(LanguageStates.waiting_choice)
-    text = translate("texts.language_prompt")
+    text = translate(lang, "texts.language_prompt")
     await event.answer(text, show_alert=False)
     await event.message.edit_text(text, reply_markup=build_language_keyboard())
 
@@ -2810,11 +2900,15 @@ async def cmd_language_change(event: CallbackQuery, state: FSMContext):
     lang = event.data.split(":", 1)[1]
 
     if is_admin_user(user_id):
-        await event.answer(translate("texts.admin_language_notice"), show_alert=True)
+        await event.answer(
+            translate(lang, "texts.admin_language_notice"), show_alert=True
+        )
         return
 
     if lang not in get_available_languages():
-        await event.answer(translate("texts.language_not_supported"), show_alert=True)
+        await event.answer(
+            translate(lang, "texts.language_not_supported"), show_alert=True
+        )
         return
 
     await user_db.add_user(user_id)
@@ -2823,22 +2917,22 @@ async def cmd_language_change(event: CallbackQuery, state: FSMContext):
 
     lang_name = get_language_display_name(lang)
     await event.answer(
-        translate("texts.language_selected", language=lang_name),
+        translate(lang, "texts.language_selected", language=lang_name),
         show_alert=True,
     )
 
 
 @router.message(lambda message: message.from_user.id in pending_auth)
-async def process_auth_key(message: Message):
+async def process_auth_key(message: Message, state: FSMContext):
     user_id = message.from_user.id
     key = message.text.strip()
 
     if await auth_manager.verify_key(user_id, key):
         await auth_manager.add_authorized_user(user_id)
         del pending_auth[user_id]
-        text = translate("auth_success")
+        text = translate(lang, "auth_success")
         await smart_answer(message, bot, text, delete_origin=False)
-        await cmd_start(message, None)
+        await cmd_start(message, state)
     else:
         await notify_admins(
             bot,
@@ -2848,14 +2942,16 @@ async def process_auth_key(message: Message):
                 key=key,
             ),
         )
-        text = translate("auth_invalid")
+        text = translate(lang, "auth_invalid")
         await smart_answer(message, bot, text, delete_origin=False)
 
 
 @router.callback_query(F.data == "add_account")
 async def cmd_add_account(event: CallbackQuery, state: FSMContext):
-    text = translate("waiting_phone")
-    keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+    text = translate(lang, "waiting_phone")
+    keyboard = [
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+    ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(AddAccountStates.waiting_phone)
 
@@ -2864,10 +2960,15 @@ async def cmd_add_account(event: CallbackQuery, state: FSMContext):
 async def process_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     await state.update_data(phone=phone)
-    text = translate("safety_notice")
+    text = translate(lang, "safety_notice")
     keyboard = [
-        [{"text": translate("buttons.confirm_yes"), "callback_data": "confirm_yes"}],
-        [{"text": translate("buttons.confirm_no"), "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(lang, "buttons.confirm_yes"),
+                "callback_data": "confirm_yes",
+            }
+        ],
+        [{"text": translate(lang, "buttons.confirm_no"), "callback_data": "cancel"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -2883,7 +2984,7 @@ async def process_confirmation_yes(event: CallbackQuery, state: FSMContext):
         await smart_answer(
             event,
             bot,
-            translate("phone_missing"),
+            translate(lang, "phone_missing"),
             delete_origin=True,
         )
         await state.clear()
@@ -2898,18 +2999,24 @@ async def process_confirmation_yes(event: CallbackQuery, state: FSMContext):
             phone_code_hash=sent_code.phone_code_hash,
             password_attempts=0,
         )
-        text = translate("waiting_code", phone=phone)
-        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        text = translate(lang, "waiting_code", phone=phone)
+        keyboard = [
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+        ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         await state.set_state(AddAccountStates.waiting_code)
     except (PhoneNumberInvalidError, FloodWaitError) as e:
-        await smart_answer(event, bot, translate("invalid_format"), delete_origin=True)
+        await smart_answer(
+            event, bot, translate(lang, "invalid_format"), delete_origin=True
+        )
         await client.disconnect()
         await state.clear()
     except Exception as e:
-        await smart_answer(event, bot, translate("invalid_format"), delete_origin=True)
+        await smart_answer(
+            event, bot, translate(lang, "invalid_format"), delete_origin=True
+        )
         await client.disconnect()
         await state.clear()
 
@@ -2926,7 +3033,7 @@ async def process_code(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("auth_error_state"),
+            translate(lang, "auth_error_state"),
             delete_origin=False,
         )
         await state.clear()
@@ -2951,16 +3058,18 @@ async def process_code(message: Message, state: FSMContext):
                 username=me.username or "none",
                 phone=phone,
             )
-            keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+            keyboard = [
+                [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
+            ]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
             await persistent_client.disconnect()
             await state.clear()
         else:
-            text = translate("waiting_password")
+            text = translate(lang, "waiting_password")
             keyboard = [
-                [{"text": translate("buttons.cancel"), "callback_data": "cancel"}]
+                [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
             ]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -2968,8 +3077,10 @@ async def process_code(message: Message, state: FSMContext):
             await state.update_data(password_attempts=0)
             await state.set_state(AddAccountStates.waiting_password)
     except SessionPasswordNeededError:
-        text = translate("waiting_password")
-        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        text = translate(lang, "waiting_password")
+        keyboard = [
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+        ]
         await smart_answer(
             message, bot, text, reply_markup=kb(keyboard), delete_origin=False
         )
@@ -2979,9 +3090,9 @@ async def process_code(message: Message, state: FSMContext):
         try:
             sent_code = await client.send_code_request(phone)
             await state.update_data(phone_code_hash=sent_code.phone_code_hash)
-            text = translate("waiting_code", phone=phone)
+            text = translate(lang, "waiting_code", phone=phone)
             keyboard = [
-                [{"text": translate("buttons.cancel"), "callback_data": "cancel"}]
+                [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
             ]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -2990,20 +3101,20 @@ async def process_code(message: Message, state: FSMContext):
             await smart_answer(
                 message,
                 bot,
-                translate("invalid_format"),
+                translate(lang, "invalid_format"),
                 delete_origin=False,
             )
             await client.disconnect()
             await state.clear()
     except (PhoneCodeInvalidError, FloodWaitError) as e:
         await smart_answer(
-            message, bot, translate("invalid_format"), delete_origin=False
+            message, bot, translate(lang, "invalid_format"), delete_origin=False
         )
         await client.disconnect()
         await state.clear()
     except Exception as e:
         await smart_answer(
-            message, bot, translate("invalid_format"), delete_origin=False
+            message, bot, translate(lang, "invalid_format"), delete_origin=False
         )
         await client.disconnect()
         await state.clear()
@@ -3021,7 +3132,7 @@ async def process_password(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("auth_error_state"),
+            translate(lang, "auth_error_state"),
             delete_origin=False,
         )
         await state.clear()
@@ -3046,7 +3157,9 @@ async def process_password(message: Message, state: FSMContext):
                 username=me.username or "none",
                 phone=phone,
             )
-            keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+            keyboard = [
+                [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
+            ]
             await smart_answer(
                 message, bot, text, reply_markup=kb(keyboard), delete_origin=False
             )
@@ -3056,7 +3169,7 @@ async def process_password(message: Message, state: FSMContext):
             await smart_answer(
                 message,
                 bot,
-                translate("auth_error_password"),
+                translate(lang, "auth_error_password"),
                 delete_origin=False,
             )
             await client.disconnect()
@@ -3067,7 +3180,7 @@ async def process_password(message: Message, state: FSMContext):
             await smart_answer(
                 message,
                 bot,
-                translate("auth_max_attempts"),
+                translate(lang, "auth_max_attempts"),
                 delete_origin=False,
             )
             await client.disconnect()
@@ -3077,12 +3190,12 @@ async def process_password(message: Message, state: FSMContext):
             await smart_answer(
                 message,
                 bot,
-                translate("auth_attempts_left", attempts=3 - attempts),
+                translate(lang, "auth_attempts_left", attempts=3 - attempts),
                 delete_origin=False,
             )
     except Exception as e:
         await smart_answer(
-            message, bot, translate("invalid_format"), delete_origin=False
+            message, bot, translate(lang, "invalid_format"), delete_origin=False
         )
         await client.disconnect()
         await state.clear()
@@ -3091,35 +3204,35 @@ async def process_password(message: Message, state: FSMContext):
 @router.callback_query(F.data == "list_accounts")
 async def cmd_list_accounts(event: CallbackQuery):
     if not account_pool.accounts:
-        text = translate("no_accounts")
+        text = translate(lang, "no_accounts")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.add_account"),
+                    "text": translate(lang, "buttons.add_account"),
                     "callback_data": "add_account",
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    lines = [translate("accounts_list")]
+    lines = [translate(lang, "accounts_list")]
     for i, acc in enumerate(account_pool.accounts, 1):
         status = (
-            translate("account_status_free")
+            translate(lang, "account_status_free")
             if not acc["in_use"]
-            else translate("account_status_busy")
+            else translate(lang, "account_status_busy")
         )
         validity = (
-            translate("account_status_valid")
+            translate(lang, "account_status_valid")
             if acc["is_valid"]
-            else translate("account_status_invalid")
+            else translate(lang, "account_status_invalid")
         )
         flood = (
-            translate("account_flood_wait", until=acc["flood_wait_until"])
+            translate(lang, "account_flood_wait", until=acc["flood_wait_until"])
             if acc.get("flood_wait_until")
             else ""
         )
@@ -3129,13 +3242,13 @@ async def cmd_list_accounts(event: CallbackQuery):
         )
 
     text = "\n".join(lines)
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     if event.from_user.id in Config.ADMIN_USER_IDS:
         keyboard.insert(
             0,
             [
                 {
-                    "text": translate("account_list_refresh"),
+                    "text": translate(lang, "account_list_refresh"),
                     "callback_data": "list_accounts",
                 }
             ],
@@ -3147,11 +3260,13 @@ async def cmd_list_accounts(event: CallbackQuery):
 @router.callback_query(F.data == "genkey")
 async def cmd_genkey(event: CallbackQuery, state: FSMContext):
     if event.from_user.id not in Config.ADMIN_USER_IDS:
-        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
 
-    text = translate("genkey_title")
-    keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+    text = translate(lang, "genkey_title")
+    keyboard = [
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+    ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(KeyGeneration.waiting_user_id)
 
@@ -3166,7 +3281,9 @@ async def process_user_id(message: Message, state: FSMContext):
             user_id=user_id,
             key=key,
         )
-        keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+        keyboard = [
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
+        ]
         await smart_answer(
             message, bot, text, reply_markup=kb(keyboard), delete_origin=False
         )
@@ -3175,7 +3292,7 @@ async def process_user_id(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("genkey_error"),
+            translate(lang, "genkey_error"),
             delete_origin=False,
         )
 
@@ -3183,15 +3300,15 @@ async def process_user_id(message: Message, state: FSMContext):
 @router.callback_query(F.data == "start_scraping")
 async def cmd_start_scraping(event: CallbackQuery, state: FSMContext):
     if not account_pool.accounts:
-        text = translate("no_available_accounts_btn")
+        text = translate(lang, "no_available_accounts_btn")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.add_account"),
+                    "text": translate(lang, "buttons.add_account"),
                     "callback_data": "add_account",
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -3204,29 +3321,39 @@ async def cmd_start_scraping(event: CallbackQuery, state: FSMContext):
             max_tasks=Config.MAX_TASKS_PER_USER,
         )
         keyboard = [
-            [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [
+                {
+                    "text": translate(lang, "buttons.my_tasks"),
+                    "callback_data": "my_tasks",
+                }
+            ],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = translate("scraping_source_select")
+    text = translate(lang, "scraping_source_select")
     keyboard = [
         [
             {
-                "text": translate("scraping_source_manual"),
+                "text": translate(lang, "scraping_source_manual"),
                 "callback_data": "scraping_source:manual",
             }
         ],
         [
             {
-                "text": translate("scraping_source_db_btn"),
+                "text": translate(lang, "scraping_source_db_btn"),
                 "callback_data": "scraping_source:db",
             }
         ],
-        [{"text": translate("scraping_source_cancel"), "callback_data": "cancel"}],
+        [
+            {
+                "text": translate(lang, "scraping_source_cancel"),
+                "callback_data": "cancel",
+            }
+        ],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(ScrapingStates.waiting_source_type)
@@ -3240,8 +3367,10 @@ async def scraping_source_select(event: CallbackQuery, state: FSMContext):
     await state.update_data(scraping_source_type=source_type)
 
     if source_type == "manual":
-        text = translate("waiting_source")
-        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        text = translate(lang, "waiting_source")
+        keyboard = [
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+        ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
@@ -3250,19 +3379,19 @@ async def scraping_source_select(event: CallbackQuery, state: FSMContext):
         chats = await chat_db.get_all_chats()
         if not chats:
             await smart_answer(
-                event, bot, translate("scraping_db_empty"), show_alert=True
+                event, bot, translate(lang, "scraping_db_empty"), show_alert=True
             )
             return
         await state.update_data(db_chats_count=len(chats))
-        text = translate("scraping_source_db", count=len(chats))
+        text = translate(lang, "scraping_source_db", count=len(chats))
         keyboard = [
             [
                 {
-                    "text": translate("buttons.continue"),
+                    "text": translate(lang, "buttons.continue"),
                     "callback_data": "scraping_db_continue",
                 }
             ],
-            [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -3273,8 +3402,10 @@ async def scraping_source_select(event: CallbackQuery, state: FSMContext):
     F.data == "scraping_db_continue", ScrapingStates.waiting_source_type
 )
 async def scraping_db_continue(event: CallbackQuery, state: FSMContext):
-    text = translate("waiting_target")
-    keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+    text = translate(lang, "waiting_target")
+    keyboard = [
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+    ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(ScrapingStates.waiting_target)
 
@@ -3283,8 +3414,10 @@ async def scraping_db_continue(event: CallbackQuery, state: FSMContext):
 async def process_source(message: Message, state: FSMContext):
     source = message.text.strip()
     await state.update_data(source=source)
-    text = translate("scrape_step2")
-    keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+    text = translate(lang, "scrape_step2")
+    keyboard = [
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+    ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
     )
@@ -3295,11 +3428,11 @@ async def process_source(message: Message, state: FSMContext):
 async def process_target(message: Message, state: FSMContext):
     target = message.text.strip()
     await state.update_data(target=target)
-    text = translate("scrape_step3")
+    text = translate(lang, "scrape_step3")
     keyboard = [
-        [{"text": translate("mode_messages"), "callback_data": "mode:1"}],
-        [{"text": translate("mode_users"), "callback_data": "mode:2"}],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "mode_messages"), "callback_data": "mode:1"}],
+        [{"text": translate(lang, "mode_users"), "callback_data": "mode:2"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -3313,15 +3446,19 @@ async def process_mode_callback(event: CallbackQuery, state: FSMContext):
     await state.update_data(mode=mode)
 
     if mode == "1":
-        text = translate("scrape_step4_msg")
-        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        text = translate(lang, "scrape_step4_msg")
+        keyboard = [
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+        ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         await state.set_state(ScrapingStates.waiting_message_limit)
     elif mode == "2":
-        text = translate("scrape_step4_users")
-        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        text = translate(lang, "scrape_step4_users")
+        keyboard = [
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+        ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
@@ -3347,7 +3484,7 @@ async def process_limit(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("limit_error", min=50, max=5000),
+            translate(lang, "limit_error", min=50, max=5000),
             delete_origin=False,
         )
         return
@@ -3373,7 +3510,7 @@ async def process_user_count(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("user_count_error", min=10, max=1000),
+            translate(lang, "user_count_error", min=10, max=1000),
             delete_origin=False,
         )
         return
@@ -3388,12 +3525,12 @@ async def ask_for_account(event, state: FSMContext):
         await smart_answer(
             event,
             bot,
-            translate("scrape_no_accounts"),
+            translate(lang, "scrape_no_accounts"),
             reply_markup=kb(
                 [
                     [
                         {
-                            "text": translate("scrape_add_account"),
+                            "text": translate(lang, "scrape_add_account"),
                             "callback_data": "add_account",
                         }
                     ]
@@ -3410,14 +3547,16 @@ async def ask_for_account(event, state: FSMContext):
         await smart_answer(
             event,
             bot,
-            translate("selected_account", name=accounts_list[0]["session_file"]),
+            translate(lang, "selected_account", name=accounts_list[0]["session_file"]),
             delete_origin=False,
         )
         await launch_scraping_task(event, state)
         return
 
-    lines = [translate("scrape_select_account")]
-    keyboard_rows = [[{"text": translate("scrape_auto"), "callback_data": "acc:auto"}]]
+    lines = [translate(lang, "scrape_select_account")]
+    keyboard_rows = [
+        [{"text": translate(lang, "scrape_auto"), "callback_data": "acc:auto"}]
+    ]
     for i, acc in enumerate(accounts_list, 1):
         status = "🟢" if acc["is_valid"] else "⚫"
         busy = " ⏳" if acc["in_use"] else ""
@@ -3427,7 +3566,7 @@ async def ask_for_account(event, state: FSMContext):
             [{"text": label, "callback_data": f"acc:{acc['session_file']}"}]
         )
     keyboard_rows.append(
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}]
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
     )
 
     await smart_answer(
@@ -3520,12 +3659,12 @@ async def launch_scraping_task(event, state: FSMContext):
         task_id=task_id,
         source=source,
         target=target,
-        mode=translate("messages") if mode == "1" else translate("users"),
+        mode=translate(lang, "messages") if mode == "1" else translate(lang, "users"),
         account=sender_session or "auto",
     )
     keyboard = [
-        [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
-        [{"text": translate("buttons.main"), "callback_data": "start"}],
+        [{"text": translate(lang, "buttons.my_tasks"), "callback_data": "my_tasks"}],
+        [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
     ]
     await smart_answer(
         event,
@@ -3545,29 +3684,34 @@ async def cmd_bulk_mailing(event: CallbackQuery, state: FSMContext):
             max_tasks=Config.MAX_TASKS_PER_USER,
         )
         keyboard = [
-            [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [
+                {
+                    "text": translate(lang, "buttons.my_tasks"),
+                    "callback_data": "my_tasks",
+                }
+            ],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = translate("bulkmail_source_select")
+    text = translate(lang, "bulkmail_source_select")
     keyboard = [
         [
             {
-                "text": translate("bulkmail_source_manual"),
+                "text": translate(lang, "bulkmail_source_manual"),
                 "callback_data": "bulkmail_source:manual",
             }
         ],
         [
             {
-                "text": translate("bulkmail_source_db_btn"),
+                "text": translate(lang, "bulkmail_source_db_btn"),
                 "callback_data": "bulkmail_source:db",
             }
         ],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BulkMailStates.waiting_db_source)
@@ -3581,8 +3725,10 @@ async def bm_source_select(event: CallbackQuery, state: FSMContext):
     await state.update_data(chats_source_type=source_type)
 
     if source_type == "manual":
-        text = translate("bulkmail_step1_manual")
-        keyboard = [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        text = translate(lang, "bulkmail_step1_manual")
+        keyboard = [
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
+        ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
@@ -3591,19 +3737,19 @@ async def bm_source_select(event: CallbackQuery, state: FSMContext):
         chats = await chat_db.get_all_chats()
         if not chats:
             await smart_answer(
-                event, bot, translate("bulkmail_db_empty"), show_alert=True
+                event, bot, translate(lang, "bulkmail_db_empty"), show_alert=True
             )
             return
         await state.update_data(db_chats_count=len(chats))
-        text = translate("bulkmail_step1_db", count=len(chats))
+        text = translate(lang, "bulkmail_step1_db", count=len(chats))
         keyboard = [
             [
                 {
-                    "text": translate("buttons.continue"),
+                    "text": translate(lang, "buttons.continue"),
                     "callback_data": "bulkmail_db_continue",
                 }
             ],
-            [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -3614,13 +3760,13 @@ async def bm_source_select(event: CallbackQuery, state: FSMContext):
     F.data == "bulkmail_db_continue", BulkMailStates.waiting_db_source
 )
 async def bm_db_continue(event: CallbackQuery, state: FSMContext):
-    text = translate("bulkmail_step2_delay")
+    text = translate(lang, "bulkmail_step2_delay")
     keyboard = [
         [{"text": "5 10", "callback_data": "delay:5:10"}],
         [{"text": "10 20", "callback_data": "delay:10:20"}],
         [{"text": "20 30", "callback_data": "delay:20:30"}],
         [{"text": "30 60", "callback_data": "delay:30:60"}],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BulkMailStates.waiting_delay)
@@ -3634,19 +3780,19 @@ async def bm_waiting_chats(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("bulkmail_empty_chats"),
+            translate(lang, "bulkmail_empty_chats"),
             delete_origin=False,
         )
         return
 
     await state.update_data(chats=parts)
-    text = translate("bulkmail_step2_delay")
+    text = translate(lang, "bulkmail_step2_delay")
     keyboard = [
         [{"text": "5 10", "callback_data": "delay:5:10"}],
         [{"text": "10 20", "callback_data": "delay:10:20"}],
         [{"text": "20 30", "callback_data": "delay:20:30"}],
         [{"text": "30 60", "callback_data": "delay:30:60"}],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -3660,15 +3806,15 @@ async def bm_waiting_delay_callback(event: CallbackQuery, state: FSMContext):
     dmin = int(parts[1])
     dmax = int(parts[2])
     await state.update_data(delay_min=dmin, delay_max=dmax)
-    text = translate("bulkmail_step3_text_first")
+    text = translate(lang, "bulkmail_step3_text_first")
     keyboard = [
         [
             {
-                "text": translate("bulkmail_texts_done"),
+                "text": translate(lang, "bulkmail_texts_done"),
                 "callback_data": "bulkmail_texts_done",
             }
         ],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BulkMailStates.waiting_text)
@@ -3688,21 +3834,21 @@ async def bm_waiting_delay(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("bulkmail_invalid_delay"),
+            translate(lang, "bulkmail_invalid_delay"),
             delete_origin=False,
         )
         return
 
     await state.update_data(delay_min=dmin, delay_max=dmax)
-    text = translate("bulkmail_step3_text_first")
+    text = translate(lang, "bulkmail_step3_text_first")
     keyboard = [
         [
             {
-                "text": translate("bulkmail_texts_done"),
+                "text": translate(lang, "bulkmail_texts_done"),
                 "callback_data": "bulkmail_texts_done",
             }
         ],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -3716,7 +3862,7 @@ async def bm_waiting_text(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("bulkmail_texts_confirm"),
+            translate(lang, "bulkmail_texts_confirm"),
             delete_origin=False,
         )
         return
@@ -3727,21 +3873,21 @@ async def bm_waiting_text(message: Message, state: FSMContext):
     await state.update_data(texts=texts)
 
     current_count = len(texts)
-    text = translate("bulkmail_texts_received", count=current_count)
+    text = translate(lang, "bulkmail_texts_received", count=current_count)
     keyboard = [
         [
             {
-                "text": translate("bulkmail_add_text"),
+                "text": translate(lang, "bulkmail_add_text"),
                 "callback_data": "bulkmail_add_text",
             }
         ],
         [
             {
-                "text": translate("bulkmail_texts_done"),
+                "text": translate(lang, "bulkmail_texts_done"),
                 "callback_data": "bulkmail_texts_done",
             }
         ],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -3752,21 +3898,21 @@ async def bm_waiting_text(message: Message, state: FSMContext):
 async def bm_add_text_callback(event: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     texts = data.get("texts", [])
-    text = translate("bulkmail_step3_text_next", count=len(texts))
+    text = translate(lang, "bulkmail_step3_text_next", count=len(texts))
     keyboard = [
         [
             {
-                "text": translate("bulkmail_add_text"),
+                "text": translate(lang, "bulkmail_add_text"),
                 "callback_data": "bulkmail_add_text",
             }
         ],
         [
             {
-                "text": translate("bulkmail_texts_done"),
+                "text": translate(lang, "bulkmail_texts_done"),
                 "callback_data": "bulkmail_texts_done",
             }
         ],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -3776,7 +3922,9 @@ async def bm_texts_done_callback(event: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     texts = data.get("texts", [])
     if not texts:
-        await smart_answer(event, bot, translate("bulkmail_no_texts"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "bulkmail_no_texts"), show_alert=True
+        )
         return
     await state.update_data(message_text=texts[0])  # For backward compatibility
     await _proceed_to_sender_selection(event, state)
@@ -3787,13 +3935,13 @@ async def _proceed_to_sender_selection(event, state: FSMContext):
     accounts_list = account_pool.accounts
 
     if not accounts_list:
-        text = translate("bulkmail_no_accounts")
+        text = translate(lang, "bulkmail_no_accounts")
         keyboard = [
             [{"text": "50", "callback_data": "total:50"}],
             [{"text": "100", "callback_data": "total:100"}],
             [{"text": "200", "callback_data": "total:200"}],
             [{"text": "500", "callback_data": "total:500"}],
-            [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+            [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -3801,16 +3949,18 @@ async def _proceed_to_sender_selection(event, state: FSMContext):
         await state.set_state(BulkMailStates.waiting_count)
         return
 
-    lines = [translate("bulkmail_step4_account")]
+    lines = [translate(lang, "bulkmail_step4_account")]
     for i, acc in enumerate(accounts_list, 1):
         status = "🔴" if acc["in_use"] else "🟢" if acc["is_valid"] else "⚫"
-        flood = translate("flood_indicator") if acc.get("flood_wait_until") else ""
+        flood = (
+            translate(lang, "flood_indicator") if acc.get("flood_wait_until") else ""
+        )
         lines.append(f"{i}. {acc['session_file']} {status}{flood}")
 
     lines.append(f"\n<b>{translate('bulkmail_step4_account').split(':')[0]}:</b>")
 
     keyboard = (
-        [[{"text": translate("bulkmail_auto"), "callback_data": "sender:auto"}]]
+        [[{"text": translate(lang, "bulkmail_auto"), "callback_data": "sender:auto"}]]
         + [
             [
                 {
@@ -3820,7 +3970,7 @@ async def _proceed_to_sender_selection(event, state: FSMContext):
             ]
             for i, acc in enumerate(accounts_list, 1)
         ]
-        + [[{"text": translate("buttons.cancel"), "callback_data": "cancel"}]]
+        + [[{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]]
     )
 
     await smart_answer(
@@ -3843,7 +3993,7 @@ async def bm_waiting_sender_callback(event: CallbackQuery, state: FSMContext):
         [{"text": "100", "callback_data": "total:100"}],
         [{"text": "200", "callback_data": "total:200"}],
         [{"text": "500", "callback_data": "total:500"}],
-        [{"text": translate("buttons.cancel"), "callback_data": "cancel"}],
+        [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(BulkMailStates.waiting_count)
@@ -3865,7 +4015,7 @@ async def bm_waiting_count(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("bulkmail_total_error"),
+            translate(lang, "bulkmail_total_error"),
             delete_origin=False,
         )
         return
@@ -3889,14 +4039,16 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
         chats = await chat_db.get_all_chats()
         if not chats:
             await smart_answer(
-                event, bot, translate("bulkmail_db_empty"), show_alert=True
+                event, bot, translate(lang, "bulkmail_db_empty"), show_alert=True
             )
             await state.clear()
             return
         chats = [c["chat_url"] or c["chat_id"] for c in chats]
 
     if not chats:
-        await smart_answer(event, bot, translate("bulkmail_no_chats"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "bulkmail_no_chats"), show_alert=True
+        )
         await state.clear()
         return
 
@@ -3953,9 +4105,9 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
         texts_preview += f"\n{translate('more_texts', count=len(texts) - 3)}"
 
     source_info = (
-        translate("scraping_source_db_btn")
+        translate(lang, "scraping_source_db_btn")
         if chats_source_type == "db"
-        else translate("source_manual", count=len(chats))
+        else translate(lang, "source_manual", count=len(chats))
     )
 
     text = translate(
@@ -3964,13 +4116,13 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
         source=source_info,
         target=str(len(texts)),
         mode=f"{delay_min}-{delay_max}с",
-        account=sender_session or translate("sender_placeholder"),
+        account=sender_session or translate(lang, "sender_placeholder"),
     )
     text += f"\n\n{translate('mailing_texts_header')}\n{texts_preview}\n\n"
-    text += translate("bulkmail_sent", task_id=task_id, sent=total)
+    text += translate(lang, "bulkmail_sent", task_id=task_id, sent=total)
     keyboard = [
-        [{"text": translate("buttons.my_tasks"), "callback_data": "my_tasks"}],
-        [{"text": translate("buttons.main"), "callback_data": "start"}],
+        [{"text": translate(lang, "buttons.my_tasks"), "callback_data": "my_tasks"}],
+        [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
     ]
 
     if isinstance(event, CallbackQuery):
@@ -4054,11 +4206,11 @@ async def show_task_details(
         keyboard.append(
             [
                 {
-                    "text": translate("task_pause"),
+                    "text": translate(lang, "task_pause"),
                     "callback_data": f"pause_task:{task_id}",
                 },
                 {
-                    "text": translate("task_cancel_btn"),
+                    "text": translate(lang, "task_cancel_btn"),
                     "callback_data": f"cancel_task_id:{task_id}",
                 },
             ]
@@ -4067,11 +4219,11 @@ async def show_task_details(
         keyboard.append(
             [
                 {
-                    "text": translate("task_resume"),
+                    "text": translate(lang, "task_resume"),
                     "callback_data": f"resume_task:{task_id}",
                 },
                 {
-                    "text": translate("task_cancel_btn"),
+                    "text": translate(lang, "task_cancel_btn"),
                     "callback_data": f"cancel_task_id:{task_id}",
                 },
             ]
@@ -4080,7 +4232,7 @@ async def show_task_details(
         keyboard.append(
             [
                 {
-                    "text": translate("task_cancel_btn"),
+                    "text": translate(lang, "task_cancel_btn"),
                     "callback_data": f"cancel_task_id:{task_id}",
                 }
             ]
@@ -4096,7 +4248,7 @@ async def show_task_details(
             keyboard.append(
                 [
                     {
-                        "text": translate("task_leave_chats"),
+                        "text": translate(lang, "task_leave_chats"),
                         "callback_data": f"leave_chats:{task_id}",
                     }
                 ]
@@ -4105,7 +4257,7 @@ async def show_task_details(
     keyboard.append(
         [
             {
-                "text": translate("task_refresh"),
+                "text": translate(lang, "task_refresh"),
                 "callback_data": f"refresh_task:{task_id}",
             }
         ]
@@ -4117,7 +4269,7 @@ async def show_task_details(
         keyboard.append(
             [
                 {
-                    "text": translate("user_info_label", user_id=task_user_id),
+                    "text": translate(lang, "user_info_label", user_id=task_user_id),
                     "callback_data": f"user_info:{task_user_id}",
                 }
             ]
@@ -4126,12 +4278,14 @@ async def show_task_details(
     keyboard.append(
         [
             {
-                "text": translate("task_all_tasks"),
+                "text": translate(lang, "task_all_tasks"),
                 "callback_data": "task_list" if for_admin else "my_tasks",
             }
         ]
     )
-    keyboard.append([{"text": translate("buttons.main"), "callback_data": "start"}])
+    keyboard.append(
+        [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
+    )
 
     return text, kb(keyboard)
 
@@ -4143,21 +4297,21 @@ async def cmd_my_tasks(event: CallbackQuery):
     user_tasks = [t for t in tasks if t.get("user_id") == user_id]
 
     if not user_tasks:
-        text = translate("no_tasks")
+        text = translate(lang, "no_tasks")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.start_scraping"),
+                    "text": translate(lang, "buttons.start_scraping"),
                     "callback_data": "start_scraping",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.bulk_mailing"),
+                    "text": translate(lang, "buttons.bulk_mailing"),
                     "callback_data": "bulk_mailing",
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -4182,21 +4336,21 @@ async def cmd_my_tasks(event: CallbackQuery):
                 event, bot, text, reply_markup=keyboard, delete_origin=True
             )
     else:
-        text = translate("no_active_tasks")
+        text = translate(lang, "no_active_tasks")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.start_scraping"),
+                    "text": translate(lang, "buttons.start_scraping"),
                     "callback_data": "start_scraping",
                 }
             ],
             [
                 {
-                    "text": translate("buttons.bulk_mailing"),
+                    "text": translate(lang, "buttons.bulk_mailing"),
                     "callback_data": "bulk_mailing",
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
@@ -4222,17 +4376,17 @@ async def cmd_my_tasks(event: CallbackQuery):
             )
         tasks_text = "\n".join(task_lines)
 
-        text = translate("task_list_header", tasks=tasks_text)
+        text = translate(lang, "task_list_header", tasks=tasks_text)
         keyboard = [
             [
                 {
-                    "text": translate("task_all_tasks_btn"),
+                    "text": translate(lang, "task_all_tasks_btn"),
                     "callback_data": (
                         "task_list" if user_id in Config.ADMIN_USER_IDS else "my_tasks"
                     ),
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
 
         await smart_answer(
@@ -4247,7 +4401,7 @@ async def cmd_task_list(event: CallbackQuery):
         await smart_answer(
             event,
             bot,
-            translate("task_list_only_admin"),
+            translate(lang, "task_list_only_admin"),
             show_alert=True,
         )
         return
@@ -4258,8 +4412,10 @@ async def cmd_task_list(event: CallbackQuery):
     ]
 
     if not active_tasks:
-        text = translate("no_tasks_list")
-        keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+        text = translate(lang, "no_tasks_list")
+        keyboard = [
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
+        ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
@@ -4277,7 +4433,9 @@ async def refresh_task(event: CallbackQuery):
     task = await tasks_storage.find_by_id(task_id, id_field="task_id")
 
     if not task:
-        await smart_answer(event, bot, translate("task_not_found"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "task_not_found"), show_alert=True
+        )
         return
 
     user_id = event.from_user.id
@@ -4292,18 +4450,22 @@ async def process_pause_task(event: CallbackQuery):
     task_id = event.data.split(":", 1)[1]
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
-        await smart_answer(event, bot, translate("task_not_found"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "task_not_found"), show_alert=True
+        )
         return
 
     user_id = event.from_user.id
     task_user_id = task_data.get("user_id")
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
-        await smart_answer(event, bot, translate("pause_no_rights"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "pause_no_rights"), show_alert=True
+        )
         return
 
     await task_queue.pause_task(task_id)
     await smart_answer(
-        event, bot, translate("task_paused", task_id=task_id), show_alert=True
+        event, bot, translate(lang, "task_paused", task_id=task_id), show_alert=True
     )
 
     updated_task = await tasks_storage.find_by_id(task_id, id_field="task_id")
@@ -4318,13 +4480,17 @@ async def process_resume_task(event: CallbackQuery):
     task_id = event.data.split(":", 1)[1]
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
-        await smart_answer(event, bot, translate("task_not_found"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "task_not_found"), show_alert=True
+        )
         return
 
     user_id = event.from_user.id
     task_user_id = task_data.get("user_id")
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
-        await smart_answer(event, bot, translate("resume_no_rights"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "resume_no_rights"), show_alert=True
+        )
         return
 
     if task_id not in task_queue.active_tasks:
@@ -4332,7 +4498,7 @@ async def process_resume_task(event: CallbackQuery):
 
     await task_queue.resume_task(task_id)
     await smart_answer(
-        event, bot, translate("task_resumed", task_id=task_id), show_alert=True
+        event, bot, translate(lang, "task_resumed", task_id=task_id), show_alert=True
     )
 
     updated_task = await tasks_storage.find_by_id(task_id, id_field="task_id")
@@ -4348,7 +4514,9 @@ async def process_cancel_task(event: CallbackQuery):
 
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
-        await smart_answer(event, bot, translate("task_not_found"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "task_not_found"), show_alert=True
+        )
         return
 
     user_id = event.from_user.id
@@ -4356,7 +4524,9 @@ async def process_cancel_task(event: CallbackQuery):
 
     # Проверяем права
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
-        await smart_answer(event, bot, translate("cancel_no_rights"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "cancel_no_rights"), show_alert=True
+        )
         return
 
     # Обновляем статус задачи
@@ -4378,21 +4548,25 @@ async def process_cancel_task(event: CallbackQuery):
 
     # Уведомляем пользователя
     if user_id == task_user_id:
-        await notify_user(bot, user_id, translate("task_cancelled", task_id=task_id))
+        await notify_user(
+            bot, user_id, translate(lang, "task_cancelled", task_id=task_id)
+        )
     else:
         await notify_user(
-            bot, task_user_id, translate("task_cancelled", task_id=task_id)
+            bot, task_user_id, translate(lang, "task_cancelled", task_id=task_id)
         )
         await notify_user(
             bot,
             user_id,
-            translate("task_cancelled_by_admin", task_id=task_id, user_id=task_user_id),
+            translate(
+                lang, "task_cancelled_by_admin", task_id=task_id, user_id=task_user_id
+            ),
         )
 
     await smart_answer(
         event,
         bot,
-        translate("task_cancelled_confirm", task_id=task_id),
+        translate(lang, "task_cancelled_confirm", task_id=task_id),
         show_alert=True,
     )
 
@@ -4409,18 +4583,22 @@ async def process_leave_chats(event: CallbackQuery):
     task_id = event.data.split(":", 1)[1]
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
-        await smart_answer(event, bot, translate("task_not_found"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "task_not_found"), show_alert=True
+        )
         return
 
     user_id = event.from_user.id
     task_user_id = task_data.get("user_id")
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
-        await smart_answer(event, bot, translate("no_rights"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "no_rights"), show_alert=True)
         return
 
     joined_chats = task_data.get("joined_chats") or []
     if not joined_chats:
-        await smart_answer(event, bot, translate("leave_nothing"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "leave_nothing"), show_alert=True
+        )
         return
 
     sender_session = task_data.get("sender_session")
@@ -4428,7 +4606,7 @@ async def process_leave_chats(event: CallbackQuery):
         await smart_answer(
             event,
             bot,
-            translate("leave_no_sender"),
+            translate(lang, "leave_no_sender"),
             show_alert=True,
         )
         return
@@ -4446,7 +4624,7 @@ async def process_leave_chats(event: CallbackQuery):
                     errors.append((chat, str(e)))
     except Exception as e:
         await smart_answer(
-            event, bot, translate("leave_error", error=e), show_alert=True
+            event, bot, translate(lang, "leave_error", error=e), show_alert=True
         )
         return
 
@@ -4459,13 +4637,13 @@ async def process_leave_chats(event: CallbackQuery):
     except Exception:
         pass
 
-    msg_lines = [translate("leave_done")]
+    msg_lines = [translate(lang, "leave_done")]
     if left:
-        msg_lines.append("• " + translate("left_chats") + ": " + ", ".join(left))
+        msg_lines.append("• " + translate(lang, "left_chats") + ": " + ", ".join(left))
     if errors:
         msg_lines.append(
             "• "
-            + translate("errors")
+            + translate(lang, "errors")
             + ": "
             + "; ".join([f"{c} ({e})" for c, e in errors])
         )
@@ -4499,9 +4677,9 @@ async def cmd_task_stats(event: CallbackQuery):
     )
 
     keyboard = [
-        [{"text": translate("buttons.task_list"), "callback_data": "task_list"}],
-        [{"text": translate("task_refresh"), "callback_data": "task_stats"}],
-        [{"text": translate("buttons.main"), "callback_data": "start"}],
+        [{"text": translate(lang, "buttons.task_list"), "callback_data": "task_list"}],
+        [{"text": translate(lang, "task_refresh"), "callback_data": "task_stats"}],
+        [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
     ]
 
     await smart_answer(event, bot, stats, reply_markup=kb(keyboard), delete_origin=True)
@@ -4511,18 +4689,18 @@ async def cmd_task_stats(event: CallbackQuery):
 async def cmd_clear_cache(event: CallbackQuery, state: FSMContext):
     user_id = event.from_user.id
     if user_id not in Config.ADMIN_USER_IDS:
-        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
 
-    text = translate("clear_cache_confirm")
+    text = translate(lang, "clear_cache_confirm")
     keyboard = [
         [
             {
-                "text": translate("buttons.confirm_yes"),
+                "text": translate(lang, "buttons.confirm_yes"),
                 "callback_data": "clear_cache_confirm",
             }
         ],
-        [{"text": translate("buttons.confirm_no"), "callback_data": "start"}],
+        [{"text": translate(lang, "buttons.confirm_no"), "callback_data": "start"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -4530,8 +4708,8 @@ async def cmd_clear_cache(event: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "clear_cache_confirm")
 async def process_clear_cache_confirm(event: CallbackQuery):
     cleared = await cache_manager.clear_cache()
-    text = translate("cache_cleared", count=cleared)
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    text = translate(lang, "cache_cleared", count=cleared)
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4539,18 +4717,18 @@ async def process_clear_cache_confirm(event: CallbackQuery):
 @router.callback_query(F.data == "cancel_all_tasks")
 async def cmd_cancel_all_tasks(event: CallbackQuery):
     if event.from_user.id not in Config.ADMIN_USER_IDS:
-        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
 
-    text = translate("task_cancel_confirm")
+    text = translate(lang, "task_cancel_confirm")
     keyboard = [
         [
             {
-                "text": translate("task_confirm_yes"),
+                "text": translate(lang, "task_confirm_yes"),
                 "callback_data": "cancel_all_tasks_confirm",
             }
         ],
-        [{"text": translate("task_confirm_no"), "callback_data": "start"}],
+        [{"text": translate(lang, "task_confirm_no"), "callback_data": "start"}],
     ]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
@@ -4558,7 +4736,7 @@ async def cmd_cancel_all_tasks(event: CallbackQuery):
 @router.callback_query(F.data == "cancel_all_tasks_confirm")
 async def process_cancel_all_tasks(event: CallbackQuery):
     if event.from_user.id not in Config.ADMIN_USER_IDS:
-        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
 
     cancelled = 0
@@ -4579,8 +4757,8 @@ async def process_cancel_all_tasks(event: CallbackQuery):
                 )
                 cancelled += 1
 
-    text = translate("tasks_cancelled", count=cancelled)
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    text = translate(lang, "tasks_cancelled", count=cancelled)
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
 
@@ -4588,23 +4766,23 @@ async def process_cancel_all_tasks(event: CallbackQuery):
 @router.callback_query(F.data == "add_chats_to_db")
 async def cmd_add_chats_to_db(event: CallbackQuery, state: FSMContext):
     if not account_pool.accounts:
-        text = translate("worm_no_account")
+        text = translate(lang, "worm_no_account")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.add_account"),
+                    "text": translate(lang, "buttons.add_account"),
                     "callback_data": "add_account",
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = translate("worm_waiting_links")
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    text = translate(lang, "worm_waiting_links")
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(AddChatsStates.waiting_links)
 
@@ -4624,7 +4802,7 @@ async def _process_chats_input(
         text = (getattr(event, "text", None) or "").strip()
         if not text:
             await smart_answer(
-                event, bot, translate("empty_input"), delete_origin=False
+                event, bot, translate(lang, "empty_input"), delete_origin=False
             )
             return
         # Разбиваем по пробелам, запятым, новым строкам
@@ -4647,7 +4825,7 @@ async def _process_chats_input(
         # Читаем файл
         if not event.document:
             await smart_answer(
-                event, bot, translate("invalid_format"), delete_origin=False
+                event, bot, translate(lang, "invalid_format"), delete_origin=False
             )
             return
         file = await event.download()
@@ -4667,7 +4845,9 @@ async def _process_chats_input(
                 raw_links.append(f"https://t.me/{part}")
 
     if not raw_links:
-        await smart_answer(event, bot, translate("empty_input"), delete_origin=False)
+        await smart_answer(
+            event, bot, translate(lang, "empty_input"), delete_origin=False
+        )
         return
 
     # Убираем дубликаты
@@ -4680,7 +4860,9 @@ async def _process_chats_input(
             unique_links.append(link)
 
     if not unique_links:
-        await smart_answer(event, bot, translate("empty_input"), delete_origin=False)
+        await smart_answer(
+            event, bot, translate(lang, "empty_input"), delete_origin=False
+        )
         return
 
     # Получаем аккаунт
@@ -4699,7 +4881,10 @@ async def _process_chats_input(
                 f"Не удалось подключиться к аккаунту {acc['session_file']}: {e}"
             )
             await smart_answer(
-                event, bot, translate("no_available_accounts"), delete_origin=False
+                event,
+                bot,
+                translate(lang, "no_available_accounts"),
+                delete_origin=False,
             )
             return
 
@@ -4745,15 +4930,17 @@ async def _process_chats_input(
             errors += 1
             logger.error(f"Ошибка обработки чата {link}: {e}")
 
-    output = translate("chats_added_title", count=len(unique_links))
+    output = translate(lang, "chats_added_title", count=len(unique_links))
     output += f"\n\n• {translate('added_to_db')}: {added}\n• {translate('errors')}: {errors}\n\n"
     if results_text:
-        output += translate("added_chats_header") + "\n" + "\n".join(results_text[:20])
+        output += (
+            translate(lang, "added_chats_header") + "\n" + "\n".join(results_text[:20])
+        )
         if len(results_text) > 20:
             output += f"\n\n{translate('more_results', count=len(results_text) - 20)}"
 
     keyboard = [
-        [{"text": translate("buttons.main"), "callback_data": "start"}],
+        [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
     ]
     await smart_answer(
         event, bot, output, reply_markup=kb(keyboard), delete_origin=False
@@ -4765,23 +4952,23 @@ async def _process_chats_input(
 @router.callback_query(F.data == "update_chats_db")
 async def cmd_update_chats_db(event: CallbackQuery):
     if event.from_user.id not in Config.ADMIN_USER_IDS:
-        await smart_answer(event, bot, translate("only_admin"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
 
     if not account_pool.accounts:
         await smart_answer(
-            event, bot, translate("no_available_accounts"), show_alert=True
+            event, bot, translate(lang, "no_available_accounts"), show_alert=True
         )
         return
 
     chats = await chat_db.get_all_chats()
     total = len(chats)
     if total == 0:
-        await smart_answer(event, bot, translate("no_chats_db"), show_alert=True)
+        await smart_answer(event, bot, translate(lang, "no_chats_db"), show_alert=True)
         return
 
-    text = translate("update_db_start", total=total)
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    text = translate(lang, "update_db_start", total=total)
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     msg = await smart_answer(
         event, bot, text, reply_markup=kb(keyboard), delete_origin=True
     )
@@ -4838,23 +5025,23 @@ async def _run_update_chats_db(msg: Any, user_id: int):
 @router.callback_query(F.data == "worm_mode")
 async def cmd_worm_mode(event: CallbackQuery, state: FSMContext):
     if not account_pool.accounts:
-        text = translate("worm_no_account")
+        text = translate(lang, "worm_no_account")
         keyboard = [
             [
                 {
-                    "text": translate("buttons.add_account"),
+                    "text": translate(lang, "buttons.add_account"),
                     "callback_data": "add_account",
                 }
             ],
-            [{"text": translate("buttons.main"), "callback_data": "start"}],
+            [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
             event, bot, text, reply_markup=kb(keyboard), delete_origin=True
         )
         return
 
-    text = translate("worm_waiting_chat")
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    text = translate(lang, "worm_waiting_chat")
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
     await state.set_state(WormModeStates.waiting_sources)
 
@@ -4864,7 +5051,9 @@ async def cmd_stop_worm(event: CallbackQuery):
     global _worm_active, _worm_task
 
     if not _worm_active:
-        await smart_answer(event, bot, translate("invalid_format"), show_alert=True)
+        await smart_answer(
+            event, bot, translate(lang, "invalid_format"), show_alert=True
+        )
         return
 
     _worm_active = False
@@ -4896,7 +5085,7 @@ async def cmd_stop_worm(event: CallbackQuery):
         added=total_added,
         errors=total_errors,
     )
-    keyboard = [[{"text": translate("buttons.main"), "callback_data": "start"}]]
+    keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
     await smart_answer(event, bot, text, reply_markup=kb(keyboard), delete_origin=True)
 
     async with _worm_lock:
@@ -4911,7 +5100,7 @@ async def process_worm_sources(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("worm_already_running", chat=_worm_chat_id),
+            translate(lang, "worm_already_running", chat=_worm_chat_id),
             delete_origin=False,
         )
         return
@@ -4919,7 +5108,9 @@ async def process_worm_sources(message: Message, state: FSMContext):
     # Парсим несколько источников (каждый с новой строки или разделённый пробелами)
     raw_sources = message.text.strip()
     if not raw_sources:
-        await smart_answer(message, bot, translate("empty_input"), delete_origin=False)
+        await smart_answer(
+            message, bot, translate(lang, "empty_input"), delete_origin=False
+        )
         return
 
     # Разбиваем по строкам, запятым, пробелам
@@ -4939,7 +5130,7 @@ async def process_worm_sources(message: Message, state: FSMContext):
 
     if not sources:
         await smart_answer(
-            message, bot, translate("invalid_format"), delete_origin=False
+            message, bot, translate(lang, "invalid_format"), delete_origin=False
         )
         return
 
@@ -4948,7 +5139,7 @@ async def process_worm_sources(message: Message, state: FSMContext):
         await smart_answer(
             message,
             bot,
-            translate("worm_max_sources", count=Config.WORM_MAX_CONCURRENT),
+            translate(lang, "worm_max_sources", count=Config.WORM_MAX_CONCURRENT),
             delete_origin=False,
         )
         sources = sources[: Config.WORM_MAX_CONCURRENT]
@@ -4961,7 +5152,7 @@ async def process_worm_sources(message: Message, state: FSMContext):
             break
     if not acc:
         await smart_answer(
-            message, bot, translate("no_available_accounts"), delete_origin=False
+            message, bot, translate(lang, "no_available_accounts"), delete_origin=False
         )
         return
 
@@ -4974,7 +5165,10 @@ async def process_worm_sources(message: Message, state: FSMContext):
         except Exception as e:
             logger.error(f"Не удалось подключиться к аккаунту: {e}")
             await smart_answer(
-                message, bot, translate("no_available_accounts"), delete_origin=False
+                message,
+                bot,
+                translate(lang, "no_available_accounts"),
+                delete_origin=False,
             )
             return
 
@@ -4990,8 +5184,8 @@ async def process_worm_sources(message: Message, state: FSMContext):
         "worm_started_multi", chats=len(sources), sources=", ".join(sources[:3])
     )
     keyboard = [
-        [{"text": translate("buttons.stop_worm"), "callback_data": "stop_worm"}],
-        [{"text": translate("buttons.main"), "callback_data": "start"}],
+        [{"text": translate(lang, "buttons.stop_worm"), "callback_data": "stop_worm"}],
+        [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
     ]
     await smart_answer(
         message, bot, text, reply_markup=kb(keyboard), delete_origin=False
@@ -5196,12 +5390,14 @@ async def ensure_join_target(
             task_id,
             {
                 "status": "failed",
-                "error": translate("join_error", target=target, error=str(e)),
+                "error": translate(lang, "join_error", target=target, error=str(e)),
                 "completed_at": datetime.now().isoformat(),
             },
             id_field="task_id",
         )
-        await notify_user(bot, user_id, translate("no_users_found", source=target))
+        await notify_user(
+            bot, user_id, translate(lang, "no_users_found", source=target)
+        )
         return None
 
 
@@ -5506,7 +5702,9 @@ async def invite_users(
                 await notify_user(
                     bot,
                     user_id,
-                    translate("floodwait_pause", task_id=task_id, seconds=wait_seconds),
+                    translate(
+                        lang, "floodwait_pause", task_id=task_id, seconds=wait_seconds
+                    ),
                 )
                 await asyncio.sleep(wait_seconds + 5)
                 await tasks_storage.update_by_id(
@@ -5672,7 +5870,7 @@ async def scrape_and_invite_by_user_count_task(
                 )
                 task_queue.remove_user_task(user_id, task_id)
                 await notify_user(
-                    bot, user_id, translate("no_users_found", source=source)
+                    bot, user_id, translate(lang, "no_users_found", source=source)
                 )
                 return
 
@@ -5725,7 +5923,9 @@ async def scrape_and_invite_by_user_count_task(
                 )
                 task_queue.remove_user_task(user_id, task_id)
                 await notify_user(
-                    bot, user_id, translate("task_cancelled_report", task_id=task_id)
+                    bot,
+                    user_id,
+                    translate(lang, "task_cancelled_report", task_id=task_id),
                 )
                 return
 
@@ -5772,7 +5972,7 @@ async def scrape_and_invite_by_user_count_task(
         await notify_user(
             bot,
             user_id,
-            translate("task_failed_report", task_id=task_id, error=str(e)),
+            translate(lang, "task_failed_report", task_id=task_id, error=str(e)),
         )
 
 
@@ -5863,7 +6063,7 @@ async def scrape_and_invite_task(
                 )
                 task_queue.remove_user_task(user_id, task_id)
                 await notify_user(
-                    bot, user_id, translate("no_users_found", source=source)
+                    bot, user_id, translate(lang, "no_users_found", source=source)
                 )
                 return
 
@@ -5916,7 +6116,9 @@ async def scrape_and_invite_task(
                 )
                 task_queue.remove_user_task(user_id, task_id)
                 await notify_user(
-                    bot, user_id, translate("task_cancelled_report", task_id=task_id)
+                    bot,
+                    user_id,
+                    translate(lang, "task_cancelled_report", task_id=task_id),
                 )
                 return
 
@@ -5963,7 +6165,7 @@ async def scrape_and_invite_task(
         await notify_user(
             bot,
             user_id,
-            translate("task_failed_report", task_id=task_id, error=str(e)),
+            translate(lang, "task_failed_report", task_id=task_id, error=str(e)),
         )
 
 
@@ -6218,7 +6420,7 @@ async def bulk_mailing_task(
             )
         task_queue.remove_user_task(user_id, task_id)
         await notify_user(
-            bot, user_id, translate("mailing_cancelled_report", task_id=task_id)
+            bot, user_id, translate(lang, "mailing_cancelled_report", task_id=task_id)
         )
         return
 
@@ -6407,7 +6609,7 @@ async def bulk_mailing_new_chats_task(
                 id_field="task_id",
             )
             task_queue.remove_user_task(user_id, task_id)
-            await notify_user(bot, user_id, translate("mailing_no_chats"))
+            await notify_user(bot, user_id, translate(lang, "mailing_no_chats"))
             return
 
         logger.info(f"Валидных чатов: {len(valid_chats)}")
@@ -6460,7 +6662,7 @@ async def db_scrape_and_invite_task(
             id_field="task_id",
         )
         task_queue.remove_user_task(user_id, task_id)
-        await notify_user(bot, user_id, translate("scraping_db_empty"))
+        await notify_user(bot, user_id, translate(lang, "scraping_db_empty"))
         return
 
     logger.info(f"DB scraping: {len(db_chats)} chats from DB")
@@ -6534,7 +6736,7 @@ async def db_scrape_and_invite_task(
                     id_field="task_id",
                 )
                 task_queue.remove_user_task(user_id, task_id)
-                await notify_user(bot, user_id, translate("scraping_no_users"))
+                await notify_user(bot, user_id, translate(lang, "scraping_no_users"))
                 return
 
             # Приглашаем пользователей
@@ -6605,7 +6807,7 @@ async def db_scrape_and_invite_task(
         await notify_user(
             bot,
             user_id,
-            translate("mailing_failed_report", task_id=task_id, error=e),
+            translate(lang, "mailing_failed_report", task_id=task_id, error=e),
         )
 
 
@@ -6692,7 +6894,7 @@ async def restore_tasks_on_startup():
                 task_id,
                 {
                     "status": "paused",
-                    "progress_text": translate("progress_paused"),
+                    "progress_text": translate(lang, "progress_paused"),
                     "paused_at": datetime.now().isoformat(),
                 },
                 id_field="task_id",
@@ -6783,6 +6985,7 @@ async def cleanup_old_tasks():
 
 # --- Запуск ---
 async def main():
+    lang = DEFAULT_LANGUAGE
     logger.info("Запуск рефакторированного бота-инвайтера v2.0...")
     logger.info("Анти-блокировочные механизмы активированы")
 
@@ -6867,7 +7070,7 @@ async def main():
             await notify_user(
                 bot,
                 admin_id,
-                translate("admin_shutdown"),
+                translate(lang, "admin_shutdown"),
             )
 
         await bot.session.close()
