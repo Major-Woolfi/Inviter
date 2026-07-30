@@ -47,7 +47,7 @@
     "waiting_password": "🔒 <b>Step 3/3</b>\nPlease enter your two-factor authentication password:",
     "account_added": "✅ <b>Account added successfully!</b>\n• Name: {name}\n• Username: @{username}\n• Phone: {phone}\n\n⚠️ <b>Note:</b> Your other sessions will remain active.",
     "no_accounts": "ℹ️ No accounts available. Use 'Add Account' to add one.",
-    "accounts_list": "📋 <b>Available accounts:</b>\n\n{accounts}",
+    "accounts_list": "📋 <b>Available accounts:</b>",
     "no_active_tasks": "📭 <b>You have no active tasks</b>",
     "no_tasks": "📭 <b>You have no tasks</b>\n\nStart a new task from the menu.",
     "task_running": "🔄 <b>Task ID:</b> <code>{task_id}</code>\n<b>Type:</b> {task_type}\n<b>Status:</b> {status}\n<b>Created:</b> {created}",
@@ -101,7 +101,13 @@
     "bulkmail_texts_received": "✅ Text #{count} received!\n\nSend another text or press '✅ Done, continue' to proceed.",
     "bulkmail_texts_confirm": "⏳ Waiting for additional texts (or /done to finish).",
     "bulkmail_step4_account": "🧾 <b>Step 4/5</b>\nSelect sender account or enter 'auto' for automatic distribution:",
-    "bulkmail_no_accounts": "🔢 <b>Step 5/5</b>\nNo available accounts - mailing will be performed automatically from pool.\nEnter total number of sends (integer, e.g. 100).",
+    "bulkmail_no_accounts": "🔢 <b>Error:</b>\nNo available accounts for mailing.\nAdd sessions via 'Add Account' button or wait for accounts to free up.",
+    "bulkmail_no_users": "❌ No users found in the selected chats. Add chats with participants or choose other chats.",
+    "mailing_completed_users_report": "📬 <b>Bulk mailing to users completed!</b>\n• Task: <code>{task_id}</code>\n• Total sent: {sent}\n• Texts used: {texts_count}\n• Unique users: {users_count}",
+    "bulkmail_target_select": "✉️ <b>Bulk Mailing</b>\n\nSelect mailing target:",
+    "bulkmail_target_chats": "📨 To chats",
+    "bulkmail_target_users": "👤 To users (DM)",
+    "bulkmail_no_users_in_chats": "❌ No participants in the selected chats for mailing.",
     "bulkmail_no_texts": "❌ You haven't sent any text! Send a message text.",
     "bulkmail_db_empty": "❌ Chats DB is empty! Add chats via 'Add Chats to DB' button.",
     "bulkmail_empty_chats": "⚠️ Chat list is empty. Please send a valid list.",
@@ -240,6 +246,8 @@
     "language_selected": "✅ Language changed to: {language}",
     "language_not_supported": "❌ Language not supported",
     "admin_language_notice": "⚠️ Administrators don't change language",
-    "language_decorative_notice": "🌐 Language selection is available for regular users"
+    "language_decorative_notice": "🌐 Language selection is available for regular users",
+    "auth_code_attempts_left": "❌ Invalid code. Attempts left: {attempts}",
+    "auth_flood_wait": "⏳ Too many attempts. Wait {seconds} seconds."
   }
 }
