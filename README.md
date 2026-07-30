@@ -25,6 +25,7 @@
     - [Установка](#установка)
     - [Конфигурация](#конфигурация)
     - [Деплой](#деплой)
+    - [Проверка](#проверка)
   - [🏗️ Архитектура проекта](#️-архитектура-проекта)
   - [🛠️ Технологический стек](#️-технологический-стек)
   - [📊 Статистика проекта](#-статистика-проекта)
@@ -87,6 +88,7 @@ Inviter - проект продвинутого бота-инвайтера, к�
 - Гибкие настройки
 - Отказоустойчивость
 - Кэширование
+- Мультиязычность
 
 ---
 
@@ -97,6 +99,7 @@ Inviter - проект продвинутого бота-инвайтера, к�
 - Зависимости
   - Runtime - Python 3.13.9+ (возможно и старше, тестирование не проводилось)
   - Библиотеки из requirements.txt
+  - Docker (для деплоя)
 - Железо (выделеное под бота, минимум для запуска и корректной работы)
   - CPU 1 ядро 1Ггц
   - RAM 200мб
@@ -134,17 +137,25 @@ echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
 
 ---
 
+### Проверка
+
+Перед запуском убедитесь, что:
+
+- [ ] Вы настроили все .env
+
+---
+
 ## 🏗️ Архитектура проекта
 
 ```plaintext
 ├── data/
 │  └── ...
+├── sessions/
+│  └── ...
 ├── langs/
 │  ├── en.json
 │  └── ru.json
 ├── logs/
-│  └── ...
-├── sessions/
 │  └── ...
 ├── .env
 ├── .env.example
@@ -177,7 +188,7 @@ echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
 | Метрика        | Значение                                                                                                                                        |
 | -------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
 | ⭐ Stars        | [![Stars](https://img.shields.io/github/stars/Major-Woolfi/Inviter)](https://github.com/Major-Woolfi/Inviter/stargazers)                        |
-| 🍴 Forks        | [![Forks](https://img.shields.io/github/forks/Major-Woolfi/Inviter)](https://github.com/Major-Woolfi/REPO_NAME/network/members)                 |
+| 🍴 Forks        | [![Forks](https://img.shields.io/github/forks/Major-Woolfi/Inviter)](https://github.com/Major-Woolfi/Inviter/network/members)                   |
 | 🐛 Issues       | [![Issues](https://img.shields.io/github/issues/Major-Woolfi/Inviter)](https://github.com/Major-Woolfi/Inviter/issues)                          |
 | 👥 Contributors | [![Contributors](https://img.shields.io/github/contributors/Major-Woolfi/Inviter)](https://github.com/Major-Woolfi/Inviter/graphs/contributors) |
 
