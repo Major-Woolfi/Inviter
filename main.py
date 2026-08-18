@@ -13,7 +13,18 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union, Callable, TypeVar
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import aiofiles
 import aiosqlite
@@ -52,14 +63,6 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from dotenv import load_dotenv
-
-# === Типы ===
-T = TypeVar("T")
-JSONValue = Union[
-    str, int, float, bool, None, List["JsonValue"], Dict[str, "JsonValue"]
-]
-JsonValue = Dict[str, JSONValue]
-
 
 # === Настройка окружения ===
 BASE_DIR: Path = Path(__file__).parent
@@ -402,7 +405,7 @@ class Config:
             )
 
 
-for path in [Config.SESSIONS_DIR, Config.DATA_DIR, LOGS_DIR]:
+for path in [Config.SESSIONS_DIR, Config.DATA_DIR, str(LOGS_DIR)]:
     try:
         os.makedirs(path, exist_ok=True)
     except Exception as e:
@@ -412,31 +415,33 @@ for path in [Config.SESSIONS_DIR, Config.DATA_DIR, LOGS_DIR]:
 # === Кастомные исключения ===
 class BotError(Exception):
 
-    def __init__(self, message: str, code: int = 500):
+    def __init__(self, message: str, code: int = 500) -> None:
         self.message = message
         self.code = code
         super().__init__(self.message)
 
 
 class ConfigError(BotError):
-    def __init__(self, message: str):
+    def __init__(self, message: str) -> None:
         super().__init__(message, code=400)
 
 
 class DatabaseError(BotError):
-    def __init__(self, message: str, original_error: Optional[Exception] = None):
+    def __init__(
+        self, message: str, original_error: Optional[Exception] = None
+    ) -> None:
         self.original_error = original_error
         super().__init__(message, code=500)
 
 
 class ValidationError(BotError):
-    def __init__(self, message: str, field: Optional[str] = None):
+    def __init__(self, message: str, field: Optional[str] = None) -> None:
         self.field = field
         super().__init__(message, code=400)
 
 
 # === Утилиты логирования ===
-def log_error(func: Callable) -> Callable:
+def log_error(func: Callable[..., Any]) -> Callable[..., Any]:
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return await func(*args, **kwargs)
@@ -447,7 +452,7 @@ def log_error(func: Callable) -> Callable:
     return wrapper
 
 
-def log_warning(func: Callable) -> Callable:
+def log_warning(func: Callable[..., Any]) -> Callable[..., Any]:
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return await func(*args, **kwargs)
@@ -456,6 +461,10 @@ def log_warning(func: Callable) -> Callable:
             raise
 
     return wrapper
+
+
+# === Типы для кэшированных сущностей ===
+_EntityType = Any  # telethon types entity
 
 
 # === Утилиты для работы с событиями ===
@@ -502,19 +511,19 @@ async def safe_send_message(
 # === Клавиатуры ===
 def kb(rows: List[List[Dict[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(**btn) for btn in row] for row in rows]
+        inline_keyboard=[[InlineKeyboardButton(**btn) for btn in row] for row in rows]  # type: ignore[arg-type]
     )
 
 
 # === Retry паттерн ===
 async def retry_async(
-    func: Callable,
+    func: Callable[..., Any],
     max_retries: int = 3,
     delay: float = Config.RETRY_DEFAULT_DELAY,
     backoff: float = Config.RETRY_BACKOFF_BASE,
-    exceptions: Tuple[type, ...] = (Exception,),
+    exceptions: Tuple[type[BaseException], ...] = (Exception,),
 ) -> Any:
-    last_exception: Optional[Exception] = None
+    last_exception: Optional[BaseException] = None
     for attempt in range(max_retries):
         try:
             return await func()
@@ -582,13 +591,17 @@ async def notify_user(
 
 
 async def update_message(
-    bot: Bot, chat_id: int, message_id: int, text: str, reply_markup=None
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    text: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
 ) -> bool:
     """Авто-обновление сообщения без создания нового"""
     try:
         await bot.edit_message_text(
             text,
-            chat_id,
+            chat_id,  # type: ignore[arg-type]
             message_id,
             reply_markup=reply_markup,
             parse_mode=ParseMode.HTML,
@@ -664,11 +677,13 @@ def format_progress_bar(percentage: float, length: int = 15) -> str:
 
 
 # --- Entity Cache ---
-entity_cache: Dict[int, Any] = {}
+entity_cache: Dict[int, _EntityType] = {}
 cache_lock = asyncio.Lock()
 
 
-async def get_cached_entity(client: TelegramClient, user_id: int) -> Optional[Any]:
+async def get_cached_entity(
+    client: TelegramClient, user_id: int
+) -> Optional[_EntityType]:
     """Кэширование сущностей для ускорения работы"""
     async with cache_lock:
         if user_id in entity_cache:
@@ -683,7 +698,7 @@ async def get_cached_entity(client: TelegramClient, user_id: int) -> Optional[An
         return None
 
 
-async def clear_entity_cache():
+async def clear_entity_cache() -> None:
     """Очистка кэша сущностей"""
     async with cache_lock:
         count = len(entity_cache)
@@ -696,7 +711,7 @@ async def clear_entity_cache():
 class TasksDB:
     """База данных задач на SQLite (замена JSONStorage)"""
 
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str) -> None:
         self.db_path: str = db_path
         self.conn: Optional[aiosqlite.Connection] = None
         self.lock: asyncio.Lock = asyncio.Lock()
@@ -800,10 +815,10 @@ class TasksDB:
                 await self.conn.execute(
                     "INSERT OR IGNORE INTO tasks (task_id, type, status, user_id, data) VALUES (?, ?, ?, ?, ?)",
                     (
-                        task_data.get("task_id", ""),
-                        task_data.get("type", ""),
-                        task_data.get("status", "pending"),
-                        task_data.get("user_id", 0),
+                        str(task_data.get("task_id", "")),
+                        str(task_data.get("type", "")),
+                        str(task_data.get("status", "pending")),
+                        int(task_data.get("user_id", 0)),
                         json.dumps(task_data.get("data", {}), ensure_ascii=False),
                     ),
                 )
@@ -825,7 +840,6 @@ class TasksDB:
                 row = await cur.fetchone()
                 if row:
                     data = dict(row)
-                    # Парсим JSON поля
                     if data.get("data"):
                         try:
                             data["data"] = json.loads(data["data"])
@@ -841,7 +855,7 @@ class TasksDB:
                             data["checkpoints"] = json.loads(data["checkpoints"])
                         except Exception:
                             data["checkpoints"] = None
-                    return data
+                    return Task.from_dict(data)
                 return None
         except Exception as e:
             logger.error(f"get_task {task_id}: {e}")
@@ -853,8 +867,8 @@ class TasksDB:
             return False
         try:
             async with self.lock:
-                set_clause = []
-                values = []
+                set_clause: List[str] = []
+                values: List[Any] = []
                 for key, value in updates.items():
                     if key in ("data", "results", "checkpoints") and isinstance(
                         value, (dict, list)
@@ -886,7 +900,7 @@ class TasksDB:
                     (user_id,),
                 )
                 rows = await cur.fetchall()
-                return [dict(row) for row in rows]
+                return [Task.from_dict(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"get_tasks_by_user {user_id}: {e}")
             return []
@@ -901,7 +915,7 @@ class TasksDB:
                     "SELECT * FROM tasks WHERE status IN ('pending', 'running', 'paused') ORDER BY created_at DESC"
                 )
                 rows = await cur.fetchall()
-                return [dict(row) for row in rows]
+                return [Task.from_dict(dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"get_active_tasks: {e}")
             return []
@@ -980,13 +994,11 @@ class TasksDB:
         """Алиас для update_task"""
         return await self.update_task(item_id, updates)
 
-    async def find_by_id(
-        self, item_id: str, id_field: str = "id"
-    ) -> Optional[Dict[str, Any]]:
+    async def find_by_id(self, item_id: str, id_field: str = "id") -> Optional[Task]:
         """Алиас для get_task"""
         return await self.get_task(item_id)
 
-    async def read_all(self) -> List[Dict[str, Any]]:
+    async def read_all(self) -> List[Task]:
         """Алиас для получения всех задач"""
         if not self.conn:
             return []
@@ -996,7 +1008,7 @@ class TasksDB:
                     "SELECT * FROM tasks ORDER BY created_at DESC"
                 )
                 rows = await cur.fetchall()
-                result = []
+                result: List[Task] = []
                 for row in rows:
                     data = dict(row)
                     if data.get("data"):
@@ -1014,7 +1026,7 @@ class TasksDB:
                             data["checkpoints"] = json.loads(data["checkpoints"])
                         except Exception:
                             data["checkpoints"] = None
-                    result.append(data)
+                    result.append(Task.from_dict(data))
                 return result
         except Exception as e:
             logger.error(f"read_all: {e}")
@@ -1058,7 +1070,7 @@ class TasksDB:
 
 # --- JSONStorage (legacy) ---
 class JSONStorage:
-    def __init__(self, path: str):
+    def __init__(self, path: str) -> None:
         self.path = path
         self._lock = asyncio.Lock()
         self._backup_path = f"{path}.bak"
@@ -1117,7 +1129,7 @@ class JSONStorage:
                         return False
         return False
 
-    async def read_all(self) -> List[Dict[str, Any]]:
+    async def read_all(self) -> List[Task]:
         await self._ensure_file()
         async with self._lock:
             for attempt in range(self._max_retries):
@@ -1127,7 +1139,9 @@ class JSONStorage:
                     if not content:
                         return []
                     data = json.loads(content)
-                    return data if isinstance(data, list) else []
+                    if not isinstance(data, list):
+                        return []
+                    return [Task.from_dict(item) for item in data]
                 except json.JSONDecodeError:
                     logger.warning(
                         f"JSON decode error for {self.path}, attempting recovery"
@@ -1138,7 +1152,8 @@ class JSONStorage:
                         ) as f:
                             content = await f.read()
                         data = json.loads(content)
-                        return data if isinstance(data, list) else []
+                        if isinstance(data, list):
+                            return [Task.from_dict(item) for item in data]
                     return []
                 except Exception as e:
                     if attempt < self._max_retries - 1:
@@ -1148,42 +1163,64 @@ class JSONStorage:
                         return []
         return []
 
-    async def write_all(self, data: List[Dict[str, Any]]) -> None:
+    async def write_all(self, data: List[Task]) -> None:
         await self._ensure_file()
         async with self._lock:
             await self._backup_file()
-            content = json.dumps(data, ensure_ascii=False, indent=2)
+            content = json.dumps(
+                [t.to_dict() for t in data], ensure_ascii=False, indent=2
+            )
             await self._safe_write(content)
 
     async def add(self, item: Dict[str, Any]) -> None:
         data = await self.read_all()
-        data.append(item)
+        task = Task.from_dict(item)
+        data.append(task)
         await self.write_all(data)
 
-    async def remove(self, predicate) -> None:
+    async def remove(self, predicate: Callable[[Task], bool]) -> None:
         data = await self.read_all()
         new_data = [x for x in data if not predicate(x)]
         await self.write_all(new_data)
 
-    async def find_by_id(
-        self, item_id: str, id_field: str = "id"
-    ) -> Optional[Dict[str, Any]]:
+    async def find_by_id(self, item_id: str, id_field: str = "id") -> Optional[Task]:
         data = await self.read_all()
         for item in data:
-            if item.get(id_field) == item_id:
+            if item.task_id == item_id:
                 return item
         return None
 
     async def remove_by_id(self, item_id: str, id_field: str = "id") -> None:
-        await self.remove(lambda x: x.get(id_field) == item_id)
+        await self.remove(lambda x: x.task_id == item_id)
 
     async def update_by_id(
         self, item_id: str, updates: Dict[str, Any], id_field: str = "id"
     ) -> bool:
         data = await self.read_all()
         for item in data:
-            if item.get(id_field) == item_id:
-                item.update(updates)
+            if item.task_id == item_id:
+                # Merge updates into task data
+                if "data" in updates:
+                    existing_data = item.data or {}
+                    if isinstance(updates["data"], dict):
+                        existing_data.update(updates["data"])
+                        item.data = existing_data
+                if "status" in updates:
+                    item.status = updates["status"]  # type: ignore[assignment]
+                if "progress" in updates:
+                    item.progress = updates["progress"]  # type: ignore[assignment]
+                if "progress_text" in updates:
+                    item.progress_text = updates["progress_text"]
+                if "error" in updates:
+                    item.error = updates["error"]
+                if "completed_at" in updates:
+                    item.completed_at = updates["completed_at"]
+                if "results" in updates:
+                    item.results = updates["results"]
+                if "flood_wait" in updates:
+                    item.flood_wait = updates["flood_wait"]
+                if "paused_at" in updates:
+                    item.paused_at = updates["paused_at"]
                 await self.write_all(data)
                 return True
         return False
@@ -1191,9 +1228,9 @@ class JSONStorage:
 
 # --- AuthManager ---
 class AuthManager:
-    def __init__(self, auth_file: str):
+    def __init__(self, auth_file: str) -> None:
         self.auth_file = auth_file
-        self.auth_data = {"keys": {}, "authorized": []}
+        self.auth_data: Dict[str, Any] = {"keys": {}, "authorized": []}
         self._lock = asyncio.Lock()
 
     async def _load_auth_data(self) -> Dict[str, Any]:
@@ -1207,21 +1244,21 @@ class AuthManager:
             logger.error(f"Error loading auth data: {e}")
         return {"keys": {}, "authorized": []}
 
-    async def _save_auth_data(self):
+    async def _save_auth_data(self) -> None:
         try:
             async with aiofiles.open(self.auth_file, "w", encoding="utf-8") as f:
                 await f.write(json.dumps(self.auth_data, ensure_ascii=False, indent=2))
         except Exception as e:
             logger.error(f"Error saving auth data: {e}")
 
-    async def load(self):
+    async def load(self) -> None:
         async with self._lock:
             self.auth_data = await self._load_auth_data()
             logger.info(
                 f"Loaded auth data: {len(self.auth_data.get('authorized', []))} authorized users, {len(self.auth_data.get('keys', {}))} keys"
             )
 
-    async def save(self):
+    async def save(self) -> None:
         async with self._lock:
             await self._save_auth_data()
 
@@ -1253,7 +1290,7 @@ class AuthManager:
                 or user_id in Config.ADMIN_USER_IDS
             )
 
-    async def add_authorized_user(self, user_id: int):
+    async def add_authorized_user(self, user_id: int) -> None:
         async with self._lock:
             if str(user_id) not in self.auth_data.get("authorized", []):
                 self.auth_data.setdefault("authorized", []).append(str(user_id))
@@ -1262,7 +1299,7 @@ class AuthManager:
 
 # --- CacheManager ---
 class CacheManager:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.conn: Optional[aiosqlite.Connection] = None
         self.lock = asyncio.Lock()
@@ -1363,7 +1400,7 @@ class CacheManager:
 
 # --- ChatDB (БД собранных чатов) ---
 class ChatDB:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.conn: Optional[aiosqlite.Connection] = None
         self.lock = asyncio.Lock()
@@ -1423,11 +1460,11 @@ class ChatDB:
                     VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 'active')""",
                     (
                         str(chat_id),
-                        chat_name,
-                        chat_url,
-                        chat_type,
-                        user_count,
-                        verified,
+                        str(chat_name),
+                        str(chat_url),
+                        str(chat_type),
+                        int(user_count),
+                        int(verified),
                     ),
                 )
                 await self.conn.commit()
@@ -1520,23 +1557,23 @@ class ChatDB:
             logger.error(f"Ошибка обновления статуса чата {chat_id}: {e}")
             return False
 
-    async def get_all_chats(self, verified_only: bool = False) -> List[Dict[str, Any]]:
+    async def get_all_chats(self, verified_only: bool = False) -> List[ChatInfo]:
         if not self.conn:
             return []
         try:
             async with self.lock:
                 query = "SELECT * FROM collected_chats WHERE status = 'active'"
-                params: tuple = ()
+                params: tuple[Any, ...] = ()
                 if verified_only:
                     query += " AND verified = 1"
                 cur = await self.conn.execute(query, params)
                 rows = await cur.fetchall()
-            return [dict(row) for row in rows]
+            return [ChatInfo(**dict(row)) for row in rows]
         except Exception as e:
             logger.error(f"Ошибка получения чатов из ChatDB: {e}")
             return []
 
-    async def get_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
+    async def get_chat(self, chat_id: str) -> Optional[ChatInfo]:
         if not self.conn:
             return None
         try:
@@ -1545,7 +1582,7 @@ class ChatDB:
                     "SELECT * FROM collected_chats WHERE chat_id = ?", (str(chat_id),)
                 )
                 row = await cur.fetchone()
-            return dict(row) if row else None
+            return ChatInfo(**dict(row)) if row else None
         except Exception as e:
             logger.error(f"Ошибка получения чата {chat_id} из ChatDB: {e}")
             return None
@@ -1556,7 +1593,7 @@ class ChatDB:
         try:
             async with self.lock:
                 query = "SELECT COALESCE(SUM(user_count), 0) as total FROM collected_chats WHERE status = 'active'"
-                params: tuple = ()
+                params: tuple[Any, ...] = ()
                 if verified_only:
                     query += " AND verified = 1"
                 cur = await self.conn.execute(query, params)
@@ -1572,7 +1609,7 @@ class ChatDB:
         try:
             async with self.lock:
                 query = "SELECT COUNT(*) as count FROM collected_chats WHERE status = 'active'"
-                params: tuple = ()
+                params: tuple[Any, ...] = ()
                 if verified_only:
                     query += " AND verified = 1"
                 cur = await self.conn.execute(query, params)
@@ -1597,7 +1634,7 @@ class ChatDB:
 
 # --- UserDB (БД пользователей и их настроек) ---
 class UserDB:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str) -> None:
         self.db_path = db_path
         self.conn: Optional[aiosqlite.Connection] = None
         self.lock = asyncio.Lock()
@@ -1662,7 +1699,7 @@ class UserDB:
             logger.error(f"get_user {user_id}: {e}")
             return None
 
-    async def update_user(self, user_id: int, **kwargs) -> bool:
+    async def update_user(self, user_id: int, **kwargs: Any) -> bool:
         allowed = {"language"}
         values_by_column = {k: v for k, v in kwargs.items() if k in allowed}
         if not values_by_column:
@@ -1671,6 +1708,8 @@ class UserDB:
         values = list(values_by_column.values()) + [user_id]
         try:
             async with self.lock:
+                if not self.conn:
+                    return False
                 await self.conn.execute(
                     f"UPDATE users SET {set_clause} WHERE user_id = ?",
                     tuple(values),
@@ -1804,7 +1843,7 @@ async def validate_and_test_chat(
     account: Dict[str, Any],
     chat_identifier: str,
     update_existing: bool = False,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[ValidatedChat]:
     """
     Проверяет чат (только группы!):
     1. Определяет тип (user/chat/channel)
@@ -1821,7 +1860,8 @@ async def validate_and_test_chat(
     try:
         entity = await client.get_entity(chat_identifier)
     except FloodWaitError as e:
-        wait_time = getattr(e, "seconds", None) or getattr(e, "wait_time", 60)
+        _fw_seconds: Optional[int] = getattr(e, "seconds", None)
+        wait_time: float = float(_fw_seconds) if _fw_seconds else 60.0
         logger.warning(
             f"Flood wait при получении сущности {chat_identifier}: {wait_time} сек"
         )
@@ -1841,7 +1881,6 @@ async def validate_and_test_chat(
             await chat_db.remove_chat_by_identifier(chat_identifier)
         return None
 
-    # 1. Определяем тип
     is_user = isinstance(entity, telethon_types.User)
     is_channel = isinstance(entity, telethon_types.Channel)
     is_chat = isinstance(entity, telethon_types.Chat)
@@ -1883,16 +1922,14 @@ async def validate_and_test_chat(
         or getattr(entity, "first_name", chat_identifier)
         or chat_identifier
     )
-    chat_type = "group"  # Только группы
+    chat_type = "group"
 
-    # Получаем username/ссылку
     chat_username = getattr(entity, "username", None)
     if chat_username:
         chat_url = f"https://t.me/{chat_username}"
     else:
         chat_url = f"https://t.me/{chat_identifier}"
 
-    # Получаем количество пользователей
     user_count = getattr(entity, "participants_count", None) or getattr(
         entity, "users_count", None
     )
@@ -1917,8 +1954,7 @@ async def validate_and_test_chat(
 
     user_count = user_count or 0
 
-    # 2.5 Join before write test (приватные/закрытые чаты)
-    test_entity = entity
+    test_entity: Optional[_EntityType] = None
     try:
         test_entity = await ensure_join_target(client, chat_identifier, account)
     except Exception as join_err:
@@ -1926,9 +1962,8 @@ async def validate_and_test_chat(
             f"Не удалось зайти в {chat_name} для проверки возможности писать: {join_err}"
         )
 
-    # 3. Проверяем, может ли бот писать
     can_write = False
-    test_msg_id = None
+    test_msg_id: Optional[int] = None
 
     try:
         for send_attempt in range(3):
@@ -1940,11 +1975,12 @@ async def validate_and_test_chat(
                 can_write = True
                 break
             except FloodWaitError as e:
-                wait_time = getattr(e, "seconds", None) or getattr(e, "wait_time", 60)
+                _fw_seconds_2: Optional[int] = getattr(e, "seconds", None)
+                wait_time_2: float = float(_fw_seconds_2) if _fw_seconds_2 else 60.0
                 logger.info(
-                    f"Flood wait в {chat_name}: {wait_time} сек (попытка {send_attempt + 1}/3)"
+                    f"Flood wait в {chat_name}: {wait_time_2} сек (попытка {send_attempt + 1}/3)"
                 )
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(wait_time_2)
             except (
                 ChatAdminRequiredError,
                 UserNotParticipantError,
@@ -1955,11 +1991,12 @@ async def validate_and_test_chat(
                 can_write = False
                 break
             except SlowModeWaitError as e:
-                wait_time = getattr(e, "seconds", None) or getattr(e, "wait_time", 5)
+                _sw_seconds: Optional[int] = getattr(e, "seconds", None)
+                wait_time_3: float = float(_sw_seconds) if _sw_seconds else 5.0
                 logger.info(
-                    f"Ожидание slow mode в {chat_name}: {wait_time} сек (попытка {send_attempt + 1}/3)"
+                    f"Ожидание slow mode в {chat_name}: {wait_time_3} сек (попытка {send_attempt + 1}/3)"
                 )
-                await asyncio.sleep(wait_time)
+                await asyncio.sleep(wait_time_3)
             except Exception as e:
                 logger.warning(f"Ошибка проверки письма в {chat_name}: {e}")
                 can_write = False
@@ -2013,7 +2050,7 @@ async def validate_and_test_chat(
                 logger.error(f"Ошибка записи чата {chat_name} в БД: {e}")
             return None
 
-    if test_msg_id:
+    if test_msg_id is not None:
         try:
             await asyncio.sleep(Config.VALIDATOR_TEST_DELETE_WAIT)
             await client.delete_messages(entity, test_msg_id)
@@ -2025,7 +2062,6 @@ async def validate_and_test_chat(
         except Exception:
             pass
 
-    # 8. Записываем/обновляем чат в БД
     try:
         if update_existing:
             updated = await chat_db.update_chat(
@@ -2054,7 +2090,6 @@ async def validate_and_test_chat(
                 )
                 logger.info(f"✅ Чат {chat_name} ({chat_id}) добавлен в ChatDB")
         else:
-            # Добавляем новый чат
             await chat_db.add_chat(
                 chat_id,
                 chat_name,
@@ -2068,51 +2103,50 @@ async def validate_and_test_chat(
         logger.error(f"Ошибка записи чата {chat_name} в БД: {e}")
         return None
 
-    # Возвращаем данные чата
-    return {
-        "chat_id": chat_id,
-        "chat_name": chat_name,
-        "chat_url": chat_url,
-        "chat_type": chat_type,
-        "user_count": user_count,
-        "verified": 1,
-    }
+    return ValidatedChat(
+        chat_id=chat_id,
+        chat_name=chat_name,
+        chat_url=chat_url,
+        chat_type=chat_type,
+        user_count=user_count,
+        verified=1,
+    )
 
 
 async def check_and_clean_banned_chats(
     client: TelegramClient,
     bot_telegram: Bot,
     bot_user_id: int,
-) -> Dict[str, int]:
+) -> CheckAndCleanResult:
     """
     Проверяет все чаты в БД:
     - Если бот забанен — удаляет чат из БД
     - Обновляет user_count и last_check для живых чатов
     - Возвращает статистику
     """
-    result = {"checked": 0, "removed": 0, "updated": 0, "errors": 0}
+    result = CheckAndCleanResult()
     chats = await chat_db.get_all_chats(verified_only=False)
-    result["checked"] = len(chats)
+    result.checked = len(chats)
 
     for chat in chats:
-        chat_id = chat["chat_id"]
-        chat_name = chat.get("chat_name", "unknown")
-        chat_url = chat.get("chat_url") or chat_id
-        user_count = chat.get("user_count", 0)
+        chat_id = chat.chat_id
+        chat_name = chat.chat_name if chat.chat_name else "unknown"
+        chat_url = chat.chat_url or chat_id
+        user_count = chat.user_count
 
         try:
             entity = await client.get_entity(chat_url)
         except Exception:
             removed = await chat_db.remove_chat(chat_id)
             if removed:
-                result["removed"] += 1
+                result.removed += 1
                 logger.info(f"🗑️ Чат {chat_name} удалён (недоступен)")
             continue
 
         if isinstance(entity, telethon_types.User):
             removed = await chat_db.remove_chat(chat_id)
             if removed:
-                result["removed"] += 1
+                result.removed += 1
                 logger.info(f"🗑️ Чат {chat_name} удалён (пользователь)")
             continue
 
@@ -2123,7 +2157,7 @@ async def check_and_clean_banned_chats(
             if "not found" in error_text or "chat not found" in error_text:
                 removed = await chat_db.remove_chat(chat_id)
                 if removed:
-                    result["removed"] += 1
+                    result.removed += 1
                     logger.info(f"🗑️ Чат {chat_name} удалён (не найден)")
                 continue
             elif "migrate" in error_text:
@@ -2140,7 +2174,7 @@ async def check_and_clean_banned_chats(
                 ):
                     removed = await chat_db.remove_chat(chat_id)
                     if removed:
-                        result["removed"] += 1
+                        result.removed += 1
                         logger.info(f"🗑️ Чат {chat_name} удалён (бан)")
                     continue
                 except Exception:
@@ -2148,7 +2182,6 @@ async def check_and_clean_banned_chats(
         except Exception:
             pass
 
-        # Refresh user_count and last_check
         try:
             new_count = getattr(entity, "participants_count", None) or getattr(
                 entity, "users_count", None
@@ -2170,7 +2203,7 @@ async def check_and_clean_banned_chats(
 
             if new_count is not None and new_count != user_count:
                 await chat_db.update_chat(chat_id, {"user_count": new_count})
-                result["updated"] += 1
+                result.updated += 1
                 logger.info(
                     f"🔄 Чат {chat_name} обновлён: пользователи {user_count} -> {new_count}"
                 )
@@ -2179,7 +2212,7 @@ async def check_and_clean_banned_chats(
                     chat_id, {"last_check": datetime.now().isoformat()}
                 )
         except Exception as e:
-            result["errors"] += 1
+            result.errors += 1
             logger.error(f"Ошибка обновления пользователей в {chat_name}: {e}")
 
     return result
@@ -2187,10 +2220,10 @@ async def check_and_clean_banned_chats(
 
 # --- AccountPoolManager ---
 class AccountPoolManager:
-    def __init__(self):
-        self.accounts: List[Dict[str, Any]] = []
+    def __init__(self) -> None:
+        self.accounts: List[Account] = []
         self.lock = asyncio.Lock()
-        self._health_check_task = None
+        self._health_check_task: Optional[asyncio.Task[None]] = None
         # Smart metrics
         self._account_success_rate: Dict[str, float] = {}
         self._account_last_error: Dict[str, datetime] = {}
@@ -2199,11 +2232,11 @@ class AccountPoolManager:
         self._adaptive_delay_max: float = 120.0
         self._load_accounts()
 
-    async def start_health_check(self):
+    async def start_health_check(self) -> None:
         """Запускает фоновый health-check для аккаунтов"""
         self._health_check_task = asyncio.create_task(self._periodic_health_check())
 
-    async def stop_health_check(self):
+    async def stop_health_check(self) -> None:
         """Останавливает health-check"""
         if self._health_check_task:
             self._health_check_task.cancel()
@@ -2212,11 +2245,10 @@ class AccountPoolManager:
             except asyncio.CancelledError:
                 pass
 
-    async def _periodic_health_check(self):
+    async def _periodic_health_check(self) -> None:
         """Периодическая проверка аккаунтов с adaptive delay"""
         while True:
             try:
-                # Adaptive delay между проверками
                 delay = max(60, Config.HEALTH_CHECK_INTERVAL / 2)
                 await asyncio.sleep(delay)
                 await self._check_all_accounts()
@@ -2228,42 +2260,39 @@ class AccountPoolManager:
                     Config.rand(
                         "HEALTH_CHECK_ERROR_DELAY_MIN", "HEALTH_CHECK_ERROR_DELAY_MAX"
                     )
-                )  # Short delay on error
+                )
 
-    async def _check_all_accounts(self):
+    async def _check_all_accounts(self) -> None:
         """Проверка всех аккаунтов с recovery"""
         async with self.lock:
             for acc in self.accounts:
-                if not acc["in_use"]:
-                    if not acc["client"] or not acc["client"].is_connected():
+                if not acc.in_use:
+                    if not acc.client or not acc.client.is_connected():
                         try:
-                            if acc["client"]:
-                                await acc["client"].disconnect()
-                            acc["client"] = await self._create_client_with_retry(
-                                acc["session_string"]
+                            if acc.client:
+                                await acc.client.disconnect()
+                            acc.client = await self._create_client_with_retry(
+                                acc.session_string
                             )
-                            me = await acc["client"].get_me()
+                            me = await acc.client.get_me()
                             if not me:
                                 raise Exception("Not authorized")
-                            acc["is_valid"] = True
-                            acc["last_check"] = datetime.now()
-                            # Update success rate
-                            self._update_account_success_rate(acc["session_file"], True)
-                            logger.info(f"Account health OK: {acc['session_file']}")
+                            acc.is_valid = True
+                            acc.last_check = datetime.now()
+                            self._update_account_success_rate(acc.session_file, True)
+                            logger.info(f"Account health OK: {acc.session_file}")
                         except Exception as e:
-                            if acc["client"]:
+                            if acc.client:
                                 try:
-                                    await acc["client"].disconnect()
+                                    await acc.client.disconnect()
                                 except Exception:
                                     pass
-                                acc["client"] = None
+                                acc.client = None
                             logger.error(
-                                f"Account health check failed {acc['session_file']}: {e}"
+                                f"Account health check failed {acc.session_file}: {e}"
                             )
-                            acc["is_valid"] = False
-                            self._update_account_success_rate(
-                                acc["session_file"], False
-                            )
+                            acc.is_valid = False
+                            self._update_account_success_rate(acc.session_file, False)
 
     async def _create_client_with_retry(self, session_string: str) -> TelegramClient:
         """Создаёт клиент с retry logic"""
@@ -2281,7 +2310,7 @@ class AccountPoolManager:
                     raise
         raise Exception("Failed to create client after 3 attempts")
 
-    def _load_accounts(self):
+    def _load_accounts(self) -> None:
         for filename in os.listdir(Config.SESSIONS_DIR):
             if filename.endswith(".session"):
                 session_path = os.path.join(Config.SESSIONS_DIR, filename)
@@ -2289,38 +2318,27 @@ class AccountPoolManager:
                     with open(session_path, "r") as f:
                         session_string = f.read().strip()
                     self.accounts.append(
-                        {
-                            "session_file": filename,
-                            "session_string": session_string,
-                            "client": None,
-                            "in_use": False,
-                            "last_used": None,
-                            "last_check": None,
-                            "is_valid": True,
-                            "flood_wait_until": None,
-                            "error_count": 0,
-                            "invite_count": 0,
-                            "success_count": 0,
-                            "consecutive_errors": 0,
-                        }
+                        Account(
+                            session_file=filename,
+                            session_string=session_string,
+                        )
                     )
                     self._account_success_rate[filename] = 1.0
                 except Exception as e:
                     logger.error(f"Error loading session {filename}: {e}")
 
-    async def _reset_account_errors(self, acc: Dict):
+    async def _reset_account_errors(self, acc: Account) -> None:
         """Сбрасывает счётчик ошибок"""
-        acc["error_count"] = 0
-        acc["invite_count"] = 0
-        acc["consecutive_errors"] = 0
+        acc.error_count = 0
+        acc.invite_count = 0
+        acc.consecutive_errors = 0
 
-    def _update_account_success_rate(self, session_file: str, success: bool):
+    def _update_account_success_rate(self, session_file: str, success: bool) -> None:
         """Обновляет статистику успеха аккаунта"""
         if session_file not in self._account_success_rate:
             self._account_success_rate[session_file] = 1.0
 
         current_rate = self._account_success_rate[session_file]
-        # Exponential moving average
         alpha = 0.1
         new_rate = alpha * (1.0 if success else 0.0) + (1 - alpha) * current_rate
         self._account_success_rate[session_file] = new_rate
@@ -2328,64 +2346,62 @@ class AccountPoolManager:
         if not success:
             self._account_last_error[session_file] = datetime.now()
 
-    async def _handle_flood_wait(self, acc: Dict, wait_time: float):
+    async def _handle_flood_wait(self, acc: Account, wait_time: float) -> None:
         """Обрабатывает FloodWait с увеличенным временем ожидания"""
         extended_wait = wait_time * Config.FLOOD_WAIT_MULTIPLIER
-        acc["flood_wait_until"] = datetime.now() + timedelta(seconds=extended_wait)
-        acc["consecutive_errors"] += 1
+        acc.flood_wait_until = datetime.now() + timedelta(seconds=extended_wait)
+        acc.consecutive_errors += 1
         logger.warning(
-            f"Flood wait for {acc['session_file']}: {extended_wait:.1f}s (original: {wait_time:.1f}s)"
+            f"Flood wait for {acc.session_file}: {extended_wait:.1f}s (original: {wait_time:.1f}s)"
         )
 
-    async def _check_account_flood(self, acc: Dict) -> bool:
+    async def _check_account_flood(self, acc: Account) -> bool:
         """Проверяет, не в flood wait ли аккаунт"""
-        if acc.get("flood_wait_until"):
-            if acc["flood_wait_until"] > datetime.now():
-                remaining = (acc["flood_wait_until"] - datetime.now()).total_seconds()
+        if acc.flood_wait_until:
+            if acc.flood_wait_until > datetime.now():
+                remaining = (acc.flood_wait_until - datetime.now()).total_seconds()
                 logger.info(
-                    f"Account {acc['session_file']} in flood wait: {remaining:.1f}s remaining"
+                    f"Account {acc.session_file} in flood wait: {remaining:.1f}s remaining"
                 )
                 return False
             else:
-                acc["flood_wait_until"] = None
+                acc.flood_wait_until = None
         return True
 
-    async def _check_account_rate_limit(self, acc: Dict) -> bool:
+    async def _check_account_rate_limit(self, acc: Account) -> bool:
         """Проверяет rate limit аккаунта с adaptive delay"""
-        if acc.get("last_used"):
-            elapsed = (datetime.now() - acc["last_used"]).total_seconds()
-            # Adaptive delay based on success rate
-            success_rate = self._account_success_rate.get(acc["session_file"], 1.0)
+        if acc.last_used:
+            elapsed = (datetime.now() - acc.last_used).total_seconds()
+            success_rate = self._account_success_rate.get(acc.session_file, 1.0)
             adaptive_delay = self._adaptive_delay_base * (1.0 / max(success_rate, 0.1))
             adaptive_delay = min(adaptive_delay, self._adaptive_delay_max)
 
             if elapsed < adaptive_delay:
                 logger.info(
-                    f"Account {acc['session_file']} rate limited: {elapsed:.1f}s since last use (adaptive: {adaptive_delay:.1f}s)"
+                    f"Account {acc.session_file} rate limited: {elapsed:.1f}s since last use (adaptive: {adaptive_delay:.1f}s)"
                 )
                 return False
         return True
 
-    async def _get_adaptive_delay(self, acc: Dict) -> float:
+    async def _get_adaptive_delay(self, acc: Account) -> float:
         """Получает adaptive delay для аккаунта"""
-        success_rate = self._account_success_rate.get(acc["session_file"], 1.0)
+        success_rate = self._account_success_rate.get(acc.session_file, 1.0)
         delay = self._adaptive_delay_base * (1.0 / max(success_rate, 0.1))
         delay = min(delay, self._adaptive_delay_max)
-        # Add randomness
         delay *= Config.rand("INVITE_JITTER_MIN", "INVITE_JITTER_MAX")
         return delay
 
     async def _detect_bot_user(self, user: Any) -> bool:
         """Определяет, является ли пользователь ботом"""
-        if hasattr(user, "bot") and user.bot:
+        if hasattr(user, "bot") and user.bot:  # type: ignore[union-attr]
             return True
-        if hasattr(user, "is_bot") and user.is_bot:
+        if hasattr(user, "is_bot") and user.is_bot:  # type: ignore[union-attr]
             return True
         return False
 
     async def _safe_get_user(
-        self, client: TelegramClient, user_id: int, max_retries: int = None
-    ) -> Optional[Any]:
+        self, client: TelegramClient, user_id: int, max_retries: Optional[int] = None
+    ) -> Optional[_EntityType]:
         """Безопасно получает пользователя с retry logic и adaptive delay"""
         if max_retries is None:
             max_retries = Config.MAX_RETRIES
@@ -2396,7 +2412,7 @@ class AccountPoolManager:
             except FloodWaitError as e:
                 logger.warning(f"Flood wait on get_entity {user_id}: {e.value}s")
                 acc = next(
-                    (acc for acc in self.accounts if acc.get("client") == client),
+                    (a for a in self.accounts if a.client == client),
                     None,
                 )
                 if acc:
@@ -2404,9 +2420,7 @@ class AccountPoolManager:
                 raise
             except Exception as e:
                 if attempt < max_retries - 1:
-                    wait_time = (
-                        Config.RETRY_BACKOFF_BASE**attempt
-                    )  # Exponential backoff
+                    wait_time = Config.RETRY_BACKOFF_BASE**attempt
                     logger.warning(
                         f"Retry get_entity {user_id} attempt {attempt + 1}: {e}"
                     )
@@ -2416,9 +2430,14 @@ class AccountPoolManager:
                         f"Failed to get entity {user_id} after {max_retries} attempts: {e}"
                     )
                     return None
+        return None
 
     async def _safe_invite(
-        self, client: TelegramClient, chat_id: str, user_id: int, acc: Dict = None
+        self,
+        client: TelegramClient,
+        chat_id: str,
+        user_id: int,
+        acc: Optional[Account] = None,
     ) -> bool:
         """Безопасно приглашает пользователя с retry и анти-бан механизмами"""
         for attempt in range(Config.MAX_RETRIES):
@@ -2428,11 +2447,10 @@ class AccountPoolManager:
                         channel=chat_id, users=[user_id]
                     )
                 )
-                # Update success rate
                 if acc:
-                    self._update_account_success_rate(acc["session_file"], True)
-                    acc["success_count"] = acc.get("success_count", 0) + 1
-                    acc["consecutive_errors"] = 0
+                    self._update_account_success_rate(acc.session_file, True)
+                    acc.success_count = acc.success_count + 1
+                    acc.consecutive_errors = 0
                 return True
             except UserPrivacyRestrictedError:
                 logger.info(f"User {user_id} privacy restricted - skipping")
@@ -2454,10 +2472,9 @@ class AccountPoolManager:
                 logger.error(f"Need admin rights for chat {chat_id}")
                 return False
             except Exception as e:
-                # Update error rate
                 if acc:
-                    self._update_account_success_rate(acc["session_file"], False)
-                    acc["consecutive_errors"] = acc.get("consecutive_errors", 0) + 1
+                    self._update_account_success_rate(acc.session_file, False)
+                    acc.consecutive_errors = acc.consecutive_errors + 1
 
                 if attempt < Config.MAX_RETRIES - 1:
                     wait_time = Config.RETRY_BACKOFF_BASE**attempt
@@ -2472,7 +2489,7 @@ class AccountPoolManager:
 
     async def _random_delay(
         self, min_delay: Optional[int] = None, max_delay: Optional[int] = None
-    ):
+    ) -> None:
         """Случайная задержка для имитации человеческого поведения"""
         delay = random.uniform(
             min_delay or Config.MIN_INVITE_DELAY, max_delay or Config.MAX_INVITE_DELAY
@@ -2480,21 +2497,18 @@ class AccountPoolManager:
         logger.info(f"Anti-block delay: {delay:.1f}s")
         await asyncio.sleep(delay)
 
-    async def human_delay(self):
+    async def human_delay(self) -> None:
         """Генерация человеческого паттерна поведения"""
-        # 80% обычный интервал, 20% "перерыв на кофе"
         if random.random() < 0.8:
             await self._random_delay()
         else:
-            # "Перерыв" 5-15 минут
             break_time = Config.rand("HUMAN_BREAK_MIN", "HUMAN_BREAK_MAX")
             logger.info(f"☕ Human break: {break_time:.0f}s")
             await asyncio.sleep(break_time)
 
-    async def simulate_activity(self, client: TelegramClient):
+    async def simulate_activity(self, client: TelegramClient) -> None:
         """Эмуляция активности аккаунта для защиты от detection"""
         try:
-            # Чтение сообщений из диалогов
             dialogs = await client.get_dialogs()
             if dialogs:
                 sample = random.sample(dialogs, min(5, len(dialogs)))
@@ -2522,53 +2536,46 @@ class AccountPoolManager:
         return client
 
     @asynccontextmanager
-    async def acquire_account(self):
-        account = None
+    async def acquire_account(self) -> AsyncIterator[Account]:
+        account: Optional[Account] = None
         try:
             async with self.lock:
                 now = datetime.now()
 
-                # Smart rotation: сортировка по success rate и последнему использованию
-                def account_sort_key(acc):
-                    success_rate = self._account_success_rate.get(
-                        acc["session_file"], 1.0
-                    )
-                    last_used = acc["last_used"] or datetime.min
-                    # Приоритет: success rate > last used > invite count
-                    return (-success_rate, last_used, acc.get("invite_count", 0))
+                def account_sort_key(a: Account) -> Tuple[float, datetime, int]:
+                    success_rate = self._account_success_rate.get(a.session_file, 1.0)
+                    last_used = a.last_used or datetime.min
+                    return (-success_rate, last_used, a.invite_count)
 
                 self.accounts.sort(key=account_sort_key)
 
                 for acc in self.accounts:
-                    if not acc["in_use"] and acc["is_valid"]:
-                        # Проверка flood wait
+                    if not acc.in_use and acc.is_valid:
                         if not await self._check_account_flood(acc):
                             continue
-                        # Проверка rate limit с adaptive delay
                         if not await self._check_account_rate_limit(acc):
                             continue
-                        # Проверка лимита инвайтов
-                        if acc.get("invite_count", 0) >= Config.MAX_ACCOUNTS_PER_TASK:
+                        if acc.invite_count >= Config.MAX_ACCOUNTS_PER_TASK:
                             await self._reset_account_errors(acc)
 
-                        acc["in_use"] = True
-                        acc["last_used"] = now
-                        if not acc["client"] or not acc["client"].is_connected():
+                        acc.in_use = True
+                        acc.last_used = now
+                        if not acc.client or not acc.client.is_connected():
                             try:
-                                if acc["client"]:
-                                    await acc["client"].disconnect()
-                                acc["client"] = await self._create_client_with_retry(
-                                    acc["session_string"]
+                                if acc.client:
+                                    await acc.client.disconnect()
+                                acc.client = await self._create_client_with_retry(
+                                    acc.session_string
                                 )
-                                me = await acc["client"].get_me()
+                                me = await acc.client.get_me()
                                 if not me:
                                     raise Exception("Not authorized")
                             except Exception as e:
                                 logger.error(f"Error connecting: {e}")
-                                acc["is_valid"] = False
-                                acc["in_use"] = False
+                                acc.is_valid = False
+                                acc.in_use = False
                                 continue
-                        logger.info(f"Acquired account: {acc['session_file']}")
+                        logger.info(f"Acquired account: {acc.session_file}")
                         account = acc
                         break
 
@@ -2578,92 +2585,86 @@ class AccountPoolManager:
         finally:
             if account:
                 async with self.lock:
-                    account["in_use"] = False
-                    account["invite_count"] = account.get("invite_count", 0) + 1
+                    account.in_use = False
+                    account.invite_count = account.invite_count + 1
                     logger.info(
-                        f"Released account: {account['session_file']} (invites: {account['invite_count']}, success_rate: {self._account_success_rate.get(account['session_file'], 0):.2f})"
+                        f"Released account: {account.session_file} (invites: {account.invite_count}, success_rate: {self._account_success_rate.get(account.session_file, 0):.2f})"
                     )
 
     @asynccontextmanager
-    async def acquire_specific_account(self, session_file: str):
-        account = None
+    async def acquire_specific_account(
+        self, session_file: str
+    ) -> AsyncIterator[Account]:
+        account: Optional[Account] = None
         async with self.lock:
             now = datetime.now()
             for acc in self.accounts:
-                if acc["session_file"] == session_file:
-                    if acc["in_use"]:
+                if acc.session_file == session_file:
+                    if acc.in_use:
                         raise Exception(
                             "Указанный аккаунт в данный момент используется"
                         )
-                    if not acc["is_valid"]:
+                    if not acc.is_valid:
                         raise Exception("Указанный аккаунт невалиден")
                     if not await self._check_account_flood(acc):
                         raise Exception(
                             "Указанный аккаунт в режиме ожидания из-за flood"
                         )
-                    acc["in_use"] = True
-                    acc["last_used"] = now
+                    acc.in_use = True
+                    acc.last_used = now
                     account = acc
                     break
             if not account:
                 raise Exception("Указанный аккаунт не найден")
-            if not account["client"] or not account["client"].is_connected():
+            if not account.client or not account.client.is_connected():
                 try:
-                    if account["client"]:
-                        await account["client"].disconnect()
-                    account["client"] = await self._create_client_with_retry(
-                        account["session_string"]
+                    if account.client:
+                        await account.client.disconnect()
+                    account.client = await self._create_client_with_retry(
+                        account.session_string
                     )
-                    me = await account["client"].get_me()
+                    me = await account.client.get_me()
                     if not me:
                         raise Exception("Not authorized")
                 except Exception as e:
-                    account["is_valid"] = False
-                    account["in_use"] = False
+                    account.is_valid = False
+                    account.in_use = False
                     raise Exception(f"Ошибка при подключении к аккаунту: {e}")
-            logger.info(f"Acquired specific account: {account['session_file']}")
+            logger.info(f"Acquired specific account: {account.session_file}")
         try:
             yield account
         finally:
             async with self.lock:
-                account["in_use"] = False
-                logger.info(f"Released specific account: {account['session_file']}")
+                account.in_use = False
+                logger.info(f"Released specific account: {account.session_file}")
 
     def has_available_accounts(self, session_file: Optional[str] = None) -> bool:
         for acc in self.accounts:
-            if session_file and acc.get("session_file") != session_file:
+            if session_file and acc.session_file != session_file:
                 continue
-            if acc.get("in_use"):
+            if acc.in_use:
                 continue
-            if not acc.get("is_valid"):
+            if not acc.is_valid:
                 continue
             return True
         return False
 
-    def add_account(self, session_string: str, session_name: str):
+    def add_account(self, session_string: str, session_name: str) -> None:
         session_path = os.path.join(Config.SESSIONS_DIR, f"{session_name}.session")
         with open(session_path, "w") as f:
             f.write(session_string)
         self.accounts.append(
-            {
-                "session_file": f"{session_name}.session",
-                "session_string": session_string,
-                "client": None,
-                "in_use": False,
-                "last_used": None,
-                "last_check": None,
-                "is_valid": True,
-                "flood_wait_until": None,
-                "error_count": 0,
-                "invite_count": 0,
-            }
+            Account(
+                session_file=f"{session_name}.session",
+                session_string=session_string,
+            )
         )
         logger.info(f"Added new account: {session_name}.session")
 
 
 # --- TaskQueueManager ---
 class TaskControl:
-    def __init__(self):
+    def __init__(self) -> None:
         self.pause_event = asyncio.Event()
         self.pause_event.set()
         self.cancelled = False
@@ -2671,7 +2672,7 @@ class TaskControl:
         self.last_activity = datetime.now()
         self.timeout: int = 3600  # 1 hour default timeout
 
-    def update_activity(self):
+    def update_activity(self) -> None:
         """Обновляет timestamp последней активности"""
         self.last_activity = datetime.now()
 
@@ -2682,24 +2683,26 @@ class TaskControl:
 
 
 class TaskQueueManager:
-    def __init__(self, max_concurrent_tasks: int = 3):
+    def __init__(self, max_concurrent_tasks: int = 3) -> None:
         self.max_concurrent_tasks = max_concurrent_tasks
-        self.queue = asyncio.Queue()
-        self.active_tasks: Dict[str, asyncio.Task] = {}
+        self.queue = asyncio.Queue[
+            Tuple[Callable[..., Any], str, Tuple[Any, ...], Dict[str, Any]]
+        ]()
+        self.active_tasks: Dict[str, Optional[asyncio.Task[Any]]] = {}
         self.task_controls: Dict[str, TaskControl] = {}
         self.user_tasks: Dict[int, Set[str]] = {}
         self.logger = logging.getLogger("task_queue")
         self.tasks_storage: Optional[TasksDB] = None
-        self._worker_tasks: Dict[str, asyncio.Task] = {}
-        self._health_check_task = None
-        self._task_timeout: int = 3600  # 1 hour default
+        self._worker_tasks: Dict[str, asyncio.Task[None]] = {}
+        self._health_check_task: Optional[asyncio.Task[None]] = None
+        self._task_timeout: int = 3600
         self._active_worker_count: int = 0
-        self._scaling_task = None
+        self._scaling_task: Optional[asyncio.Task[None]] = None
 
     def set_storage(self, storage: TasksDB) -> None:
         self.tasks_storage = storage
 
-    def start_workers(self):
+    def start_workers(self) -> None:
         # Запуск минимального количества воркеров
         for i in range(Config.MIN_WORKERS):
             self._create_worker(f"worker-{i + 1}")
@@ -2718,7 +2721,7 @@ class TaskQueueManager:
                 f"Worker {name} created (total: {self._active_worker_count})"
             )
 
-    async def _auto_scale_workers(self):
+    async def _auto_scale_workers(self) -> None:
         """Автоматическое масштабирование воркеров"""
         while True:
             try:
@@ -2773,7 +2776,7 @@ class TaskQueueManager:
                     )
                 )
 
-    async def stop_workers(self):
+    async def stop_workers(self) -> None:
         """Останавливает всех воркеров"""
         if self._scaling_task:
             self._scaling_task.cancel()
@@ -2793,7 +2796,7 @@ class TaskQueueManager:
         self._worker_tasks.clear()
         self._active_worker_count = 0
 
-    async def _task_health_check(self):
+    async def _task_health_check(self) -> None:
         """Проверка здоровья задач (таймауты, зависания)"""
         while True:
             try:
@@ -2825,7 +2828,7 @@ class TaskQueueManager:
                     )
                 )
 
-    async def _worker(self, name: str):
+    async def _worker(self, name: str) -> None:
         self.logger.info(f"Worker {name} started")
         while True:
             try:
@@ -2900,7 +2903,13 @@ class TaskQueueManager:
                     )
                 )
 
-    async def add_task(self, queue_task_id: str, task_func, *args, **kwargs):
+    async def add_task(
+        self,
+        queue_task_id: str,
+        task_func: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
         self.task_controls.setdefault(queue_task_id, TaskControl())
         await self.queue.put((task_func, queue_task_id, args, kwargs))
         self.logger.info(
@@ -2955,10 +2964,10 @@ class TaskQueueManager:
     def can_user_add_task(self, user_id: int) -> bool:
         return len(self.user_tasks.get(user_id, set())) < Config.MAX_TASKS_PER_USER
 
-    def add_user_task(self, user_id: int, task_id: str):
+    def add_user_task(self, user_id: int, task_id: str) -> None:
         self.user_tasks.setdefault(user_id, set()).add(task_id)
 
-    def remove_user_task(self, user_id: int, task_id: str):
+    def remove_user_task(self, user_id: int, task_id: str) -> None:
         if user_id in self.user_tasks:
             self.user_tasks[user_id].discard(task_id)
 
@@ -3028,23 +3037,33 @@ account_pool = AccountPoolManager()
 task_queue = TaskQueueManager(max_concurrent_tasks=Config.MAX_CONCURRENT_TASKS)
 task_queue.set_storage(tasks_storage)
 
-pending_auth = {}
+pending_auth: Dict[int, bool] = {}
 
 # --- Worm Mode state ---
 _worm_active: bool = False
-_worm_task: Optional[asyncio.Task] = None
+_worm_task: Optional[asyncio.Task[None]] = None
 _worm_chat_id: Optional[str] = None
 _worm_sources: List[str] = []
-_worm_stats: Dict[str, Dict[str, int]] = {}
+_worm_stats: Dict[str, WormSourceStats] = {}
 _worm_lock = asyncio.Lock()
 
 
 # --- Middleware ---
-async def auth_middleware(handler, event, data):
+async def auth_middleware(
+    handler: Callable[..., Any],
+    event: Union[Message, CallbackQuery],
+    data: Dict[str, Any],
+) -> Any:
     if isinstance(event, Message):
-        user_id = event.from_user.id
+        user = event.from_user
+        if not user:
+            return await handler(event, data)
+        user_id = user.id
     elif isinstance(event, CallbackQuery):
-        user_id = event.from_user.id
+        user = event.from_user
+        if not user:
+            return await handler(event, data)
+        user_id = user.id
     else:
         return await handler(event, data)
 
@@ -3075,7 +3094,9 @@ async def auth_middleware(handler, event, data):
 
 
 async def language_middleware(
-    handler: Callable, event: Any, data: Dict[str, Any]
+    handler: Callable[..., Any],
+    event: Union[Message, CallbackQuery],
+    data: Dict[str, Any],
 ) -> Any:
     user = getattr(event, "from_user", None)
     token = _CURRENT_LANGUAGE.set(DEFAULT_LANGUAGE)
@@ -3097,22 +3118,28 @@ async def language_middleware(
         _CURRENT_LANGUAGE.reset(token)
 
 
-router.message.middleware(language_middleware)
-router.callback_query.middleware(language_middleware)
-router.message.middleware(auth_middleware)
-router.callback_query.middleware(auth_middleware)
+router.message.middleware(language_middleware)  # type: ignore[arg-type]
+router.callback_query.middleware(language_middleware)  # type: ignore[arg-type]
+router.message.middleware(auth_middleware)  # type: ignore[arg-type]
+router.callback_query.middleware(auth_middleware)  # type: ignore[arg-type]
 
 
 # --- Обработчики команд ---
 @router.message(Command("start"))
 @router.callback_query(F.data == "start")
-async def cmd_start(event, state: FSMContext):
+async def cmd_start(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
     await state.clear()
 
     if isinstance(event, Message):
-        user_id = event.from_user.id
+        user = event.from_user
+        if not user:
+            return
+        user_id = user.id
     else:
-        user_id = event.from_user.id
+        user = event.from_user
+        if not user:
+            return
+        user_id = user.id
 
     is_admin = user_id in Config.ADMIN_USER_IDS
     is_authorized = await auth_manager.is_authorized(user_id)
@@ -3123,7 +3150,6 @@ async def cmd_start(event, state: FSMContext):
         await smart_answer(event, bot, text, delete_origin=False)
         return
 
-    # Получаем статистику
     accounts_count = len(account_pool.accounts)
     chats_count = (
         await chat_db.get_active_chats_count(verified_only=True) if chat_db.conn else 0
@@ -3259,7 +3285,7 @@ async def cmd_start(event, state: FSMContext):
 
 
 @router.callback_query(F.data == "cancel")
-async def cmd_cancel(event, state: FSMContext):
+async def cmd_cancel(event: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await cmd_start(event, state)
 
@@ -3302,8 +3328,11 @@ async def get_lang(state: FSMContext, user_id: int) -> str:
 
 
 @router.callback_query(F.data == "language_select")
-async def cmd_language_select(event: CallbackQuery, state: FSMContext):
-    user_id = event.from_user.id
+async def cmd_language_select(event: CallbackQuery, state: FSMContext) -> None:
+    user = event.from_user
+    if not user:
+        return
+    user_id = user.id
 
     if is_admin_user(user_id):
         await event.answer(
@@ -3314,13 +3343,21 @@ async def cmd_language_select(event: CallbackQuery, state: FSMContext):
     await state.set_state(LanguageStates.waiting_choice)
     text = translate(lang, "texts.language_prompt")
     await event.answer(text, show_alert=False)
-    await event.message.edit_text(text, reply_markup=build_language_keyboard())
+    msg = event.message
+    if isinstance(msg, Message) and msg:
+        await msg.edit_text(text, reply_markup=build_language_keyboard())
 
 
 @router.callback_query(F.data.startswith("lang:"))
-async def cmd_language_change(event: CallbackQuery, state: FSMContext):
-    user_id = event.from_user.id
-    lang = event.data.split(":", 1)[1]
+async def cmd_language_change(event: CallbackQuery, state: FSMContext) -> None:
+    user = event.from_user
+    if not user:
+        return
+    user_id = user.id
+    data = event.data
+    if not data:
+        return
+    lang = data.split(":", 1)[1]
 
     if is_admin_user(user_id):
         await event.answer(
@@ -3345,10 +3382,19 @@ async def cmd_language_change(event: CallbackQuery, state: FSMContext):
     )
 
 
-@router.message(lambda message: message.from_user.id in pending_auth)
-async def process_auth_key(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    key = message.text.strip()
+@router.message(
+    lambda message: message.from_user is not None
+    and message.from_user.id in pending_auth
+)
+async def process_auth_key(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    if not user:
+        return
+    user_id = user.id
+    text = message.text
+    if not text:
+        return
+    key = text.strip()
 
     if await auth_manager.verify_key(user_id, key):
         await auth_manager.add_authorized_user(user_id)
@@ -3370,7 +3416,7 @@ async def process_auth_key(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "add_account")
-async def cmd_add_account(event: CallbackQuery, state: FSMContext):
+async def cmd_add_account(event: CallbackQuery, state: FSMContext) -> None:
     text = translate(lang, "waiting_phone")
     keyboard = [
         [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
@@ -3380,8 +3426,11 @@ async def cmd_add_account(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(AddAccountStates.waiting_phone)
-async def process_phone(message: Message, state: FSMContext):
-    phone = message.text.strip()
+async def process_phone(message: Message, state: FSMContext) -> None:
+    text = message.text
+    if not text:
+        return
+    phone = text.strip()
     await state.update_data(phone=phone)
     text = translate(lang, "safety_notice")
     keyboard = [
@@ -3400,7 +3449,7 @@ async def process_phone(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "confirm_yes", AddAccountStates.waiting_confirmation)
-async def process_confirmation_yes(event: CallbackQuery, state: FSMContext):
+async def process_confirmation_yes(event: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     phone = data.get("phone")
     if not phone:
@@ -3445,8 +3494,11 @@ async def process_confirmation_yes(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(AddAccountStates.waiting_code)
-async def process_code(message: Message, state: FSMContext):
-    code = message.text.strip()
+async def process_code(message: Message, state: FSMContext) -> None:
+    text = message.text
+    if not text:
+        return
+    code = text.strip()
     data = await state.get_data()
     client = data.get("client")
     phone = data.get("phone")
@@ -3569,8 +3621,11 @@ async def process_code(message: Message, state: FSMContext):
 
 
 @router.message(AddAccountStates.waiting_password)
-async def process_password(message: Message, state: FSMContext):
-    password = message.text.strip()
+async def process_password(message: Message, state: FSMContext) -> None:
+    text = message.text
+    if not text:
+        return
+    password = text.strip()
     data = await state.get_data()
     client = data.get("client")
     phone = data.get("phone")
@@ -3669,7 +3724,7 @@ async def process_password(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "list_accounts")
-async def cmd_list_accounts(event: CallbackQuery):
+async def cmd_list_accounts(event: CallbackQuery) -> None:
     if not account_pool.accounts:
         text = translate(lang, "no_accounts")
         keyboard = [
@@ -3690,23 +3745,23 @@ async def cmd_list_accounts(event: CallbackQuery):
     for i, acc in enumerate(account_pool.accounts, 1):
         status = (
             translate(lang, "account_status_free")
-            if not acc["in_use"]
+            if not acc.in_use
             else translate(lang, "account_status_busy")
         )
         validity = (
             translate(lang, "account_status_valid")
-            if acc["is_valid"]
+            if acc.is_valid
             else translate(lang, "account_status_invalid")
         )
         flood = (
-            translate(lang, "account_flood_wait", until=acc["flood_wait_until"])
-            if acc.get("flood_wait_until")
+            translate(lang, "account_flood_wait", until=acc.flood_wait_until)
+            if acc.flood_wait_until
             else ""
         )
         lines.append(
-            f"{i}. <code>{acc['session_file']}</code>\n"
+            f"{i}. <code>{acc.session_file}</code>\n"
             f"  {status} | {validity}\n"
-            f"{translate('account_last_used', when=acc['last_used'] or translate('never'))} {flood}\n"
+            f"{translate('account_last_used', when=acc.last_used or translate('never'))} {flood}\n"
         )
 
     text = "\n".join(lines)
@@ -3726,7 +3781,7 @@ async def cmd_list_accounts(event: CallbackQuery):
 
 
 @router.callback_query(F.data == "genkey")
-async def cmd_genkey(event: CallbackQuery, state: FSMContext):
+async def cmd_genkey(event: CallbackQuery, state: FSMContext) -> None:
     if event.from_user.id not in Config.ADMIN_USER_IDS:
         await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
@@ -3740,9 +3795,12 @@ async def cmd_genkey(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(KeyGeneration.waiting_user_id)
-async def process_user_id(message: Message, state: FSMContext):
+async def process_user_id(message: Message, state: FSMContext) -> None:
     try:
-        user_id = int(message.text.strip())
+        text = message.text
+        if not text:
+            return
+        user_id = int(text.strip())
         key = await auth_manager.generate_key(user_id)
         text = translate(
             "genkey_success",
@@ -3766,7 +3824,7 @@ async def process_user_id(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "start_scraping")
-async def cmd_start_scraping(event: CallbackQuery, state: FSMContext):
+async def cmd_start_scraping(event: CallbackQuery, state: FSMContext) -> None:
     if not account_pool.accounts:
         text = translate(lang, "no_available_accounts_btn")
         keyboard = [
@@ -3830,8 +3888,11 @@ async def cmd_start_scraping(event: CallbackQuery, state: FSMContext):
 @router.callback_query(
     F.data.startswith("scraping_source:"), ScrapingStates.waiting_source_type
 )
-async def scraping_source_select(event: CallbackQuery, state: FSMContext):
-    source_type = event.data.split(":")[1]
+async def scraping_source_select(event: CallbackQuery, state: FSMContext) -> None:
+    data = event.data
+    if not data:
+        return
+    source_type = data.split(":")[1]
     await state.update_data(scraping_source_type=source_type)
 
     if source_type == "manual":
@@ -3869,7 +3930,7 @@ async def scraping_source_select(event: CallbackQuery, state: FSMContext):
 @router.callback_query(
     F.data == "scraping_db_continue", ScrapingStates.waiting_source_type
 )
-async def scraping_db_continue(event: CallbackQuery, state: FSMContext):
+async def scraping_db_continue(event: CallbackQuery, state: FSMContext) -> None:
     text = translate(lang, "waiting_target")
     keyboard = [
         [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
@@ -3879,7 +3940,7 @@ async def scraping_db_continue(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(ScrapingStates.waiting_source)
-async def process_source(message: Message, state: FSMContext):
+async def process_source(message: Message, state: FSMContext) -> None:
     source = message.text.strip()
     await state.update_data(source=source)
     text = translate(lang, "scrape_step2")
@@ -3893,7 +3954,7 @@ async def process_source(message: Message, state: FSMContext):
 
 
 @router.message(ScrapingStates.waiting_target)
-async def process_target(message: Message, state: FSMContext):
+async def process_target(message: Message, state: FSMContext) -> None:
     target = message.text.strip()
     await state.update_data(target=target)
     text = translate(lang, "scrape_step3")
@@ -3909,7 +3970,7 @@ async def process_target(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("mode:"), ScrapingStates.waiting_mode)
-async def process_mode_callback(event: CallbackQuery, state: FSMContext):
+async def process_mode_callback(event: CallbackQuery, state: FSMContext) -> None:
     mode = event.data.split(":")[1]
     await state.update_data(mode=mode)
 
@@ -3936,16 +3997,19 @@ async def process_mode_callback(event: CallbackQuery, state: FSMContext):
 @router.callback_query(
     F.data.startswith("limit:"), ScrapingStates.waiting_message_limit
 )
-async def process_limit_callback(event: CallbackQuery, state: FSMContext):
+async def process_limit_callback(event: CallbackQuery, state: FSMContext) -> None:
     limit = int(event.data.split(":")[1])
     await state.update_data(limit=limit)
     await ask_for_account(event, state)
 
 
 @router.message(ScrapingStates.waiting_message_limit)
-async def process_limit(message: Message, state: FSMContext):
+async def process_limit(message: Message, state: FSMContext) -> None:
     try:
-        limit = int(message.text)
+        text = message.text
+        if not text:
+            return
+        limit = int(text)
         if limit < 50 or limit > 5000:
             raise ValueError
     except ValueError:
@@ -3962,16 +4026,19 @@ async def process_limit(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("users:"), ScrapingStates.waiting_user_count)
-async def process_user_count_callback(event: CallbackQuery, state: FSMContext):
+async def process_user_count_callback(event: CallbackQuery, state: FSMContext) -> None:
     user_count = int(event.data.split(":")[1])
     await state.update_data(user_count=user_count)
     await ask_for_account(event, state)
 
 
 @router.message(ScrapingStates.waiting_user_count)
-async def process_user_count(message: Message, state: FSMContext):
+async def process_user_count(message: Message, state: FSMContext) -> None:
     try:
-        user_count = int(message.text)
+        text = message.text
+        if not text:
+            return
+        user_count = int(text)
         if user_count < 10 or user_count > 1000:
             raise ValueError
     except ValueError:
@@ -3987,7 +4054,9 @@ async def process_user_count(message: Message, state: FSMContext):
     await ask_for_account(message, state)
 
 
-async def ask_for_account(event, state: FSMContext):
+async def ask_for_account(
+    event: Union[Message, CallbackQuery], state: FSMContext
+) -> None:
     accounts_list = account_pool.accounts
     if not accounts_list:
         await smart_answer(
@@ -4010,12 +4079,11 @@ async def ask_for_account(event, state: FSMContext):
         return
 
     if len(accounts_list) == 1:
-        # Авто-выбор единственного аккаунта
-        await state.update_data(sender_session=accounts_list[0]["session_file"])
+        await state.update_data(sender_session=accounts_list[0].session_file)
         await smart_answer(
             event,
             bot,
-            translate(lang, "selected_account", name=accounts_list[0]["session_file"]),
+            translate(lang, "selected_account", name=accounts_list[0].session_file),
             delete_origin=False,
         )
         await launch_scraping_task(event, state)
@@ -4026,12 +4094,12 @@ async def ask_for_account(event, state: FSMContext):
         [{"text": translate(lang, "scrape_auto"), "callback_data": "acc:auto"}]
     ]
     for i, acc in enumerate(accounts_list, 1):
-        status = "🟢" if acc["is_valid"] else "⚫"
-        busy = " ⏳" if acc["in_use"] else ""
-        flood = " ⏱" if acc.get("flood_wait_until") else ""
-        label = f"{i}. {acc['session_file'][:18]} {status}{busy}{flood}"
+        status = "🟢" if acc.is_valid else "⚫"
+        busy = " ⏳" if acc.in_use else ""
+        flood = " ⏱" if acc.flood_wait_until else ""
+        label = f"{i}. {acc.session_file[:18]} {status}{busy}{flood}"
         keyboard_rows.append(
-            [{"text": label, "callback_data": f"acc:{acc['session_file']}"}]
+            [{"text": label, "callback_data": f"acc:{acc.session_file}"}]
         )
     keyboard_rows.append(
         [{"text": translate(lang, "buttons.cancel"), "callback_data": "cancel"}]
@@ -4048,7 +4116,7 @@ async def ask_for_account(event, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("acc:"), ScrapingStates.waiting_account)
-async def process_account_choice(event: CallbackQuery, state: FSMContext):
+async def process_account_choice(event: CallbackQuery, state: FSMContext) -> None:
     val = event.data.split(":", 1)[1]
     sender_session = None if val == "auto" else val
     await state.update_data(sender_session=sender_session)
@@ -4056,7 +4124,7 @@ async def process_account_choice(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(ScrapingStates.waiting_account)
-async def process_account_manual(message: Message, state: FSMContext):
+async def process_account_manual(message: Message, state: FSMContext) -> None:
     txt = message.text.strip().lower()
     sender_session = None
     if txt not in ("auto", "a"):
@@ -4065,7 +4133,9 @@ async def process_account_manual(message: Message, state: FSMContext):
     await launch_scraping_task(message, state)
 
 
-async def launch_scraping_task(event, state: FSMContext):
+async def launch_scraping_task(
+    event: Union[Message, CallbackQuery], state: FSMContext
+) -> None:
     data = await state.get_data()
     source = data.get("source")
     target = data.get("target")
@@ -4145,7 +4215,7 @@ async def launch_scraping_task(event, state: FSMContext):
 
 
 @router.callback_query(F.data == "bulk_mailing")
-async def cmd_bulk_mailing(event: CallbackQuery, state: FSMContext):
+async def cmd_bulk_mailing(event: CallbackQuery, state: FSMContext) -> None:
     if not task_queue.can_user_add_task(event.from_user.id):
         text = translate(
             "bulkmail_max_tasks",
@@ -4204,7 +4274,7 @@ async def cmd_bulk_mailing(event: CallbackQuery, state: FSMContext):
 @router.callback_query(
     F.data.startswith("bulkmail_target:"), BulkMailStates.waiting_db_source
 )
-async def bm_target_select(event: CallbackQuery, state: FSMContext):
+async def bm_target_select(event: CallbackQuery, state: FSMContext) -> None:
     target_type = event.data.split(":", 1)[1]
     await state.update_data(mailing_target=target_type)
 
@@ -4230,7 +4300,7 @@ async def bm_target_select(event: CallbackQuery, state: FSMContext):
 @router.callback_query(
     F.data.startswith("bulkmail_source:"), BulkMailStates.waiting_db_source
 )
-async def bm_source_select(event: CallbackQuery, state: FSMContext):
+async def bm_source_select(event: CallbackQuery, state: FSMContext) -> None:
     source_type = event.data.split(":")[1]
     await state.update_data(chats_source_type=source_type)
 
@@ -4269,7 +4339,7 @@ async def bm_source_select(event: CallbackQuery, state: FSMContext):
 @router.callback_query(
     F.data == "bulkmail_db_continue", BulkMailStates.waiting_db_source
 )
-async def bm_db_continue(event: CallbackQuery, state: FSMContext):
+async def bm_db_continue(event: CallbackQuery, state: FSMContext) -> None:
     text = translate(lang, "bulkmail_step2_delay")
     keyboard = [
         [{"text": "5 10", "callback_data": "delay:5:10"}],
@@ -4283,7 +4353,7 @@ async def bm_db_continue(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(BulkMailStates.waiting_chats)
-async def bm_waiting_chats(message: Message, state: FSMContext):
+async def bm_waiting_chats(message: Message, state: FSMContext) -> None:
     raw = message.text.strip()
     parts = [p.strip() for p in raw.replace(",", " ").split() if p.strip()]
     if not parts:
@@ -4311,7 +4381,7 @@ async def bm_waiting_chats(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("delay:"), BulkMailStates.waiting_delay)
-async def bm_waiting_delay_callback(event: CallbackQuery, state: FSMContext):
+async def bm_waiting_delay_callback(event: CallbackQuery, state: FSMContext) -> None:
     parts = event.data.split(":")
     dmin = int(parts[1])
     dmax = int(parts[2])
@@ -4331,7 +4401,7 @@ async def bm_waiting_delay_callback(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(BulkMailStates.waiting_delay)
-async def bm_waiting_delay(message: Message, state: FSMContext):
+async def bm_waiting_delay(message: Message, state: FSMContext) -> None:
     parts = message.text.strip().split()
     try:
         if len(parts) != 2:
@@ -4367,7 +4437,7 @@ async def bm_waiting_delay(message: Message, state: FSMContext):
 
 
 @router.message(BulkMailStates.waiting_text)
-async def bm_waiting_text(message: Message, state: FSMContext):
+async def bm_waiting_text(message: Message, state: FSMContext) -> None:
     if message.text == "/done" or message.text == "/закончить":
         await smart_answer(
             message,
@@ -4405,7 +4475,7 @@ async def bm_waiting_text(message: Message, state: FSMContext):
 
 
 @router.callback_query(F.data == "bulkmail_add_text", BulkMailStates.waiting_text)
-async def bm_add_text_callback(event: CallbackQuery, state: FSMContext):
+async def bm_add_text_callback(event: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     texts = data.get("texts", [])
     text = translate(lang, "bulkmail_step3_text_next", count=len(texts))
@@ -4428,7 +4498,7 @@ async def bm_add_text_callback(event: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "bulkmail_texts_done", BulkMailStates.waiting_text)
-async def bm_texts_done_callback(event: CallbackQuery, state: FSMContext):
+async def bm_texts_done_callback(event: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     texts = data.get("texts", [])
     if not texts:
@@ -4440,8 +4510,7 @@ async def bm_texts_done_callback(event: CallbackQuery, state: FSMContext):
     await _proceed_to_sender_selection(event, state)
 
 
-async def _proceed_to_sender_selection(event, state: FSMContext):
-    """Переход к выбору аккаунта-отправителя"""
+async def _proceed_to_sender_selection(event: CallbackQuery, state: FSMContext) -> None:
     accounts_list = account_pool.accounts
 
     if not account_pool.has_available_accounts():
@@ -4456,11 +4525,9 @@ async def _proceed_to_sender_selection(event, state: FSMContext):
 
     lines = [translate(lang, "bulkmail_step4_account")]
     for i, acc in enumerate(accounts_list, 1):
-        status = "🔴" if acc["in_use"] else "🟢" if acc["is_valid"] else "⚫"
-        flood = (
-            translate(lang, "flood_indicator") if acc.get("flood_wait_until") else ""
-        )
-        lines.append(f"{i}. {acc['session_file']} {status}{flood}")
+        status = "🔴" if acc.in_use else "🟢" if acc.is_valid else "⚫"
+        flood = translate(lang, "flood_indicator") if acc.flood_wait_until else ""
+        lines.append(f"{i}. {acc.session_file} {status}{flood}")
 
     lines.append(f"\n<b>{translate('bulkmail_step4_account').split(':')[0]}:</b>")
 
@@ -4469,8 +4536,8 @@ async def _proceed_to_sender_selection(event, state: FSMContext):
         + [
             [
                 {
-                    "text": f"{i}. {acc['session_file'][:20]}",
-                    "callback_data": f"sender:{acc['session_file']}",
+                    "text": f"{i}. {acc.session_file[:20]}",
+                    "callback_data": f"sender:{acc.session_file}",
                 }
             ]
             for i, acc in enumerate(accounts_list, 1)
@@ -4485,7 +4552,7 @@ async def _proceed_to_sender_selection(event, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("sender:"), BulkMailStates.waiting_sender)
-async def bm_waiting_sender_callback(event: CallbackQuery, state: FSMContext):
+async def bm_waiting_sender_callback(event: CallbackQuery, state: FSMContext) -> None:
     sender = event.data.split(":", 1)[1]
     await state.update_data(sender_session=sender if sender != "auto" else None)
 
@@ -4505,13 +4572,13 @@ async def bm_waiting_sender_callback(event: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data.startswith("total:"), BulkMailStates.waiting_count)
-async def bm_waiting_count_callback(event: CallbackQuery, state: FSMContext):
+async def bm_waiting_count_callback(event: CallbackQuery, state: FSMContext) -> None:
     total = int(event.data.split(":")[1])
     await process_bulk_mailing_final(event, state, total)
 
 
 @router.message(BulkMailStates.waiting_count)
-async def bm_waiting_count(message: Message, state: FSMContext):
+async def bm_waiting_count(message: Message, state: FSMContext) -> None:
     try:
         total = int(message.text.strip())
         if total <= 0:
@@ -4528,7 +4595,9 @@ async def bm_waiting_count(message: Message, state: FSMContext):
     await process_bulk_mailing_final(message, state, total)
 
 
-async def process_bulk_mailing_final(event, state: FSMContext, total: int):
+async def process_bulk_mailing_final(
+    event: CallbackQuery | Message, state: FSMContext, total: int
+) -> None:
     data = await state.get_data()
     chats = data.get("chats", [])
     chats_source_type = data.get("chats_source_type", "manual")
@@ -4541,9 +4610,7 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
     user_id = event.from_user.id
 
     if sender_session:
-        if not any(
-            acc.get("session_file") == sender_session for acc in account_pool.accounts
-        ):
+        if not any(acc.session_file == sender_session for acc in account_pool.accounts):
             await smart_answer(
                 event,
                 bot,
@@ -4571,7 +4638,7 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
             )
             await state.clear()
             return
-        chats = [c["chat_url"] or c["chat_id"] for c in chats]
+        chats = [c.chat_url or c.chat_id for c in chats]
 
         if mailing_target == "users":
             total_users = await chat_db.get_total_users(verified_only=True)
@@ -4681,15 +4748,15 @@ async def process_bulk_mailing_final(event, state: FSMContext, total: int):
 
 # --- Новый формат отображения задач ---
 async def show_task_details(
-    bot: Bot, user_id: int, task: Dict[str, Any], for_admin: bool = False
-):
+    bot: Bot, user_id: int, task: Task, for_admin: bool = False
+) -> Tuple[str, InlineKeyboardMarkup]:
     """Показывает детали задачи в отдельном сообщении (как в VPN-боте)"""
-    task_id = task.get("task_id", "unknown")
-    task_type = task.get("type", "unknown")
-    status = task.get("status", "unknown")
-    created = task.get("created_at", "")
-    progress = task.get("progress", 0)
-    progress_text = task.get("progress_text", "0/0")
+    task_id = task.task_id or "unknown"
+    task_type = task.type or "unknown"
+    status = task.status or "unknown"
+    created = task.created_at or ""
+    progress = task.progress or 0
+    progress_text = task.progress_text or "0/0"
 
     # Иконки статусов
     status_icons = {
@@ -4715,25 +4782,27 @@ async def show_task_details(
     text += f"{translate('task_status_label')} {status}\n"
     text += f"{translate('task_created_label')} {time_str}\n"
 
+    task_data = task.data or {}
+
     if task_type == "scraping":
-        source = task.get("source", "")
-        target = task.get("target", "")
-        mode = task.get("mode", "")
+        source = task_data.get("source", "")
+        target = task_data.get("target", "")
+        mode = task_data.get("mode", "")
         if mode == "messages":
-            limit = task.get("limit", 0)
+            limit = task_data.get("limit", 0)
             text += f"{translate('task_source_label')} {source}\n"
             text += f"{translate('task_target_label')} {target}\n"
             text += f"{translate('task_messages_label')} {limit}\n"
         else:
-            user_count = task.get("user_count", 0)
+            user_count = task_data.get("user_count", 0)
             text += f"{translate('task_source_label')} {source}\n"
             text += f"{translate('task_target_label')} {target}\n"
             text += f"{translate('task_users_label')} {user_count}\n"
 
     elif task_type == "mailing":
-        chats = task.get("chats", [])
-        total_sends = task.get("total_sends", 0)
-        sent = task.get("sent", 0)
+        chats = task_data.get("chats", [])
+        total_sends = task_data.get("total_sends", 0)
+        sent = task_data.get("sent", 0)
         text += f"{translate('task_chats_label')} {len(chats)}\n"
         text += f"{translate('task_sent_label')} {sent}/{total_sends}\n"
 
@@ -4742,7 +4811,7 @@ async def show_task_details(
         text += f"{translate('task_current_status_label')} {progress_text}"
 
     keyboard = []
-    can_control = for_admin or task.get("user_id") == user_id
+    can_control = for_admin or task.user_id == user_id
 
     if status == "running" and can_control:
         keyboard.append(
@@ -4785,7 +4854,7 @@ async def show_task_details(
         status in ["completed", "cancelled", "failed"]
         and not Config.AUTO_LEAVE_AFTER_INVITE
     ):
-        joined_chats = task.get("joined_chats") or []
+        joined_chats = task_data.get("joined_chats") if task_data else []
         if joined_chats:
             keyboard.append(
                 [
@@ -4807,7 +4876,7 @@ async def show_task_details(
 
     # Для администратора - информация о пользователе
     if for_admin:
-        task_user_id = task.get("user_id")
+        task_user_id = task.user_id
         keyboard.append(
             [
                 {
@@ -4833,10 +4902,10 @@ async def show_task_details(
 
 
 @router.callback_query(F.data == "my_tasks")
-async def cmd_my_tasks(event: CallbackQuery):
+async def cmd_my_tasks(event: CallbackQuery) -> None:
     user_id = event.from_user.id
     tasks = await tasks_storage.read_all()
-    user_tasks = [t for t in tasks if t.get("user_id") == user_id]
+    user_tasks = [t for t in tasks if t.user_id == user_id]
 
     if not user_tasks:
         text = translate(lang, "no_tasks")
@@ -4862,26 +4931,26 @@ async def cmd_my_tasks(event: CallbackQuery):
 
     # Разделяем задачи на активные и неактивные
     active_tasks = [
-        t for t in user_tasks if t.get("status") in ["pending", "running", "paused"]
+        t for t in user_tasks if t.status in ["pending", "running", "paused"]
     ]
     inactive_tasks = [
         t
         for t in user_tasks
-        if t.get("status") not in ["pending", "running", "paused", "cancelled"]
+        if t.status not in ["pending", "running", "paused", "cancelled"]
     ]
 
     # Сначала показываем активные задачи
     if active_tasks:
         for task in active_tasks[-5:]:  # Последние 5 активных задач
-            text, keyboard = await show_task_details(
+            text, task_keyboard = await show_task_details(
                 bot, user_id, task, for_admin=False
             )
             await smart_answer(
-                event, bot, text, reply_markup=keyboard, delete_origin=True
+                event, bot, text, reply_markup=task_keyboard, delete_origin=True
             )
     else:
         text = translate(lang, "no_active_tasks")
-        keyboard = [
+        keyboard_rows: List[List[Dict[str, str]]] = [
             [
                 {
                     "text": translate(lang, "buttons.start_scraping"),
@@ -4897,16 +4966,16 @@ async def cmd_my_tasks(event: CallbackQuery):
             [{"text": translate(lang, "buttons.main"), "callback_data": "start"}],
         ]
         await smart_answer(
-            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+            event, bot, text, reply_markup=kb(keyboard_rows), delete_origin=True
         )
 
     # Показываем неактивные задачи списком (если есть)
     if inactive_tasks:
         task_lines = []
         for i, task in enumerate(inactive_tasks[-10:], 1):
-            task_id = task.get("task_id", "unknown")
-            task_type = task.get("type", "unknown")
-            status = task.get("status", "unknown")
+            task_id = task.task_id or "unknown"
+            task_type = task.type or "unknown"
+            status = task.status or "unknown"
 
             status_icons = {
                 "completed": "✅",
@@ -4939,7 +5008,7 @@ async def cmd_my_tasks(event: CallbackQuery):
 
 
 @router.callback_query(F.data == "task_list")
-async def cmd_task_list(event: CallbackQuery):
+async def cmd_task_list(event: CallbackQuery) -> None:
     user_id = event.from_user.id
     if user_id not in Config.ADMIN_USER_IDS:
         await smart_answer(
@@ -4951,28 +5020,30 @@ async def cmd_task_list(event: CallbackQuery):
         return
 
     tasks = await tasks_storage.read_all()
-    active_tasks = [
-        t for t in tasks if t.get("status") in ["pending", "running", "paused"]
-    ]
+    active_tasks = [t for t in tasks if t.status in ["pending", "running", "paused"]]
 
     if not active_tasks:
         text = translate(lang, "no_tasks_list")
-        keyboard = [
+        keyboard_rows: List[List[Dict[str, str]]] = [
             [{"text": translate(lang, "buttons.main"), "callback_data": "start"}]
         ]
         await smart_answer(
-            event, bot, text, reply_markup=kb(keyboard), delete_origin=True
+            event, bot, text, reply_markup=kb(keyboard_rows), delete_origin=True
         )
         return
 
     # Показываем каждую активную задачу в отдельном сообщении
     for task in active_tasks[-10:]:  # Последние 10 активных задач
-        text, keyboard = await show_task_details(bot, user_id, task, for_admin=True)
-        await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
+        text, task_keyboard = await show_task_details(
+            bot, user_id, task, for_admin=True
+        )
+        await smart_answer(
+            event, bot, text, reply_markup=task_keyboard, delete_origin=True
+        )
 
 
 @router.callback_query(F.data.startswith("refresh_task:"))
-async def refresh_task(event: CallbackQuery):
+async def refresh_task(event: CallbackQuery) -> None:
     task_id = event.data.split(":", 1)[1]
     task = await tasks_storage.find_by_id(task_id, id_field="task_id")
 
@@ -4985,12 +5056,14 @@ async def refresh_task(event: CallbackQuery):
     user_id = event.from_user.id
     for_admin = user_id in Config.ADMIN_USER_IDS
 
-    text, keyboard = await show_task_details(bot, user_id, task, for_admin=for_admin)
-    await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
+    text, task_keyboard = await show_task_details(
+        bot, user_id, task, for_admin=for_admin
+    )
+    await smart_answer(event, bot, text, reply_markup=task_keyboard, delete_origin=True)
 
 
 @router.callback_query(F.data.startswith("pause_task:"))
-async def process_pause_task(event: CallbackQuery):
+async def process_pause_task(event: CallbackQuery) -> None:
     task_id = event.data.split(":", 1)[1]
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
@@ -5000,7 +5073,7 @@ async def process_pause_task(event: CallbackQuery):
         return
 
     user_id = event.from_user.id
-    task_user_id = task_data.get("user_id")
+    task_user_id = task_data.user_id
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
         await smart_answer(
             event, bot, translate(lang, "pause_no_rights"), show_alert=True
@@ -5013,14 +5086,15 @@ async def process_pause_task(event: CallbackQuery):
     )
 
     updated_task = await tasks_storage.find_by_id(task_id, id_field="task_id")
-    text, keyboard = await show_task_details(
-        bot, user_id, updated_task, for_admin=(user_id in Config.ADMIN_USER_IDS)
-    )
-    await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
+    if updated_task:
+        text, task_kb = await show_task_details(
+            bot, user_id, updated_task, for_admin=(user_id in Config.ADMIN_USER_IDS)
+        )
+        await smart_answer(event, bot, text, reply_markup=task_kb, delete_origin=True)
 
 
 @router.callback_query(F.data.startswith("resume_task:"))
-async def process_resume_task(event: CallbackQuery):
+async def process_resume_task(event: CallbackQuery) -> None:
     task_id = event.data.split(":", 1)[1]
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
@@ -5030,7 +5104,7 @@ async def process_resume_task(event: CallbackQuery):
         return
 
     user_id = event.from_user.id
-    task_user_id = task_data.get("user_id")
+    task_user_id = task_data.user_id
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
         await smart_answer(
             event, bot, translate(lang, "resume_no_rights"), show_alert=True
@@ -5046,14 +5120,15 @@ async def process_resume_task(event: CallbackQuery):
     )
 
     updated_task = await tasks_storage.find_by_id(task_id, id_field="task_id")
-    text, keyboard = await show_task_details(
-        bot, user_id, updated_task, for_admin=(user_id in Config.ADMIN_USER_IDS)
-    )
-    await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
+    if updated_task:
+        text, task_kb = await show_task_details(
+            bot, user_id, updated_task, for_admin=(user_id in Config.ADMIN_USER_IDS)
+        )
+        await smart_answer(event, bot, text, reply_markup=task_kb, delete_origin=True)
 
 
 @router.callback_query(F.data.startswith("cancel_task_id:"))
-async def process_cancel_task(event: CallbackQuery):
+async def process_cancel_task(event: CallbackQuery) -> None:
     task_id = event.data.split(":", 1)[1]
 
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
@@ -5064,7 +5139,7 @@ async def process_cancel_task(event: CallbackQuery):
         return
 
     user_id = event.from_user.id
-    task_user_id = task_data.get("user_id")
+    task_user_id = task_data.user_id
 
     # Проверяем права
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
@@ -5115,15 +5190,16 @@ async def process_cancel_task(event: CallbackQuery):
     )
 
     # Обновляем отображение задачи
-    task_data["status"] = "cancelled"
-    text, keyboard = await show_task_details(
-        bot, user_id, task_data, for_admin=(user_id in Config.ADMIN_USER_IDS)
-    )
-    await smart_answer(event, bot, text, reply_markup=keyboard, delete_origin=True)
+    updated_task = await tasks_storage.find_by_id(task_id, id_field="task_id")
+    if updated_task:
+        text, task_kb = await show_task_details(
+            bot, user_id, updated_task, for_admin=(user_id in Config.ADMIN_USER_IDS)
+        )
+        await smart_answer(event, bot, text, reply_markup=task_kb, delete_origin=True)
 
 
 @router.callback_query(F.data.startswith("leave_chats:"))
-async def process_leave_chats(event: CallbackQuery):
+async def process_leave_chats(event: CallbackQuery) -> None:
     task_id = event.data.split(":", 1)[1]
     task_data = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task_data:
@@ -5133,19 +5209,20 @@ async def process_leave_chats(event: CallbackQuery):
         return
 
     user_id = event.from_user.id
-    task_user_id = task_data.get("user_id")
+    task_user_id = task_data.user_id
     if user_id not in Config.ADMIN_USER_IDS and user_id != task_user_id:
         await smart_answer(event, bot, translate(lang, "no_rights"), show_alert=True)
         return
 
-    joined_chats = task_data.get("joined_chats") or []
+    task_data_dict = task_data.data or {}
+    joined_chats = task_data_dict.get("joined_chats") or []
     if not joined_chats:
         await smart_answer(
             event, bot, translate(lang, "leave_nothing"), show_alert=True
         )
         return
 
-    sender_session = task_data.get("sender_session")
+    sender_session = task_data_dict.get("sender_session")
     if not sender_session:
         await smart_answer(
             event,
@@ -5159,7 +5236,7 @@ async def process_leave_chats(event: CallbackQuery):
     errors = []
     try:
         async with account_pool.acquire_specific_account(sender_session) as account:
-            client = account["client"]
+            client = account.client
             for chat in joined_chats:
                 try:
                     await ensure_leave_target(client, chat)
@@ -5195,19 +5272,19 @@ async def process_leave_chats(event: CallbackQuery):
 
 
 @router.callback_query(F.data == "task_stats")
-async def cmd_task_stats(event: CallbackQuery):
+async def cmd_task_stats(event: CallbackQuery) -> None:
     tasks = await tasks_storage.read_all()
 
     total = len(tasks)
-    pending = len([t for t in tasks if t.get("status") == "pending"])
-    running = len([t for t in tasks if t.get("status") == "running"])
-    paused = len([t for t in tasks if t.get("status") == "paused"])
-    completed = len([t for t in tasks if t.get("status") == "completed"])
-    cancelled = len([t for t in tasks if t.get("status") == "cancelled"])
-    failed = len([t for t in tasks if t.get("status") == "failed"])
+    pending = len([t for t in tasks if t.status == "pending"])
+    running = len([t for t in tasks if t.status == "running"])
+    paused = len([t for t in tasks if t.status == "paused"])
+    completed = len([t for t in tasks if t.status == "completed"])
+    cancelled = len([t for t in tasks if t.status == "cancelled"])
+    failed = len([t for t in tasks if t.status == "failed"])
 
-    scraping = len([t for t in tasks if t.get("type") == "scraping"])
-    mailing = len([t for t in tasks if t.get("type") == "mailing"])
+    scraping = len([t for t in tasks if t.type == "scraping"])
+    mailing = len([t for t in tasks if t.type == "mailing"])
 
     stats = translate(
         "task_stats",
@@ -5230,7 +5307,7 @@ async def cmd_task_stats(event: CallbackQuery):
 
 
 @router.callback_query(F.data == "clear_cache")
-async def cmd_clear_cache(event: CallbackQuery, state: FSMContext):
+async def cmd_clear_cache(event: CallbackQuery, state: FSMContext) -> None:
     user_id = event.from_user.id
     if user_id not in Config.ADMIN_USER_IDS:
         await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
@@ -5250,7 +5327,7 @@ async def cmd_clear_cache(event: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "clear_cache_confirm")
-async def process_clear_cache_confirm(event: CallbackQuery):
+async def process_clear_cache_confirm(event: CallbackQuery) -> None:
     cleared = await cache_manager.clear_cache()
     text = translate(lang, "cache_cleared", count=cleared)
     keyboard = [[{"text": translate(lang, "buttons.main"), "callback_data": "start"}]]
@@ -5259,7 +5336,7 @@ async def process_clear_cache_confirm(event: CallbackQuery):
 
 # === Отменить все задачи ===
 @router.callback_query(F.data == "cancel_all_tasks")
-async def cmd_cancel_all_tasks(event: CallbackQuery):
+async def cmd_cancel_all_tasks(event: CallbackQuery) -> None:
     if event.from_user.id not in Config.ADMIN_USER_IDS:
         await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
@@ -5278,7 +5355,7 @@ async def cmd_cancel_all_tasks(event: CallbackQuery):
 
 
 @router.callback_query(F.data == "cancel_all_tasks_confirm")
-async def process_cancel_all_tasks(event: CallbackQuery):
+async def process_cancel_all_tasks(event: CallbackQuery) -> None:
     if event.from_user.id not in Config.ADMIN_USER_IDS:
         await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
@@ -5298,7 +5375,7 @@ async def process_cancel_all_tasks(event: CallbackQuery):
 
 # === Добавить чаты в БД ===
 @router.callback_query(F.data == "add_chats_to_db")
-async def cmd_add_chats_to_db(event: CallbackQuery, state: FSMContext):
+async def cmd_add_chats_to_db(event: CallbackQuery, state: FSMContext) -> None:
     if not account_pool.accounts:
         text = translate(lang, "no_available_accounts_btn")
         keyboard = [
@@ -5322,12 +5399,12 @@ async def cmd_add_chats_to_db(event: CallbackQuery, state: FSMContext):
 
 
 @router.message(AddChatsStates.waiting_links, ~F.document)
-async def process_add_chats_links(message: Message, state: FSMContext):
+async def process_add_chats_links(message: Message, state: FSMContext) -> None:
     await _process_chats_input(message, state, source="message")
 
 
 @router.message(AddChatsStates.waiting_links, F.document)
-async def process_add_chats_file(message: Message, state: FSMContext):
+async def process_add_chats_file(message: Message, state: FSMContext) -> None:
     await _process_chats_input(message, state, source="file")
 
 
@@ -5371,8 +5448,25 @@ async def _process_chats_input(
             return
         try:
             file_info = await bot.get_file(event.document.file_id)
-            file_bytes = await bot.download_file(file_info.file_path)
+            file_path = file_info.file_path
+            if not file_path:
+                await smart_answer(
+                    event,
+                    bot,
+                    translate(user_lang, "invalid_format"),
+                    delete_origin=False,
+                )
+                return
+            file_bytes = await bot.download_file(file_path)
             raw_bytes = file_bytes.read() if hasattr(file_bytes, "read") else file_bytes
+            if not raw_bytes:
+                await smart_answer(
+                    event,
+                    bot,
+                    translate(user_lang, "invalid_format"),
+                    delete_origin=False,
+                )
+                return
             content = None
             for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
                 try:
@@ -5442,18 +5536,16 @@ async def _process_chats_input(
     # Получаем аккаунт
     acc = account_pool.accounts[0]
     for a in account_pool.accounts:
-        if not a["in_use"] and a["is_valid"]:
+        if not a.in_use and a.is_valid:
             acc = a
             break
 
-    if not acc["client"] or not acc["client"].is_connected():
+    if not acc.client or not acc.client.is_connected():
         try:
-            acc["client"] = await account_pool._create_client(acc["session_string"])
-            await acc["client"].get_me()
+            acc.client = await account_pool._create_client(acc.session_string)
+            await acc.client.get_me()
         except Exception as e:
-            logger.error(
-                f"Не удалось подключиться к аккаунту {acc['session_file']}: {e}"
-            )
+            logger.error(f"Не удалось подключиться к аккаунту {acc.session_file}: {e}")
             await smart_answer(
                 event,
                 bot,
@@ -5462,7 +5554,7 @@ async def _process_chats_input(
             )
             return
 
-    client = acc["client"]
+    client = acc.client
     added = 0
     errors = 0
     results_text: List[str] = []
@@ -5485,15 +5577,16 @@ async def _process_chats_input(
                 results_text.append(
                     translate(
                         "chat_added_result",
-                        chat_name=result["chat_name"],
-                        user_count=result["user_count"],
+                        chat_name=result.chat_name,
+                        user_count=result.user_count,
                     )
                 )
             else:
                 errors += 1
                 results_text.append(f"❌ {link} — не прошёл проверку")
         except FloodWaitError as e:
-            wait_time = getattr(e, "seconds", None) or getattr(e, "wait_time", 60)
+            _fw_seconds: Optional[int] = getattr(e, "seconds", None)
+            wait_time: float = float(_fw_seconds) if _fw_seconds else 60.0
             logger.warning(f"Flood wait при обработке {link}: {wait_time} сек")
             await asyncio.sleep(wait_time)
             try:
@@ -5507,8 +5600,8 @@ async def _process_chats_input(
                     results_text.append(
                         translate(
                             "chat_added_result",
-                            chat_name=result["chat_name"],
-                            user_count=result["user_count"],
+                            chat_name=result.chat_name,
+                            user_count=result.user_count,
                         )
                     )
                 else:
@@ -5560,7 +5653,7 @@ async def _process_chats_input(
 
 # === Обновить БД чатов ===
 @router.callback_query(F.data == "update_chats_db")
-async def cmd_update_chats_db(event: CallbackQuery):
+async def cmd_update_chats_db(event: CallbackQuery) -> None:
     if event.from_user.id not in Config.ADMIN_USER_IDS:
         await smart_answer(event, bot, translate(lang, "only_admin"), show_alert=True)
         return
@@ -5589,23 +5682,23 @@ async def cmd_update_chats_db(event: CallbackQuery):
     asyncio.create_task(_run_update_chats_db(msg, event.from_user.id))
 
 
-async def _run_update_chats_db(msg: Any, user_id: int):
+async def _run_update_chats_db(msg: Any, user_id: int) -> None:
     """Фоновая проверка всех чатов в БД"""
     if not account_pool.accounts:
         return
 
     acc = None
     for a in account_pool.accounts:
-        if not a["in_use"] and a["is_valid"]:
+        if not a.in_use and a.is_valid:
             acc = a
             break
     if not acc:
         return
 
-    client = acc["client"]
+    client = acc.client
     if not client or not client.is_connected():
         try:
-            client = await account_pool._create_client(acc["session_string"])
+            client = await account_pool._create_client(acc.session_string)
         except Exception:
             return
 
@@ -5615,11 +5708,11 @@ async def _run_update_chats_db(msg: Any, user_id: int):
 
     text = translate(
         "update_db_done",
-        checked=result["checked"],
+        checked=result.checked,
         added=0,
-        removed=result["removed"],
-        updated=result.get("updated", 0),
-        errors=result["errors"],
+        removed=result.removed,
+        updated=result.updated or 0,
+        errors=result.errors,
     )
     text += (
         f"\n\n{translate('current_stats', chats=len(chats), total_users=total_users)}"
@@ -5636,7 +5729,7 @@ async def _run_update_chats_db(msg: Any, user_id: int):
 
 # === Режим червя ===
 @router.callback_query(F.data == "worm_mode")
-async def cmd_worm_mode(event: CallbackQuery, state: FSMContext):
+async def cmd_worm_mode(event: CallbackQuery, state: FSMContext) -> None:
     if not account_pool.accounts:
         text = translate(lang, "no_available_accounts_btn")
         keyboard = [
@@ -5660,7 +5753,7 @@ async def cmd_worm_mode(event: CallbackQuery, state: FSMContext):
 
 
 @router.callback_query(F.data == "stop_worm")
-async def cmd_stop_worm(event: CallbackQuery):
+async def cmd_stop_worm(event: CallbackQuery) -> None:
     global _worm_active, _worm_task
 
     if not _worm_active:
@@ -5690,10 +5783,10 @@ async def cmd_stop_worm(event: CallbackQuery):
         try:
             async with account_pool.lock:
                 for acc in account_pool.accounts:
-                    if acc.get("client") and acc["client"].is_connected():
+                    if acc.client and acc.client.is_connected():
                         for src in list(sources_to_leave):
                             try:
-                                await ensure_leave_target(acc["client"], src)
+                                await ensure_leave_target(acc.client, src)
                             except Exception:
                                 pass
                         break
@@ -5701,14 +5794,10 @@ async def cmd_stop_worm(event: CallbackQuery):
             pass
 
     # Считаем общую статистику
-    total_messages = sum(
-        s.get("messages", 0) for s in stats.values() if isinstance(s, dict)
-    )
-    total_links = sum(s.get("links", 0) for s in stats.values() if isinstance(s, dict))
-    total_added = sum(s.get("added", 0) for s in stats.values() if isinstance(s, dict))
-    total_errors = sum(
-        s.get("errors", 0) for s in stats.values() if isinstance(s, dict)
-    )
+    total_messages = sum(s.messages for s in stats.values())
+    total_links = sum(s.links for s in stats.values())
+    total_added = sum(s.added for s in stats.values())
+    total_errors = sum(s.errors for s in stats.values())
 
     text = translate(
         "worm_stopped",
@@ -5725,7 +5814,7 @@ async def cmd_stop_worm(event: CallbackQuery):
 
 
 @router.message(WormModeStates.waiting_sources)
-async def process_worm_sources(message: Message, state: FSMContext):
+async def process_worm_sources(message: Message, state: FSMContext) -> None:
     global _worm_active, _worm_task, _worm_chat_id, _worm_stats
 
     if _worm_active:
@@ -5737,7 +5826,6 @@ async def process_worm_sources(message: Message, state: FSMContext):
         )
         return
 
-    # Парсим несколько источников (каждый с новой строки или разделённый пробелами)
     raw_sources = message.text.strip()
     if not raw_sources:
         await smart_answer(
@@ -5745,10 +5833,8 @@ async def process_worm_sources(message: Message, state: FSMContext):
         )
         return
 
-    # Разбиваем по строкам, запятым, пробелам
     raw_list = re.split(r"[\s,;\n]+", raw_sources)
 
-    # Парсим каждый источник
     sources: List[str] = []
     for raw in raw_list:
         raw = raw.strip()
@@ -5766,7 +5852,6 @@ async def process_worm_sources(message: Message, state: FSMContext):
         )
         return
 
-    # Ограничиваем количество источников
     if len(sources) > Config.WORM_MAX_CONCURRENT:
         await smart_answer(
             message,
@@ -5776,10 +5861,9 @@ async def process_worm_sources(message: Message, state: FSMContext):
         )
         sources = sources[: Config.WORM_MAX_CONCURRENT]
 
-    # Проверяем аккаунт
-    acc = None
+    acc: Optional[Account] = None
     for a in account_pool.accounts:
-        if not a["in_use"] and a["is_valid"]:
+        if not a.in_use and a.is_valid:
             acc = a
             break
     if not acc:
@@ -5788,12 +5872,12 @@ async def process_worm_sources(message: Message, state: FSMContext):
         )
         return
 
-    client = acc["client"]
+    client = acc.client
     if not client or not client.is_connected():
         try:
-            acc["client"] = await account_pool._create_client(acc["session_string"])
-            await acc["client"].get_me()
-            client = acc["client"]
+            acc.client = await account_pool._create_client(acc.session_string)
+            await acc.client.get_me()
+            client = acc.client
         except Exception as e:
             logger.error(f"Не удалось подключиться к аккаунту: {e}")
             await smart_answer(
@@ -5804,14 +5888,11 @@ async def process_worm_sources(message: Message, state: FSMContext):
             )
             return
 
-    # Запускаем червя
     _worm_active = True
     _worm_chat_id = ", ".join(sources[:3]) + ("..." if len(sources) > 3 else "")
     _worm_sources = list(sources)
     async with _worm_lock:
-        _worm_stats = {
-            s: {"messages": 0, "links": 0, "added": 0, "errors": 0} for s in sources
-        }
+        _worm_stats = {s: WormSourceStats() for s in sources}
 
     text = translate(
         "worm_started_multi", chats=len(sources), sources=", ".join(sources[:3])
@@ -5826,7 +5907,6 @@ async def process_worm_sources(message: Message, state: FSMContext):
 
     await state.clear()
 
-    # Запускаем фоновую задачу
     _worm_task = asyncio.create_task(
         _run_worm_mode(client, acc, sources, message.from_user.id)
     )
@@ -5838,32 +5918,19 @@ async def _run_worm_mode(
     sources: List[str],
     user_id: int,
 ):
-    """
-    Основная логика режима червя.
-    sources: список чатов/каналов для сканирования.
-    Работает по кругу:
-      1. Сканирует сообщения в чате
-      2. Находит ссылки → валидирует
-      3. Валидатор сам записывает в БД
-      4. После полной проверки чата — кидает «копии» в новые валидные чаты
-      5. Повторяет по кругу пока не остановлен или нет новых ссылок
-    """
+    """Основная логика режима червя."""
     global _worm_active, _worm_stats
 
-    # Инициализация статистики для каждого источника
     for source in sources:
-        _worm_stats[source] = {"messages": 0, "links": 0, "added": 0, "errors": 0}
+        _worm_stats[source] = WormSourceStats()
 
     logger.info(f"🐛 Червь запущен в {len(sources)} чатах: {sources}")
 
     processed_count = 0
-    new_valid_chats: List[Dict[str, Any]] = []  # Новые валидные чаты для копий
+    new_valid_chats: List[ValidatedChat] = []
 
     while _worm_active:
-        all_valid_empty = True  # Флаг: есть ли новые валидные чаты
-
         try:
-            # Проходим по всем источникам
             for source in sources:
                 if not _worm_active:
                     break
@@ -5874,7 +5941,6 @@ async def _run_worm_mode(
                     logger.warning(f"Не удалось получить источник {source}: {e}")
                     continue
 
-                # Сканируем сообщения (лимит из .env)
                 try:
                     msg_count = 0
                     async for message in client.iter_messages(
@@ -5889,10 +5955,9 @@ async def _run_worm_mode(
                                 continue
 
                             async with _worm_lock:
-                                _worm_stats[source]["messages"] += 1
+                                _worm_stats[source].messages += 1
                                 processed_count += 1
 
-                            # Проверка статуса каждые N сообщений
                             if processed_count % Config.WORM_CHECK_INTERVAL == 0:
                                 logger.info(
                                     f"🐛 Червь в {source}: {_worm_stats[source]}"
@@ -5903,9 +5968,8 @@ async def _run_worm_mode(
                                 continue
 
                             async with _worm_lock:
-                                _worm_stats[source]["links"] += len(links)
+                                _worm_stats[source].links += len(links)
 
-                            # Валидируем каждую ссылку
                             for link in links:
                                 if not _worm_active:
                                     break
@@ -5922,14 +5986,13 @@ async def _run_worm_mode(
                                     )
                                     if result:
                                         async with _worm_lock:
-                                            _worm_stats[source]["added"] += 1
+                                            _worm_stats[source].added += 1
                                         new_valid_chats.append(result)
                                 except Exception as e:
                                     async with _worm_lock:
-                                        _worm_stats[source]["errors"] += 1
+                                        _worm_stats[source].errors += 1
                                     logger.error(f"Ошибка обработки ссылки {link}: {e}")
 
-                                # Анти-флуд
                                 await asyncio.sleep(
                                     Config.rand("WORM_MIN_DELAY", "WORM_MAX_DELAY")
                                 )
@@ -5952,7 +6015,6 @@ async def _run_worm_mode(
                         )
                     )
 
-            # После полной проверки всех источников — кидаем «копии» в новые чаты
             if new_valid_chats:
                 logger.info(
                     f"🐛 Червь: {len(new_valid_chats)} новых валидных чатов для копий"
@@ -5960,38 +6022,38 @@ async def _run_worm_mode(
                 for new_chat in new_valid_chats:
                     if not _worm_active:
                         break
-                    joined_entity = None
+                    joined_entity: Optional[_EntityType] = None
                     try:
                         joined_entity = await ensure_join_target(
-                            client, new_chat["chat_url"], account
+                            client, new_chat.chat_url, account
                         )
                     except Exception as join_err:
                         logger.warning(
-                            f"🐛 Worm join failed for {new_chat['chat_name']}: {join_err}"
+                            f"🐛 Worm join failed for {new_chat.chat_name}: {join_err}"
                         )
 
                     try:
-                        new_entity = await client.get_entity(new_chat["chat_url"])
+                        new_entity = await client.get_entity(new_chat.chat_url)
                         if joined_entity:
                             new_entity = joined_entity
                         await client.send_message(
                             new_entity, "🐛 Message from Inviter Bot Worm Mode"
                         )
-                        logger.info(f"🐛 Копия отправлена в {new_chat['chat_name']}")
+                        logger.info(f"🐛 Копия отправлена в {new_chat.chat_name}")
                         await asyncio.sleep(
                             Config.rand("WORM_MIN_DELAY", "WORM_MAX_DELAY")
                         )
                     except Exception as e:
                         logger.error(
-                            f"Ошибка отправки копии в {new_chat['chat_name']}: {e}"
+                            f"Ошибка отправки копии в {new_chat.chat_name}: {e}"
                         )
                     finally:
                         if joined_entity is not None:
                             try:
-                                await ensure_leave_target(client, new_chat["chat_url"])
+                                await ensure_leave_target(client, new_chat.chat_url)
                             except Exception as leave_err:
                                 logger.warning(
-                                    f"🐛 Worm leave failed for {new_chat['chat_name']}: {leave_err}"
+                                    f"🐛 Worm leave failed for {new_chat.chat_name}: {leave_err}"
                                 )
 
                 new_valid_chats.clear()
@@ -6002,7 +6064,6 @@ async def _run_worm_mode(
                 Config.rand("WORM_TOP_ERROR_DELAY_MIN", "WORM_TOP_ERROR_DELAY_MAX")
             )
 
-    # Финальная статистика
     logger.info(f"🐛 Червь остановлен. Итоговая статистика: {_worm_stats}")
     async with _worm_lock:
         _worm_chat_id = None
@@ -6015,11 +6076,8 @@ async def ensure_join_target(
     account: Dict[str, Any],
     task_id: Optional[str] = None,
     user_id: Optional[int] = None,
-):
-    """
-    Бот заходит в целевой чат/канал.
-    task_id/user_id опциональны: если переданы — обновляет задачу и уведомляет.
-    """
+) -> Optional[_EntityType]:
+    """Бот заходит в целевой чат/канал."""
     try:
         if target.startswith("https://t.me/+"):
             invite_hash = target.split("+", 1)[1]
@@ -6032,16 +6090,18 @@ async def ensure_join_target(
                 if "USER_ALREADY_PARTICIPANT" not in str(join_err).upper():
                     raise
         entity = await client.get_entity(target)
-        logger.info(f"Account {account['session_file']} joined {target}")
+        logger.info(f"Account {account.session_file} joined {target}")
         if task_id is not None and user_id is not None:
             try:
                 task = await tasks_storage.find_by_id(task_id, id_field="task_id")
                 if task is not None:
-                    joined = task.get("joined_chats", [])
+                    joined = task.data.get("joined_chats", [])
                     if target not in joined:
                         joined.append(target)
                         await tasks_storage.update_by_id(
-                            task_id, {"joined_chats": joined}, id_field="task_id"
+                            task_id,
+                            {"data": {"joined_chats": joined}},
+                            id_field="task_id",
                         )
             except Exception as upd_err:
                 logger.warning(
@@ -6055,14 +6115,12 @@ async def ensure_join_target(
                 task_id,
                 {
                     "status": "failed",
-                    "error": translate(lang, "join_error", target=target, error=str(e)),
+                    "error": f"Join error: {e}",
                     "completed_at": datetime.now().isoformat(),
                 },
                 id_field="task_id",
             )
-            await notify_user(
-                bot, user_id, translate(lang, "no_users_found", source=target)
-            )
+            await notify_user(bot, user_id, f"No users found from source: {target}")
         return None
 
 
@@ -6072,11 +6130,8 @@ async def ensure_join_source(
     account: Dict[str, Any],
     task_id: Optional[str] = None,
     user_id: Optional[int] = None,
-):
-    """
-    Бот заходит в исходный чат/канал для сканирования (приватные/закрытые).
-    Если вход не требуется — возвращает сущность.
-    """
+) -> Optional[_EntityType]:
+    """Бот заходит в исходный чат/канал для сканирования."""
     try:
         if source.startswith("https://t.me/+"):
             invite_hash = source.split("+", 1)[1]
@@ -6089,14 +6144,14 @@ async def ensure_join_source(
                 if "USER_ALREADY_PARTICIPANT" not in str(join_err).upper():
                     raise
         entity = await client.get_entity(source)
-        logger.info(f"Account {account['session_file']} joined source {source}")
+        logger.info(f"Account {account.session_file} joined source {source}")
         return entity
     except Exception as e:
         logger.warning(f"Failed to join source {source}: {e}")
         return None
 
 
-async def ensure_leave_target(client: TelegramClient, target: str):
+async def ensure_leave_target(client: TelegramClient, target: str) -> None:
     """
     Выход из чата/канала.
     """
@@ -6118,11 +6173,11 @@ async def ensure_leave_target(client: TelegramClient, target: str):
         logger.warning(f"Failed to leave target {target}: {e}")
 
 
-async def leave_all_joined_chats(task_id: str, client: TelegramClient):
+async def leave_all_joined_chats(task_id: str, client: TelegramClient) -> None:
     task = await tasks_storage.find_by_id(task_id, id_field="task_id")
     if not task:
         return
-    joined = task.get("joined_chats") or []
+    joined = (task.data or {}).get("joined_chats") or []
     if not joined:
         return
     for chat in list(joined):
@@ -6237,17 +6292,16 @@ async def invite_users(
     task_id: str,
     user_id: int,
     source: Optional[str] = None,
-) -> Tuple[Dict[str, int], List[int]]:
+) -> Tuple[InviteResult, List[int]]:
     logger.info(f"Inviting {len(user_ids)} users to {target_entity}")
-    results = {"success": 0, "failed": 0, "privacy_errors": 0, "already_members": 0}
+    results = InviteResult()
     remaining_users: List[int] = []
     total_users = len(user_ids)
     processed = 0
-    invite_buffer = []
-    buffer_size = 10  # Буферизация инвайтов
+    invite_buffer: List[int] = []
+    buffer_size = 10
 
-    # Защита от детекта: 5% шанс пропустить пользователя (имитация ошибки)
-    def should_skip_user():
+    def should_skip_user() -> bool:
         return random.random() < 0.05
 
     try:
@@ -6282,17 +6336,15 @@ async def invite_users(
 
             await control.pause_event.wait()
 
-            # Проверка на уже приглашённых
             if (
                 await cache_manager.is_invited(target_entity, current_user_id)
                 or current_user_id in current_participants
             ):
-                results["already_members"] += 1
+                results.already_members += 1
                 processed += 1
                 idx += 1
                 continue
 
-            # Защита от детекта: случайный пропуск
             if should_skip_user():
                 logger.info(
                     f"🎭 Simulating human error - skipping user {current_user_id}"
@@ -6304,30 +6356,25 @@ async def invite_users(
                 )
                 continue
 
-            # Человеческий паттерн между инвайтами
             if processed > 0 and processed % 5 == 0:
                 await account_pool.human_delay()
 
             try:
-                # Используем кэшированные сущности
                 user_entity = await get_cached_entity(client, current_user_id)
                 if not user_entity:
-                    results["failed"] += 1
+                    results.failed += 1
                     processed += 1
                     idx += 1
                     continue
 
-                # Проверка на бота
                 if await account_pool._detect_bot_user(user_entity):
                     logger.info(f"User {current_user_id} is a bot - skipping")
                     processed += 1
                     idx += 1
                     continue
 
-                # Буферизация инвайтов
                 invite_buffer.append(current_user_id)
 
-                # Отправка буфера
                 if len(invite_buffer) >= buffer_size:
                     for uid in invite_buffer:
                         try:
@@ -6348,24 +6395,23 @@ async def invite_users(
                                         )
                                     )
 
-                            results["success"] += 1
+                            results.success += 1
                             current_participants.add(uid)
                             await cache_manager.mark_invited(
                                 target_entity, uid, task_id
                             )
-                            account["invite_count"] = account.get("invite_count", 0) + 1
+                            account.invite_count = account.invite_count + 1
                         except UserPrivacyRestrictedError:
-                            results["privacy_errors"] += 1
+                            results.privacy_errors += 1
                         except (ChatAdminRequiredError, ChannelPrivateError):
-                            results["failed"] += 1
+                            results.failed += 1
                         except UserNotParticipantError:
-                            results["failed"] += 1
+                            results.failed += 1
                         except Exception as e:
-                            results["failed"] += 1
+                            results.failed += 1
                             logger.error(f"Invite error for {uid}: {e}")
 
                     invite_buffer = []
-                    # Задержка после буфера
                     await asyncio.sleep(
                         Config.rand("POST_BUFFER_DELAY_MIN", "POST_BUFFER_DELAY_MAX")
                     )
@@ -6374,11 +6420,11 @@ async def invite_users(
                 idx += 1
 
             except UserPrivacyRestrictedError:
-                results["privacy_errors"] += 1
+                results.privacy_errors += 1
                 processed += 1
                 idx += 1
             except (ChatAdminRequiredError, ChannelPrivateError):
-                results["failed"] += 1
+                results.failed += 1
                 processed += 1
                 idx += 1
             except (FloodWaitError, FloodError) as e:
@@ -6392,9 +6438,9 @@ async def invite_users(
                         "progress_text": format_progress_bar(
                             (processed / max(1, total_users)) * 100
                         ),
-                        "checkpoints": {
+                        "data": {
                             "remaining_users": user_ids[idx:],
-                            "sender_session": account["session_file"],
+                            "sender_session": account.session_file,
                             "target": target_entity,
                             "source": source,
                         },
@@ -6405,9 +6451,7 @@ async def invite_users(
                 await notify_user(
                     bot,
                     user_id,
-                    translate(
-                        lang, "floodwait_pause", task_id=task_id, seconds=wait_seconds
-                    ),
+                    f"Floodwait pause for task {task_id}: {wait_seconds}s",
                 )
                 await asyncio.sleep(wait_seconds + Config.FLOOD_WAIT_PADDING)
                 await tasks_storage.update_by_id(
@@ -6415,20 +6459,18 @@ async def invite_users(
                     {"status": "running", "flood_wait": None},
                     id_field="task_id",
                 )
-                # Повторить текущего пользователя после паузы
                 continue
             except AuthKeyUnregisteredError:
-                account["is_valid"] = False
-                results["failed"] += 1
+                account.is_valid = False
+                results.failed += 1
                 processed += 1
                 idx += 1
             except Exception as e:
-                results["failed"] += 1
+                results.failed += 1
                 processed += 1
                 idx += 1
                 logger.error(f"Invite error for {current_user_id}: {e}")
 
-            # Обновление прогресса
             if processed % 20 == 0 or processed == total_users:
                 progress = (processed / max(1, total_users)) * 100
                 await tasks_storage.update_by_id(
@@ -6441,9 +6483,9 @@ async def invite_users(
                             processed=processed,
                             total=total_users,
                         ),
-                        "checkpoints": {
+                        "data": {
                             "remaining_users": user_ids[idx + 1 :],
-                            "sender_session": account["session_file"],
+                            "sender_session": account.session_file,
                             "target": target_entity,
                             "source": source,
                         },
@@ -6451,7 +6493,6 @@ async def invite_users(
                     id_field="task_id",
                 )
 
-        # Отправка оставшегося буфера
         if invite_buffer:
             for uid in invite_buffer:
                 try:
@@ -6470,12 +6511,12 @@ async def invite_users(
                                 )
                             )
 
-                    results["success"] += 1
+                    results.success += 1
                     current_participants.add(uid)
                     await cache_manager.mark_invited(target_entity, uid, task_id)
-                    account["invite_count"] = account.get("invite_count", 0) + 1
+                    account.invite_count = account.invite_count + 1
                 except Exception as e:
-                    results["failed"] += 1
+                    results.failed += 1
                     logger.error(f"Final buffer invite error for {uid}: {e}")
 
         return results, remaining_users
@@ -6493,7 +6534,7 @@ async def scrape_and_invite_by_user_count_task(
     task_id: str,
     sender_session: Optional[str] = None,
     checkpoint: Optional[Dict[str, Any]] = None,
-):
+) -> None:
     logger.info(
         f"Starting user-count task: {source} -> {target} ({user_count}) via {sender_session or 'auto'}"
     )
@@ -6505,7 +6546,7 @@ async def scrape_and_invite_by_user_count_task(
             "status": "running",
             "progress": 0,
             "progress_text": "0/0",
-            "checkpoints": checkpoint or {},
+            "data": checkpoint or {},
         },
         id_field="task_id",
     )
@@ -6515,23 +6556,25 @@ async def scrape_and_invite_by_user_count_task(
         return
 
     collected_users: List[int] = []
-    client = None
+    client: Optional[TelegramClient] = None
     try:
         async with (
             account_pool.acquire_specific_account(sender_session)
             if sender_session
             else account_pool.acquire_account()
         ) as account:
-            used_session = account.get("session_file")
+            used_session = account.session_file
             try:
                 task = await tasks_storage.find_by_id(task_id, id_field="task_id")
-                if task and not task.get("sender_session"):
+                if task and not task.data.get("sender_session"):
                     await tasks_storage.update_by_id(
-                        task_id, {"sender_session": used_session}, id_field="task_id"
+                        task_id,
+                        {"data": {"sender_session": used_session}},
+                        id_field="task_id",
                     )
             except Exception:
                 pass
-            client = account["client"]
+            client = account.client
             target_entity = await ensure_join_target(
                 client, target, account, task_id, user_id
             )
@@ -6584,16 +6627,16 @@ async def scrape_and_invite_by_user_count_task(
                 )
                 task_queue.remove_user_task(user_id, task_id)
                 await notify_user(
-                    bot, user_id, translate(lang, "no_users_found", source=source)
+                    bot, user_id, f"No active users found in source: {source}"
                 )
                 return
 
             await tasks_storage.update_by_id(
                 task_id,
                 {
-                    "checkpoints": {
+                    "data": {
                         "remaining_users": collected_users,
-                        "sender_session": account["session_file"],
+                        "sender_session": account.session_file,
                         "target": target,
                         "source": source,
                     }
@@ -6604,9 +6647,7 @@ async def scrape_and_invite_by_user_count_task(
             await notify_user(
                 bot,
                 user_id,
-                translate(
-                    "invite_progress", task_id=task_id, count=len(collected_users)
-                ),
+                f"Task {task_id}: collected {len(collected_users)} users to invite",
             )
 
             results, remaining = await invite_users(
@@ -6626,9 +6667,9 @@ async def scrape_and_invite_by_user_count_task(
                     {
                         "status": "cancelled",
                         "completed_at": datetime.now().isoformat(),
-                        "checkpoints": {
+                        "data": {
                             "remaining_users": remaining,
-                            "sender_session": account["session_file"],
+                            "sender_session": account.session_file,
                             "target": target,
                             "source": source,
                         },
@@ -6639,7 +6680,7 @@ async def scrape_and_invite_by_user_count_task(
                 await notify_user(
                     bot,
                     user_id,
-                    translate(lang, "task_cancelled_report", task_id=task_id),
+                    f"Task {task_id} cancelled",
                 )
                 return
 
@@ -6647,27 +6688,29 @@ async def scrape_and_invite_by_user_count_task(
                 task_id,
                 {
                     "status": "completed",
-                    "results": results,
+                    "results": {
+                        "success": results.success,
+                        "failed": results.failed,
+                        "privacy_errors": results.privacy_errors,
+                        "already_members": results.already_members,
+                    },
                     "completed_at": datetime.now().isoformat(),
                     "progress": 100,
                     "progress_text": f"{len(collected_users)} users collected",
-                    "checkpoints": {"remaining_users": []},
+                    "data": {"remaining_users": []},
                 },
                 id_field="task_id",
             )
         task_queue.remove_user_task(user_id, task_id)
 
-        results_data = results or {}
-        text = translate(
-            "task_completed_report",
-            task_id=task_id,
-            source=source,
-            target=target,
-            invited=len(collected_users),
-            success=results_data.get("success", 0),
-            failed=results_data.get("failed", 0),
-            privacy=results_data.get("privacy", 0),
-            account=account["session_file"],
+        text = (
+            f"Task {task_id} completed:\n"
+            f"Source: {source}\nTarget: {target}\n"
+            f"Collected: {len(collected_users)}\n"
+            f"Success: {results.success}\n"
+            f"Failed: {results.failed}\n"
+            f"Privacy errors: {results.privacy_errors}\n"
+            f"Account: {account.session_file}"
         )
         await notify_user(bot, user_id, text)
     except Exception as e:
@@ -6686,7 +6729,7 @@ async def scrape_and_invite_by_user_count_task(
         await notify_user(
             bot,
             user_id,
-            translate(lang, "task_failed_report", task_id=task_id, error=str(e)),
+            f"Task {task_id} failed: {e}",
         )
     finally:
         if client:
@@ -6702,7 +6745,7 @@ async def scrape_and_invite_task(
     task_id: str,
     sender_session: Optional[str] = None,
     checkpoint: Optional[Dict[str, Any]] = None,
-):
+) -> None:
     logger.info(
         f"Starting message-limit task: {source} -> {target} ({message_limit}) via {sender_session or 'auto'}"
     )
@@ -6714,7 +6757,7 @@ async def scrape_and_invite_task(
             "status": "running",
             "progress": 0,
             "progress_text": "0/0",
-            "checkpoints": checkpoint or {},
+            "data": checkpoint or {},
         },
         id_field="task_id",
     )
@@ -6724,23 +6767,25 @@ async def scrape_and_invite_task(
         return
 
     collected_users: List[int] = []
-    client = None
+    client: Optional[TelegramClient] = None
     try:
         async with (
             account_pool.acquire_specific_account(sender_session)
             if sender_session
             else account_pool.acquire_account()
         ) as account:
-            used_session = account.get("session_file")
+            used_session = account.session_file
             try:
                 task = await tasks_storage.find_by_id(task_id, id_field="task_id")
-                if task and not task.get("sender_session"):
+                if task and not task.data.get("sender_session"):
                     await tasks_storage.update_by_id(
-                        task_id, {"sender_session": used_session}, id_field="task_id"
+                        task_id,
+                        {"data": {"sender_session": used_session}},
+                        id_field="task_id",
                     )
             except Exception:
                 pass
-            client = account["client"]
+            client = account.client
             target_entity = await ensure_join_target(
                 client, target, account, task_id, user_id
             )
@@ -6766,7 +6811,7 @@ async def scrape_and_invite_task(
                         control, client, source, message_limit, task_id
                     )
                 except AuthKeyUnregisteredError:
-                    account["is_valid"] = False
+                    account.is_valid = False
                     raise
 
             if control.cancelled:
@@ -6791,16 +6836,16 @@ async def scrape_and_invite_task(
                 )
                 task_queue.remove_user_task(user_id, task_id)
                 await notify_user(
-                    bot, user_id, translate(lang, "no_users_found", source=source)
+                    bot, user_id, f"No active users found in source: {source}"
                 )
                 return
 
             await tasks_storage.update_by_id(
                 task_id,
                 {
-                    "checkpoints": {
+                    "data": {
                         "remaining_users": collected_users,
-                        "sender_session": account["session_file"],
+                        "sender_session": account.session_file,
                         "target": target,
                         "source": source,
                     }
@@ -6811,9 +6856,7 @@ async def scrape_and_invite_task(
             await notify_user(
                 bot,
                 user_id,
-                translate(
-                    "invite_progress", task_id=task_id, count=len(collected_users)
-                ),
+                f"Task {task_id}: collected {len(collected_users)} users to invite",
             )
 
             results, remaining = await invite_users(
@@ -6833,9 +6876,9 @@ async def scrape_and_invite_task(
                     {
                         "status": "cancelled",
                         "completed_at": datetime.now().isoformat(),
-                        "checkpoints": {
+                        "data": {
                             "remaining_users": remaining,
-                            "sender_session": account["session_file"],
+                            "sender_session": account.session_file,
                             "target": target,
                             "source": source,
                         },
@@ -6846,7 +6889,7 @@ async def scrape_and_invite_task(
                 await notify_user(
                     bot,
                     user_id,
-                    translate(lang, "task_cancelled_report", task_id=task_id),
+                    f"Task {task_id} cancelled",
                 )
                 return
 
@@ -6854,27 +6897,29 @@ async def scrape_and_invite_task(
                 task_id,
                 {
                     "status": "completed",
-                    "results": results,
+                    "results": {
+                        "success": results.success,
+                        "failed": results.failed,
+                        "privacy_errors": results.privacy_errors,
+                        "already_members": results.already_members,
+                    },
                     "completed_at": datetime.now().isoformat(),
                     "progress": 100,
                     "progress_text": f"{len(collected_users)} users collected",
-                    "checkpoints": {"remaining_users": []},
+                    "data": {"remaining_users": []},
                 },
                 id_field="task_id",
             )
         task_queue.remove_user_task(user_id, task_id)
 
-        results_data = results or {}
-        text = translate(
-            "task_completed_report",
-            task_id=task_id,
-            source=source,
-            target=target,
-            invited=len(collected_users),
-            success=results_data.get("success", 0),
-            failed=results_data.get("failed", 0),
-            privacy=results_data.get("privacy", 0),
-            account=account["session_file"],
+        text = (
+            f"Task {task_id} completed:\n"
+            f"Source: {source}\nTarget: {target}\n"
+            f"Collected: {len(collected_users)}\n"
+            f"Success: {results.success}\n"
+            f"Failed: {results.failed}\n"
+            f"Privacy errors: {results.privacy_errors}\n"
+            f"Account: {account.session_file}"
         )
         await notify_user(bot, user_id, text)
     except Exception as e:
@@ -6893,7 +6938,7 @@ async def scrape_and_invite_task(
         await notify_user(
             bot,
             user_id,
-            translate(lang, "task_failed_report", task_id=task_id, error=str(e)),
+            f"Task {task_id} failed: {e}",
         )
     finally:
         if client:
@@ -6903,14 +6948,14 @@ async def scrape_and_invite_task(
 async def collect_users_for_mailing(
     client: TelegramClient,
     chats: List[str],
-    account: Optional[Dict[str, Any]] = None,
+    account: Optional[Account] = None,
     task_id: Optional[str] = None,
 ) -> List[int]:
     user_ids: List[int] = []
     seen_user_ids: Set[int] = set()
 
     for chat_ref in chats:
-        joined_entity = None
+        joined_entity: Optional[_EntityType] = None
         try:
             if account is not None:
                 try:
@@ -6986,7 +7031,7 @@ async def bulk_mailing_task(
         return
 
     sent = 0
-    per_chat_sent = {c: 0 for c in chats}
+    per_chat_sent: Dict[str, int] = {c: 0 for c in chats}
     next_chat_idx = 0
     text_index = 0
     consecutive_errors = 0
@@ -7009,8 +7054,7 @@ async def bulk_mailing_task(
             "progress": (sent / max(1, total_sends)) * 100,
             "progress_text": f"{sent}/{total_sends}",
             "sent": sent,
-            "checkpoints": {
-                "sent": sent,
+            "data": {
                 "per_chat_sent": per_chat_sent,
                 "next_chat_idx": next_chat_idx,
                 "text_index": text_index,
@@ -7040,7 +7084,7 @@ async def bulk_mailing_task(
             )
 
             async with account_ctx as account:
-                client = account["client"]
+                client = account.client
                 resolved_targets: List[int] = []
                 if delivery_mode == "users":
                     resolved_targets = await collect_users_for_mailing(
@@ -7060,7 +7104,7 @@ async def bulk_mailing_task(
                         await notify_user(
                             bot,
                             user_id,
-                            translate(lang, "bulkmail_no_users"),
+                            f"No users found in the selected chats",
                         )
                         return
 
@@ -7074,7 +7118,7 @@ async def bulk_mailing_task(
 
                     try:
                         target_key: Optional[str] = None
-                        target_entity: Optional[Any] = None
+                        target_entity: Optional[_EntityType] = None
 
                         if delivery_mode == "users":
                             if not resolved_targets:
@@ -7100,7 +7144,7 @@ async def bulk_mailing_task(
                             chat = chats[next_chat_idx % len(chats)]
                             next_chat_idx += 1
                             target_key = str(chat)
-                            joined_entity = None
+                            joined_entity: Optional[_EntityType] = None
                             try:
                                 joined_entity = await ensure_join_target(
                                     client, str(chat), account
@@ -7179,15 +7223,13 @@ async def bulk_mailing_task(
                                             "progress_text": f"{sent}/{total_sends}",
                                             "sent": sent,
                                             "per_chat_sent": per_chat_sent,
-                                            "checkpoints": {
+                                            "data": {
                                                 "sent": sent,
                                                 "per_chat_sent": per_chat_sent,
                                                 "next_chat_idx": next_chat_idx,
                                                 "text_index": text_index,
                                                 "consecutive_errors": consecutive_errors,
-                                                "sender_session": account[
-                                                    "session_file"
-                                                ],
+                                                "sender_session": account.session_file,
                                                 "used_targets": list(used_targets),
                                             },
                                         },
@@ -7203,7 +7245,7 @@ async def bulk_mailing_task(
                     except (FloodWaitError, FloodError) as e:
                         wait_seconds = getattr(e, "seconds", None) or 60
                         extended_wait = wait_seconds * Config.FLOOD_WAIT_MULTIPLIER
-                        account["flood_wait_until"] = datetime.now() + timedelta(
+                        account.flood_wait_until = datetime.now() + timedelta(
                             seconds=extended_wait
                         )
                         await tasks_storage.update_by_id(
@@ -7213,13 +7255,13 @@ async def bulk_mailing_task(
                                 "flood_wait": wait_seconds,
                                 "progress": (sent / max(1, total_sends)) * 100,
                                 "progress_text": f"{sent}/{total_sends}",
-                                "checkpoints": {
+                                "data": {
                                     "sent": sent,
                                     "per_chat_sent": per_chat_sent,
                                     "next_chat_idx": next_chat_idx,
                                     "text_index": text_index,
                                     "consecutive_errors": consecutive_errors,
-                                    "sender_session": account["session_file"],
+                                    "sender_session": account.session_file,
                                     "used_targets": list(used_targets),
                                 },
                             },
@@ -7228,12 +7270,7 @@ async def bulk_mailing_task(
                         await notify_user(
                             bot,
                             user_id,
-                            translate(
-                                "floodwait_extended_pause",
-                                task_id=task_id,
-                                seconds=wait_seconds,
-                                extended=extended_wait,
-                            ),
+                            f"Floodwait extended pause for task {task_id}: {wait_seconds}s (extended: {extended_wait}s)",
                         )
                         await asyncio.sleep(
                             extended_wait + Config.MAILING_FLOOD_WAIT_PADDING
@@ -7248,7 +7285,7 @@ async def bulk_mailing_task(
                         else:
                             break
                     except AuthKeyUnregisteredError:
-                        account["is_valid"] = False
+                        account.is_valid = False
                         await tasks_storage.update_by_id(
                             task_id,
                             {
@@ -7288,7 +7325,7 @@ async def bulk_mailing_task(
                 {
                     "status": "cancelled",
                     "completed_at": datetime.now().isoformat(),
-                    "checkpoints": {
+                    "data": {
                         "sent": sent,
                         "per_chat_sent": per_chat_sent,
                         "next_chat_idx": next_chat_idx,
@@ -7304,7 +7341,7 @@ async def bulk_mailing_task(
             await notify_user(
                 bot,
                 user_id,
-                translate(lang, "mailing_cancelled_report", task_id=task_id),
+                f"Mailing cancelled for task {task_id}",
             )
             return
 
@@ -7318,7 +7355,7 @@ async def bulk_mailing_task(
                 "progress": 100,
                 "progress_text": f"{sent}/{total_sends}",
                 "sent": sent,
-                "checkpoints": {
+                "data": {
                     "sent": sent,
                     "per_chat_sent": per_chat_sent,
                     "next_chat_idx": next_chat_idx,
@@ -7333,12 +7370,11 @@ async def bulk_mailing_task(
         task_queue.remove_user_task(user_id, task_id)
 
         if delivery_mode == "users":
-            text = translate(
-                "mailing_completed_users_report",
-                task_id=task_id,
-                sent=sent,
-                texts_count=len(message_texts),
-                users_count=len(per_chat_sent),
+            text = (
+                f"Mailing task {task_id} completed:\n"
+                f"Sent: {sent} messages\n"
+                f"Texts used: {len(message_texts)}\n"
+                f"Users targeted: {len(per_chat_sent)}"
             )
         else:
             chat_report_lines = []
@@ -7346,12 +7382,11 @@ async def bulk_mailing_task(
                 chat_report_lines.append(f"  - {c}: {cnt}")
             chats_report = "\n".join(chat_report_lines)
 
-            text = translate(
-                "mailing_completed_report",
-                task_id=task_id,
-                sent=sent,
-                texts_count=len(message_texts),
-                chats_report=chats_report,
+            text = (
+                f"Mailing task {task_id} completed:\n"
+                f"Sent: {sent} messages\n"
+                f"Texts used: {len(message_texts)}\n"
+                f"Per chat:\n{chats_report}"
             )
         await notify_user(bot, user_id, text)
 
@@ -7366,7 +7401,7 @@ async def bulk_mailing_task(
                 "progress": (sent / max(1, total_sends)) * 100,
                 "progress_text": f"{sent}/{total_sends}",
                 "sent": sent,
-                "checkpoints": {
+                "data": {
                     "sent": sent,
                     "per_chat_sent": per_chat_sent,
                     "next_chat_idx": next_chat_idx,
@@ -7381,12 +7416,11 @@ async def bulk_mailing_task(
         task_queue.remove_user_task(user_id, task_id)
 
         if delivery_mode == "users":
-            text = translate(
-                "mailing_completed_users_report",
-                task_id=task_id,
-                sent=sent,
-                texts_count=len(message_texts),
-                users_count=len(per_chat_sent),
+            text = (
+                f"Mailing task {task_id} completed (partial):\n"
+                f"Sent: {sent} messages\n"
+                f"Texts used: {len(message_texts)}\n"
+                f"Users targeted: {len(per_chat_sent)}"
             )
         else:
             chat_report_lines = []
@@ -7394,12 +7428,11 @@ async def bulk_mailing_task(
                 chat_report_lines.append(f"  - {c}: {cnt}")
             chats_report = "\n".join(chat_report_lines)
 
-            text = translate(
-                "mailing_completed_report",
-                task_id=task_id,
-                sent=sent,
-                texts_count=len(message_texts),
-                chats_report=chats_report,
+            text = (
+                f"Mailing task {task_id} completed (partial):\n"
+                f"Sent: {sent} messages\n"
+                f"Texts used: {len(message_texts)}\n"
+                f"Per chat:\n{chats_report}"
             )
         await notify_user(bot, user_id, text)
 
@@ -7443,7 +7476,7 @@ async def validate_and_add_chats_from_text(
 
             if chat_data:
                 result["added"] += 1
-                logger.info(f"✅ Чат {chat_data['chat_name']} добавлен/обновлён")
+                logger.info(f"✅ Чат {chat_data.chat_name} добавлен/обновлён")
             else:
                 result["skipped"] += 1
                 logger.info(f"⏭️ Чат {identifier} пропущен")
@@ -7491,10 +7524,10 @@ async def bulk_mailing_new_chats_task(
         else account_pool.acquire_account()
     )
 
-    valid_chats: List[Dict[str, Any]] = []
+    valid_chats: List[ChatInfo] = []
 
     async with account_ctx as account:
-        client = account["client"]
+        client = account.client
 
         validation_result = await validate_and_add_chats_from_text(
             client, account, raw_text, user_id, task_id
@@ -7723,66 +7756,73 @@ async def db_scrape_and_invite_task(
             await leave_all_joined_chats(task_id, client)
 
 
-async def queue_task_from_storage(task: Dict[str, Any], resume: bool = False):
-    task_id = task.get("task_id")
-    task_type = task.get("type")
-    user_id = task.get("user_id")
-    checkpoint = task.get("checkpoints")
+async def queue_task_from_storage(task: Task, resume: bool = False) -> None:
+    task_id = task.task_id
+    task_type = task.type
+    user_id = task.user_id
+    checkpoint = task.data
 
     if not task_id or not task_type or not user_id:
         return
 
     if task_type == "scraping":
-        source_type = task.get("chats_source_type", "manual")
+        source_type = (
+            task.data.get("chats_source_type", "manual") if task.data else "manual"
+        )
         if source_type == "db":
             # DB scraping task
             await task_queue.add_task(
                 task_id,
                 db_scrape_and_invite_task,
-                target=task.get("target"),
-                message_limit=task.get("limit", 0),
+                target=task.data.get("target") if task.data else None,
+                message_limit=task.data.get("limit", 0) if task.data else 0,
                 user_id=user_id,
                 task_id=task_id,
-                sender_session=task.get("sender_session"),
+                sender_session=task.data.get("sender_session") if task.data else None,
                 checkpoint=checkpoint,
             )
         else:
-            mode = task.get("mode")
+            mode = task.data.get("mode") if task.data else None
             if mode == "messages":
                 await task_queue.add_task(
                     task_id,
                     scrape_and_invite_task,
-                    source=task.get("source"),
-                    target=task.get("target"),
-                    message_limit=task.get("limit", 0),
+                    source=task.data.get("source") if task.data else None,
+                    target=task.data.get("target") if task.data else None,
+                    message_limit=task.data.get("limit", 0) if task.data else 0,
                     user_id=user_id,
                     task_id=task_id,
-                    sender_session=task.get("sender_session"),
+                    sender_session=(
+                        task.data.get("sender_session") if task.data else None
+                    ),
                     checkpoint=checkpoint,
                 )
             else:
                 await task_queue.add_task(
                     task_id,
                     scrape_and_invite_by_user_count_task,
-                    source=task.get("source"),
-                    target=task.get("target"),
-                    user_count=task.get("user_count", 0),
+                    source=task.data.get("source") if task.data else None,
+                    target=task.data.get("target") if task.data else None,
+                    user_count=task.data.get("user_count", 0) if task.data else 0,
                     user_id=user_id,
                     task_id=task_id,
-                    sender_session=task.get("sender_session"),
+                    sender_session=(
+                        task.data.get("sender_session") if task.data else None
+                    ),
                     checkpoint=checkpoint,
                 )
     elif task_type == "mailing":
+        chats = task.data.get("chats", []) if task.data else []
         await task_queue.add_task(
             task_id,
             bulk_mailing_task,
-            chats=task.get("chats", []),
-            delay_min=task.get("delay_min", 1),
-            delay_max=task.get("delay_max", 1),
-            message_texts=task.get("message_texts", [""]),
-            total_sends=task.get("total_sends", 0),
+            chats=chats,
+            delay_min=task.data.get("delay_min", 1) if task.data else 1,
+            delay_max=task.data.get("delay_max", 1) if task.data else 1,
+            message_texts=task.data.get("message_texts", [""]) if task.data else [""],
+            total_sends=task.data.get("total_sends", 0) if task.data else 0,
             user_id=user_id,
-            sender_session_file=task.get("sender_session"),
+            sender_session_file=task.data.get("sender_session") if task.data else None,
             task_id=task_id,
             checkpoint=checkpoint,
         )
@@ -7794,12 +7834,12 @@ async def queue_task_from_storage(task: Dict[str, Any], resume: bool = False):
 
 
 # --- Фоновые задачи ---
-async def restore_tasks_on_startup():
+async def restore_tasks_on_startup() -> None:
     tasks = await tasks_storage.read_all()
     for task in tasks:
-        task_id = task.get("task_id")
-        status = task.get("status")
-        task_user_id = task.get("user_id")
+        task_id = task.task_id
+        status = task.status
+        task_user_id = task.user_id
 
         if status == "cancelled":
             pass
@@ -7818,15 +7858,14 @@ async def restore_tasks_on_startup():
         if status == "pending":
             await queue_task_from_storage(task)
 
-        if status == "paused" and task_user_id:
-            task_queue.add_user_task(task_user_id, task_id)
-        elif status == "pending" and task_user_id:
-            task_queue.add_user_task(task_user_id, task_id)
+        if task_user_id:
+            if status == "paused" or status == "pending":
+                task_queue.add_user_task(task_user_id, task_id)
 
         # Paused задачи оставляем до ручного возобновления
 
 
-async def cleanup_entity_cache():
+async def cleanup_entity_cache() -> None:
     """Фоновая очистка кэша сущностей каждые 30 минут"""
     while True:
         try:
@@ -7843,7 +7882,7 @@ async def cleanup_entity_cache():
             )
 
 
-async def simulate_account_activity():
+async def simulate_account_activity() -> None:
     """Фоновая эмуляция активности аккаунтов"""
     while True:
         try:
@@ -7868,7 +7907,7 @@ async def simulate_account_activity():
             )
 
 
-async def cleanup_old_tasks():
+async def cleanup_old_tasks() -> None:
     """Очистка старых задач из хранилища"""
     while True:
         try:
