@@ -478,7 +478,7 @@ class Account:
     session_string: str
     in_use: bool = False
     is_valid: bool = True
-    client: Optional[Any] = None
+    client: Optional[TelegramClient] = None
     last_used: Optional[datetime] = None
     invite_count: int = 0
     success_count: int = 0
@@ -2172,7 +2172,7 @@ def parse_link_to_identifier(link: str) -> Optional[str]:
 
 async def validate_and_test_chat(
     client: TelegramClient,
-    account: Dict[str, Any],
+    account: Account,
     chat_identifier: str,
     update_existing: bool = False,
 ) -> Optional[ValidatedChat]:
@@ -2271,6 +2271,7 @@ async def validate_and_test_chat(
     user_count = user_count or 0
 
     test_entity: Optional[_EntityType] = None
+    was_member = await is_account_joined(account.session_file, chat_identifier)
     try:
         test_entity = await ensure_join_target(client, chat_identifier, account)
     except Exception as join_err:
@@ -2318,9 +2319,9 @@ async def validate_and_test_chat(
                 can_write = False
                 break
     finally:
-        if test_entity is not None and test_entity != entity:
+        if test_entity is not None and test_entity != entity and not was_member:
             try:
-                await ensure_leave_target(client, chat_identifier)
+                await ensure_leave_target(client, chat_identifier, account.session_file)
             except Exception as leave_err:
                 logger.warning(
                     f"Не удалось выйти из {chat_name} после проверки: {leave_err}"
@@ -2610,8 +2611,6 @@ class AccountPoolManager:
                     await asyncio.sleep(wait_time)
                 else:
                     raise
-        raise Exception("Failed to create client after 3 attempts")
-
     def _load_accounts(self) -> None:
         for filename in os.listdir(Config.SESSIONS_DIR):
             if filename.endswith(".session"):
@@ -2692,92 +2691,6 @@ class AccountPoolManager:
             return True
         if hasattr(user, "is_bot") and user.is_bot:  # type: ignore[union-attr]
             return True
-        return False
-
-    async def _safe_get_user(
-        self, client: TelegramClient, user_id: int, max_retries: Optional[int] = None
-    ) -> Optional[_EntityType]:
-        if max_retries is None:
-            max_retries = Config.MAX_RETRIES
-
-        for attempt in range(max_retries):
-            try:
-                return await get_cached_entity(client, user_id)
-            except FloodWaitError as e:
-                logger.warning(f"Flood wait on get_entity {user_id}: {e.value}s")
-                acc = next(
-                    (a for a in self.accounts if a.client == client),
-                    None,
-                )
-                if acc:
-                    await self._handle_flood_wait(acc, e.value)
-                raise
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    wait_time = Config.RETRY_BACKOFF_BASE**attempt
-                    logger.warning(
-                        f"Retry get_entity {user_id} attempt {attempt + 1}: {e}"
-                    )
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(
-                        f"Failed to get entity {user_id} after {max_retries} attempts: {e}"
-                    )
-                    return None
-        return None
-
-    async def _safe_invite(
-        self,
-        client: TelegramClient,
-        chat_id: str,
-        user_id: int,
-        acc: Optional[Account] = None,
-    ) -> bool:
-        for attempt in range(Config.MAX_RETRIES):
-            try:
-                await client(
-                    functions.channels.InviteToChannelRequest(
-                        channel=chat_id, users=[user_id]
-                    )
-                )
-                if acc:
-                    self._update_account_success_rate(acc.session_file, True)
-                    acc.success_count = acc.success_count + 1
-                    acc.consecutive_errors = 0
-                return True
-            except UserPrivacyRestrictedError:
-                logger.info(f"User {user_id} privacy restricted - skipping")
-                return False
-            except UserNotParticipantError:
-                logger.warning(f"User {user_id} not participant - retrying")
-                if attempt < Config.MAX_RETRIES - 1:
-                    await asyncio.sleep(
-                        Config.rand("INVITE_RETRY_DELAY_MIN", "INVITE_RETRY_DELAY_MAX")
-                    )
-                    continue
-                return False
-            except FloodWaitError as e:
-                logger.warning(f"Flood wait on invite {user_id}: {e.value}s")
-                if acc:
-                    await self._handle_flood_wait(acc, e.value)
-                raise
-            except ChatAdminRequiredError:
-                logger.error(f"Need admin rights for chat {chat_id}")
-                return False
-            except Exception as e:
-                if acc:
-                    self._update_account_success_rate(acc.session_file, False)
-                    acc.consecutive_errors = acc.consecutive_errors + 1
-
-                if attempt < Config.MAX_RETRIES - 1:
-                    wait_time = Config.RETRY_BACKOFF_BASE**attempt
-                    logger.warning(f"Retry invite {user_id} attempt {attempt + 1}: {e}")
-                    await asyncio.sleep(wait_time)
-                else:
-                    logger.error(
-                        f"Failed to invite {user_id} after {Config.MAX_RETRIES} attempts: {e}"
-                    )
-                    return False
         return False
 
     async def _random_delay(
@@ -3140,7 +3053,6 @@ class TaskQueueManager:
                         )
                     except asyncio.TimeoutError:
                         self.logger.warning(f"Task {task_id} timed out")
-                        control.cancelled = True
                         if self.tasks_storage:
                             await self.tasks_storage.update_by_id(
                                 task_id,
@@ -3900,7 +3812,7 @@ async def process_code(message: Message, state: FSMContext) -> None:
         await smart_answer(
             message,
             bot,
-            translate(lang, "auth_flood_wait", seconds=e.value),
+            translate(lang, "auth_flood_wait", seconds=getattr(e, "seconds", 60)),
             delete_origin=False,
         )
         await client.disconnect()
@@ -5531,7 +5443,9 @@ async def process_leave_chats(event: CallbackQuery) -> None:
             client = account.client
             for chat in joined_chats:
                 try:
-                    await ensure_leave_target(client, chat)
+                    await ensure_leave_target(
+                        client, chat, account.session_file
+                    )
                     left.append(chat)
                 except Exception as e:
                     errors.append((chat, str(e)))
@@ -5985,36 +5899,45 @@ async def _run_update_chats_db(msg: Any, user_id: int) -> None:
     if not acc:
         return
 
-    client = acc.client
-    if not client or not client.is_connected():
-        try:
-            client = await account_pool._create_client(acc.session_string)
-        except Exception:
-            return
-
-    result = await check_and_clean_banned_chats(client, bot, user_id)
-    chats = await chat_db.get_all_chats(verified_only=True)
-    total_users = await chat_db.get_total_users(verified_only=True)
-
-    text = translate(
-        "update_db_done",
-        checked=result.checked,
-        added=0,
-        removed=result.removed,
-        updated=result.updated or 0,
-        errors=result.errors,
-    )
-    text += (
-        f"\n\n{translate('current_stats', chats=len(chats), total_users=total_users)}"
-    )
-
+    acc.in_use = True
     try:
-        if isinstance(msg, Message) and msg and msg.chat:
-            await msg.edit_text(text, parse_mode="HTML")
-        elif isinstance(msg, CallbackQuery) and msg.message:
-            await msg.message.edit_text(text, parse_mode="HTML")
-    except Exception as e:
-        logger.error(f"Ошибка обновления сообщения при обновлении БД: {e}")
+        client = acc.client
+        if not client or not client.is_connected():
+            try:
+                client = await account_pool._create_client(acc.session_string)
+                acc.client = client
+            except Exception:
+                return
+
+        result = await check_and_clean_banned_chats(client, bot, user_id)
+        chats = await chat_db.get_all_chats(verified_only=True)
+        total_users = await chat_db.get_total_users(verified_only=True)
+
+        text = translate(
+            "update_db_done",
+            checked=result.checked,
+            added=0,
+            removed=result.removed,
+            updated=result.updated or 0,
+            errors=result.errors,
+        )
+        text += (
+            f"\n\n{translate('current_stats', chats=len(chats), total_users=total_users)}"
+        )
+
+        try:
+            if isinstance(msg, Message) and msg and msg.chat:
+                await msg.edit_text(text, parse_mode="HTML")
+            elif isinstance(msg, CallbackQuery) and msg.message:
+                await msg.message.edit_text(text, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка обновления сообщения при обновлении БД: {e}")
+    finally:
+        try:
+            if acc and acc.in_use:
+                acc.in_use = False
+        except Exception:
+            pass
 
 
 # === Режим червя ===
@@ -6076,7 +5999,13 @@ async def cmd_stop_worm(event: CallbackQuery) -> None:
                     if acc.client and acc.client.is_connected():
                         for src in list(sources_to_leave):
                             try:
-                                await ensure_leave_target(acc.client, src)
+                                if not await is_account_joined(
+                                    acc.session_file, src
+                                ):
+                                    continue
+                                await ensure_leave_target(
+                                    acc.client, src, acc.session_file
+                                )
                             except Exception:
                                 pass
                         break
@@ -6162,6 +6091,7 @@ async def process_worm_sources(message: Message, state: FSMContext) -> None:
         )
         return
 
+    acc.in_use = True
     client = acc.client
     if not client or not client.is_connected():
         try:
@@ -6170,6 +6100,7 @@ async def process_worm_sources(message: Message, state: FSMContext) -> None:
             client = acc.client
         except Exception as e:
             logger.error(f"Не удалось подключиться к аккаунту: {e}")
+            acc.in_use = False
             await smart_answer(
                 message,
                 bot,
@@ -6204,172 +6135,186 @@ async def process_worm_sources(message: Message, state: FSMContext) -> None:
 
 async def _run_worm_mode(
     client: TelegramClient,
-    account: Dict[str, Any],
+    account: Account,
     sources: List[str],
     user_id: int,
 ) -> None:
     global _worm_active, _worm_stats
+    try:
 
-    for source in sources:
-        _worm_stats[source] = WormSourceStats()
+        for source in sources:
+            _worm_stats[source] = WormSourceStats()
 
-    logger.info(f"🐛 Червь запущен в {len(sources)} чатах: {sources}")
+        logger.info(f"🐛 Червь запущен в {len(sources)} чатах: {sources}")
 
-    processed_count = 0
-    new_valid_chats: List[ValidatedChat] = []
+        processed_count = 0
+        new_valid_chats: List[ValidatedChat] = []
 
-    while _worm_active:
-        try:
-            for source in sources:
-                if not _worm_active:
-                    break
-
-                try:
-                    entity = await get_cached_entity(client, source)
-                except Exception as e:
-                    logger.warning(f"Не удалось получить источник {source}: {e}")
-                    continue
-
-                try:
-                    msg_count = 0
-                    async for message in client.iter_messages(
-                        entity, limit=Config.WORM_SCAN_LIMIT, reverse=True
-                    ):
-                        if not _worm_active:
-                            break
-
-                        try:
-                            text = getattr(message, "text", None) or ""
-                            if not text.strip():
-                                continue
-
-                            async with _worm_lock:
-                                _worm_stats[source].messages += 1
-                                processed_count += 1
-
-                            if processed_count % Config.WORM_CHECK_INTERVAL == 0:
-                                logger.info(
-                                    f"🐛 Червь в {source}: {_worm_stats[source]}"
-                                )
-
-                            links = extract_links_from_text(text)
-                            if not links:
-                                continue
-
-                            async with _worm_lock:
-                                _worm_stats[source].links += len(links)
-
-                            for link in links:
-                                if not _worm_active:
-                                    break
-
-                                identifier = parse_link_to_identifier(link)
-                                if not identifier:
-                                    continue
-
-                                try:
-                                    result = await validate_and_test_chat(
-                                        client,
-                                        account,
-                                        identifier,
-                                    )
-                                    if result:
-                                        async with _worm_lock:
-                                            _worm_stats[source].added += 1
-                                        new_valid_chats.append(result)
-                                except Exception as e:
-                                    async with _worm_lock:
-                                        _worm_stats[source].errors += 1
-                                    logger.error(f"Ошибка обработки ссылки {link}: {e}")
-
-                                await asyncio.sleep(
-                                    Config.rand("WORM_MIN_DELAY", "WORM_MAX_DELAY")
-                                )
-
-                        except Exception as e:
-                            logger.error(f"Ошибка обработки сообщения: {e}")
-                            await asyncio.sleep(
-                                Config.rand(
-                                    "WORKER_ERROR_DELAY_MIN", "WORKER_ERROR_DELAY_MAX"
-                                )
-                            )
-
-                    msg_count += 1
-
-                except Exception as e:
-                    logger.error(f"Ошибка сканирования {source}: {e}")
-                    await asyncio.sleep(
-                        Config.rand(
-                            "WORM_SCAN_ERROR_DELAY_MIN", "WORM_SCAN_ERROR_DELAY_MAX"
-                        )
-                    )
-
-            if new_valid_chats:
-                logger.info(
-                    f"🐛 Червь: {len(new_valid_chats)} новых валидных чатов для копий"
-                )
-                for new_chat in new_valid_chats:
+        while _worm_active:
+            try:
+                for source in sources:
                     if not _worm_active:
                         break
-                    joined_entity: Optional[_EntityType] = None
-                    try:
-                        joined_entity = await ensure_join_target(
-                            client, new_chat.chat_url, account
-                        )
-                    except Exception as join_err:
-                        logger.warning(
-                            f"🐛 Worm join failed for {new_chat.chat_name}: {join_err}"
-                        )
 
                     try:
-                        new_entity = await get_cached_entity(client, new_chat.chat_url)
-                        if joined_entity:
-                            new_entity = joined_entity
-                        await client.send_message(
-                            new_entity, "🐛 Message from Inviter Bot Worm Mode"
-                        )
-                        logger.info(f"🐛 Копия отправлена в {new_chat.chat_name}")
-                        await asyncio.sleep(
-                            Config.rand("WORM_MIN_DELAY", "WORM_MAX_DELAY")
-                        )
+                        entity = await get_cached_entity(client, source)
                     except Exception as e:
-                        logger.error(
-                            f"Ошибка отправки копии в {new_chat.chat_name}: {e}"
-                        )
-                    finally:
-                        if joined_entity is not None:
+                        logger.warning(f"Не удалось получить источник {source}: {e}")
+                        continue
+
+                    try:
+                        msg_count = 0
+                        async for message in client.iter_messages(
+                            entity, limit=Config.WORM_SCAN_LIMIT, reverse=True
+                        ):
+                            if not _worm_active:
+                                break
+
                             try:
-                                await ensure_leave_target(client, new_chat.chat_url)
-                            except Exception as leave_err:
-                                logger.warning(
-                                    f"🐛 Worm leave failed for {new_chat.chat_name}: {leave_err}"
+                                text = getattr(message, "text", None) or ""
+                                if not text.strip():
+                                    continue
+
+                                async with _worm_lock:
+                                    _worm_stats[source].messages += 1
+                                    processed_count += 1
+
+                                if processed_count % Config.WORM_CHECK_INTERVAL == 0:
+                                    logger.info(
+                                        f"🐛 Червь в {source}: {_worm_stats[source]}"
+                                    )
+
+                                links = extract_links_from_text(text)
+                                if not links:
+                                    continue
+
+                                async with _worm_lock:
+                                    _worm_stats[source].links += len(links)
+
+                                for link in links:
+                                    if not _worm_active:
+                                        break
+
+                                    identifier = parse_link_to_identifier(link)
+                                    if not identifier:
+                                        continue
+
+                                    try:
+                                        result = await validate_and_test_chat(
+                                            client,
+                                            account,
+                                            identifier,
+                                        )
+                                        if result:
+                                            async with _worm_lock:
+                                                _worm_stats[source].added += 1
+                                            new_valid_chats.append(result)
+                                    except Exception as e:
+                                        async with _worm_lock:
+                                            _worm_stats[source].errors += 1
+                                        logger.error(f"Ошибка обработки ссылки {link}: {e}")
+
+                                    await asyncio.sleep(
+                                        Config.rand("WORM_MIN_DELAY", "WORM_MAX_DELAY")
+                                    )
+
+                            except Exception as e:
+                                logger.error(f"Ошибка обработки сообщения: {e}")
+                                await asyncio.sleep(
+                                    Config.rand(
+                                        "WORKER_ERROR_DELAY_MIN", "WORKER_ERROR_DELAY_MAX"
+                                    )
                                 )
 
-                new_valid_chats.clear()
+                        msg_count += 1
 
-        except Exception as e:
-            logger.error(f"Ошибка режима червя: {e}")
-            await asyncio.sleep(
-                Config.rand("WORM_TOP_ERROR_DELAY_MIN", "WORM_TOP_ERROR_DELAY_MAX")
-            )
+                    except Exception as e:
+                        logger.error(f"Ошибка сканирования {source}: {e}")
+                        await asyncio.sleep(
+                            Config.rand(
+                                "WORM_SCAN_ERROR_DELAY_MIN", "WORM_SCAN_ERROR_DELAY_MAX"
+                            )
+                        )
 
-    logger.info(f"🐛 Червь остановлен. Итоговая статистика: {_worm_stats}")
-    async with _worm_lock:
-        _worm_chat_id = None
+                if new_valid_chats:
+                    logger.info(
+                        f"🐛 Червь: {len(new_valid_chats)} новых валидных чатов для копий"
+                    )
+                    for new_chat in new_valid_chats:
+                        if not _worm_active:
+                            break
+                        joined_entity: Optional[_EntityType] = None
+                        was_member = await is_account_joined(
+                            account.session_file, new_chat.chat_url
+                        )
+                        try:
+                            joined_entity = await ensure_join_target(
+                                client, new_chat.chat_url, account
+                            )
+                        except Exception as join_err:
+                            logger.warning(
+                                f"🐛 Worm join failed for {new_chat.chat_name}: {join_err}"
+                            )
+
+                        try:
+                            new_entity = await get_cached_entity(client, new_chat.chat_url)
+                            if joined_entity:
+                                new_entity = joined_entity
+                            await client.send_message(
+                                new_entity, "🐛 Message from Inviter Bot Worm Mode"
+                            )
+                            logger.info(f"🐛 Копия отправлена в {new_chat.chat_name}")
+                            await asyncio.sleep(
+                                Config.rand("WORM_MIN_DELAY", "WORM_MAX_DELAY")
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"Ошибка отправки копии в {new_chat.chat_name}: {e}"
+                            )
+                        finally:
+                            if joined_entity is not None and not was_member:
+                                try:
+                                    await ensure_leave_target(
+                                        client, new_chat.chat_url, account.session_file
+                                    )
+                                except Exception as leave_err:
+                                    logger.warning(
+                                        f"🐛 Worm leave failed for {new_chat.chat_name}: {leave_err}"
+                                    )
+
+                    new_valid_chats.clear()
+
+            except Exception as e:
+                logger.error(f"Ошибка режима червя: {e}")
+                await asyncio.sleep(
+                    Config.rand("WORM_TOP_ERROR_DELAY_MIN", "WORM_TOP_ERROR_DELAY_MAX")
+                )
+
+        logger.info(f"🐛 Червь остановлен. Итоговая статистика: {_worm_stats}")
+        async with _worm_lock:
+            _worm_chat_id = None
+    finally:
+        account.in_use = False
 
 
-# === Исправленные задачи ---
+# === Utility Functions ===
 async def ensure_join_target(
     client: TelegramClient,
     target: str,
-    account: Dict[str, Any],
+    account: Account,
     task_id: Optional[str] = None,
     user_id: Optional[int] = None,
 ) -> Optional[_EntityType]:
+    joined_by_bot = False
     try:
         if target.startswith("https://t.me/+"):
             invite_hash = target.split("+", 1)[1]
-            await client(functions.messages.ImportChatInviteRequest(invite_hash))
+            result = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+            if result.chats:
+                entity = await get_cached_entity(client, result.chats[0].id)
+            else:
+                entity = await get_cached_entity(client, target)
+            joined_by_bot = True
         else:
             if not await is_account_joined(account.session_file, target):
                 entity = await get_cached_entity(client, target)
@@ -6379,9 +6324,11 @@ async def ensure_join_target(
                     if "USER_ALREADY_PARTICIPANT" not in str(join_err).upper():
                         raise
                 await mark_account_joined(account.session_file, target)
-            entity = await get_cached_entity(client, target)
+                joined_by_bot = True
+            else:
+                entity = await get_cached_entity(client, target)
         logger.info(f"Account {account.session_file} joined {target}")
-        if task_id is not None and user_id is not None:
+        if task_id is not None and user_id is not None and joined_by_bot:
             try:
                 task = await tasks_storage.find_by_id(task_id, id_field="task_id")
                 if task is not None:
@@ -6417,14 +6364,18 @@ async def ensure_join_target(
 async def ensure_join_source(
     client: TelegramClient,
     source: str,
-    account: Dict[str, Any],
+    account: Account,
     task_id: Optional[str] = None,
     user_id: Optional[int] = None,
 ) -> Optional[_EntityType]:
     try:
         if source.startswith("https://t.me/+"):
             invite_hash = source.split("+", 1)[1]
-            await client(functions.messages.ImportChatInviteRequest(invite_hash))
+            result = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+            if result.chats:
+                entity = await get_cached_entity(client, result.chats[0].id)
+            else:
+                entity = await get_cached_entity(client, source)
         else:
             if not await is_account_joined(account.session_file, source):
                 entity = await get_cached_entity(client, source)
@@ -6434,7 +6385,8 @@ async def ensure_join_source(
                     if "USER_ALREADY_PARTICIPANT" not in str(join_err).upper():
                         raise
                 await mark_account_joined(account.session_file, source)
-            entity = await get_cached_entity(client, source)
+            else:
+                entity = await get_cached_entity(client, source)
         logger.info(f"Account {account.session_file} joined source {source}")
         return entity
     except Exception as e:
@@ -6442,7 +6394,11 @@ async def ensure_join_source(
         return None
 
 
-async def ensure_leave_target(client: TelegramClient, target: str) -> None:
+async def ensure_leave_target(
+    client: TelegramClient,
+    target: str,
+    session_file: Optional[str] = None,
+) -> None:
     try:
         entity = await get_cached_entity(client, target)
         if isinstance(entity, telethon_types.Channel):
@@ -6457,6 +6413,8 @@ async def ensure_leave_target(client: TelegramClient, target: str) -> None:
             except Exception:
                 pass
         logger.info(f"Left target {target}")
+        if session_file:
+            await mark_account_left(session_file, target)
     except Exception as e:
         logger.warning(f"Failed to leave target {target}: {e}")
 
@@ -6468,9 +6426,10 @@ async def leave_all_joined_chats(task_id: str, client: TelegramClient) -> None:
     joined = (task.data or {}).get("joined_chats") or []
     if not joined:
         return
+    session_file = (task.data or {}).get("sender_session")
     for chat in list(joined):
         try:
-            await ensure_leave_target(client, chat)
+            await ensure_leave_target(client, chat, session_file)
         except Exception:
             pass
     try:
@@ -6578,7 +6537,7 @@ async def get_active_users(
 
 async def invite_users(
     control: TaskControl,
-    account: Dict[str, Any],
+    account: Account,
     client: TelegramClient,
     user_ids: List[int],
     target_entity: str,
@@ -6687,6 +6646,9 @@ async def invite_users(
                                             fwd_limit=0,
                                         )
                                     )
+                                else:
+                                    results.failed += 1
+                                    continue
 
                             results.success += 1
                             current_participants.add(uid)
@@ -6803,6 +6765,9 @@ async def invite_users(
                                     chat_id=target.id, user_id=user_ent, fwd_limit=0
                                 )
                             )
+                        else:
+                            results.failed += 1
+                            continue
 
                     results.success += 1
                     current_participants.add(uid)
@@ -7252,6 +7217,9 @@ async def collect_users_for_mailing(
 
     for chat_ref in chats:
         joined_entity: Optional[_EntityType] = None
+        was_member = account is not None and await is_account_joined(
+            account.session_file, chat_ref
+        )
         try:
             if account is not None:
                 try:
@@ -7300,9 +7268,11 @@ async def collect_users_for_mailing(
                 logger.warning(f"Error collecting participants from {chat_ref}: {e}")
                 continue
         finally:
-            if joined_entity is not None:
+            if joined_entity is not None and not was_member:
                 try:
-                    await ensure_leave_target(client, chat_ref)
+                    await ensure_leave_target(
+                        client, chat_ref, account.session_file
+                    )
                 except Exception:
                     pass
 
@@ -7446,6 +7416,9 @@ async def bulk_mailing_task(
                             next_chat_idx += 1
                             target_key = str(chat)
                             joined_entity: Optional[_EntityType] = None
+                            bot_was_member = await is_account_joined(
+                                account.session_file, str(chat)
+                            )
                             try:
                                 joined_entity = await ensure_join_target(
                                     client, str(chat), account
@@ -7541,9 +7514,11 @@ async def bulk_mailing_task(
                                         id_field="task_id",
                                     )
                             finally:
-                                if joined_entity is not None:
+                                if joined_entity is not None and not bot_was_member:
                                     try:
-                                        await ensure_leave_target(client, str(chat))
+                                        await ensure_leave_target(
+                                            client, str(chat), account.session_file
+                                        )
                                     except Exception:
                                         pass
 
@@ -7744,7 +7719,7 @@ async def bulk_mailing_task(
 
 async def validate_and_add_chats_from_text(
     client: TelegramClient,
-    account: Dict[str, Any],
+    account: Account,
     text: str,
     user_id: int,
     task_id: str,
@@ -8116,6 +8091,7 @@ async def queue_task_from_storage(task: Task, resume: bool = False) -> None:
             sender_session_file=task.data.get("sender_session") if task.data else None,
             task_id=task_id,
             checkpoint=checkpoint,
+            delivery_mode=task.data.get("mailing_target", "chats") if task.data else "chats",
         )
 
     await task_queue.add_user_task(user_id, task_id)
@@ -8318,6 +8294,7 @@ async def main() -> None:
 
         await cache_manager.close()
         await chat_db.close()
+        await user_db.close()
         await tasks_storage.close()
         await auth_manager.save()
 
