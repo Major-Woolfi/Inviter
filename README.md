@@ -37,7 +37,7 @@
 
 ### Идея и концепция
 
-**Inviter** — это проект, созданный для решения целого спектра задач:
+**Inviter** - это проект, созданный для решения целого спектра задач:
 
 - Перегонка трафика `из` - `в`
 - Рассылки пользователям в личные сообщения
@@ -80,15 +80,20 @@ Inviter - проект продвинутого бота-инвайтера, к�
 
 Реализовано и работоспособно:
 
-- Инвайтинг
-- БД чатов
-- Валидаторы
-- Human-like поведение
-- Рандомизаторы
-- Гибкие настройки
-- Отказоустойчивость
-- Кэширование
-- Мультиязычность
+- Инвайтинг с нескольких аккаунтов
+- БД чатов на SQLite с валидацией и очисткой
+- Массовая рассылка по чатам и в личные сообщения
+- Режим червя для сбора чатов по ссылкам из сообщений
+- Планировщик задач с очередью, паузой, возобновлением и отменой
+- Human-like поведение и рандомизация задержек
+- Адаптивные задержки и обработка FloodWait
+- Кэширование сущностей, участников и приглашений
+- Автоматический выход из чатов, куда бот вступил сам
+- Мультиязычность (ru, en)
+- Доступ по Telegram ID владельца, без ключей и регистрации
+
+> Бот работает в режиме одного владельца: список `OWNER_USER_IDS` в `.env` задаёт единственных
+> пользователей, которым доступен функционал.
 
 ---
 
@@ -121,19 +126,36 @@ cp .env.example .env
 # Отредактируйте .env под ваши нужды
 ```
 
+Обязательные переменные:
+
+| Переменная      | Описание                                        |
+| --------------- | ----------------------------------------------- |
+| `BOT_TOKEN`     | Токен бота от BotFather                          |
+| `API_ID`        | Числовой `api_id` с my.telegram.org              |
+| `API_HASH`      | `api_hash` с my.telegram.org                     |
+| `OWNER_USER_IDS` | Telegram ID владельца через запятую, например `111111,222222` |
+
+Полный список настроек с комментариями находится в `.env.example`.
+
 ### Деплой
 
 ```shell
-cd /root/bots/Inviter_bot/ || exit 1
-
-docker build -t inviter_bot .
-docker rm -f inviter_bot 2>/dev/null || true
-docker run -d --name inviter_bot --restart always -v "$(pwd)":/app inviter_bot
-
-echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
+# Разово перенесите проект в нужную папку и настройте PROJECT_DIR при необходимости
+bash deploy_bot.sh
 ```
 
-> Вам нужно изменить путь в `cd` или переместить бота в соответствующую папку
+Скрипт собирает образ, пересоздаёт контейнер и пробрасывает `data`, `sessions`, `logs`
+и `.env`. Вручную:
+
+```shell
+docker build -t inviter_bot .
+docker rm -f inviter_bot 2>/dev/null || true
+docker run -d --name inviter_bot --restart always --env-file .env \
+  -v "$(pwd)/data":/app/data -v "$(pwd)/sessions":/app/sessions \
+  -v "$(pwd)/logs":/app/logs inviter_bot
+```
+
+> Замените путь в `cd` или переместите бота в соответствующую папку
 
 ---
 
@@ -142,6 +164,10 @@ echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
 Перед запуском убедитесь, что:
 
 - [ ] Вы настроили все .env
+- [ ] `python main.py` запускается без ошибок конфигурации
+- [ ] `python -m pytest tests -q` проходит
+
+Тесты покрывают конфигурацию, переводы, разбор ссылок и все базы данных.
 
 ---
 
@@ -149,14 +175,19 @@ echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
 
 ```plaintext
 ├── data/
-│  └── ...
+│  ├── tasks.db
+│  ├── chats.db
+│  ├── cache.db
+│  └── users.db
 ├── sessions/
-│  └── ...
+│  └── *.session
 ├── langs/
 │  ├── en.json
 │  └── ru.json
 ├── logs/
-│  └── ...
+│  └── bot_YYYY-MM-DD.log
+├── tests/
+│  └── test_main.py
 ├── .env
 ├── .env.example
 ├── main.py
@@ -172,14 +203,15 @@ echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
 
 ## 🛠️ Технологический стек
 
-| Категория    | Технологии          |
-| ------------ | ------------------- |
-| **Backend**  | telethon            |
-| **Frontend** | aiogram             |
-| **Database** | aiofiles, aiosqlite |
-| **DevOps**   | Docker              |
+| Категория    | Технологии                    |
+| ------------ | ----------------------------- |
+| **Backend**  | aiogram 3, Telethon           |
+| **Database** | aiosqlite (SQLite)            |
+| **Config**   | python-dotenv                 |
+| **DevOps**   | Docker                        |
+| **Quality**  | pytest, Ruff                  |
 
-> В `Backend`, `Frontend` и `Database` указаны библиотеки Python, т.к. это единственный язык который тут используется не считая языков на которых написаны сами библиотеки.
+> Все указанные технологии - библиотеки Python, т.к. это единственный язык, который тут используется, не считая языков, на которых написаны сами библиотеки.
 
 ---
 
@@ -198,10 +230,10 @@ echo "✅ Deployed! Logs: docker logs -f  inviter_bot "
 
 Приветствуем любые вклад в проект! Перед созданием PR обязательно прочитай:
 
-- 📋 [CONTRIBUTING](https://github.com/Major-Woolfi/.github/blob/main/community/CONTRIBUTING.md) — правила участия
-- 💬 [CODE OF CONDUCT](https://github.com/Major-Woolfi/.github/blob/main/community/CODE_OF_CONDUCT.md) — кодекс поведения
-- 🐛 [ISSUE TEMPLATE](https://github.com/Major-Woolfi/.github/tree/main/community/ISSUES.md) — шаблоны багов и фич
-- 🔀 [PULL REQUEST TEMPLATE](https://github.com/Major-Woolfi/.github/blob/main/community/PULL_REQUEST_TEMPLATE.md) — требования к PR
+- 📋 [CONTRIBUTING](https://github.com/Major-Woolfi/.github/blob/main/community/CONTRIBUTING.md) - правила участия
+- 💬 [CODE OF CONDUCT](https://github.com/Major-Woolfi/.github/blob/main/community/CODE_OF_CONDUCT.md) - кодекс поведения
+- 🐛 [ISSUE TEMPLATE](https://github.com/Major-Woolfi/.github/tree/main/community/ISSUES.md) - шаблоны багов и фич
+- 🔀 [PULL REQUEST TEMPLATE](https://github.com/Major-Woolfi/.github/blob/main/community/PULL_REQUEST_TEMPLATE.md) - требования к PR
 
 Все общие правила хранятся в [репозитории `.github`](https://github.com/Major-Woolfi/.github) в папке `community`.
 
