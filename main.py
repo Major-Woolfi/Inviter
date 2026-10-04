@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 import html
 import io
@@ -14,21 +12,34 @@ import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Self
 
 import aiosqlite
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramBadRequest,
+    TelegramConflictError,
+    TelegramNetworkError,
+)
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+)
+from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 from dotenv import load_dotenv
 from telethon import TelegramClient, functions
 from telethon import types as telethon_types
@@ -47,7 +58,6 @@ from telethon.errors import (
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     PhoneNumberInvalidError,
-    RPCError,
     SessionPasswordNeededError,
     SlowModeWaitError,
     UserAlreadyParticipantError,
@@ -61,11 +71,12 @@ from telethon.sessions import StringSession
 
 # --- Настройка окружения ---
 BASE_DIR: Path = Path(__file__).parent
-load_dotenv(BASE_DIR / ".env")
+ENV_FILE: Path = BASE_DIR / ".env"
+load_dotenv(ENV_FILE)
 
 # --- Настройка логирования ---
 LOGS_DIR: Path = BASE_DIR / "logs"
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(exist_ok=True)
 LOG_FILE: Path = LOGS_DIR / f"bot_{datetime.now(UTC).strftime('%Y-%m-%d')}.log"
 
 logger = logging.getLogger("bot")
@@ -79,91 +90,95 @@ if not logger.handlers:
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
+    file_handler: logging.FileHandler | None = None
     try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8", mode="a")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
     except (PermissionError, OSError) as e:
         logger.warning(f"Не удалось инициализировать файловый логгер: {e}")
-logger.info("=== Логгер инициализирован ===")
+    logger.info("=== Логгер инициализирован ===")
+
+# --- Константы ---
+ACTIVE_TASK_STATUSES: frozenset[str] = frozenset({"pending", "running", "paused"})
+FINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "failed"})
 
 
 # --- Кастомные исключения ---
 class BotError(Exception):
-    def __init__(self, message: str, code: int = 500) -> None:
+    def __init__(self, message: str, code: int = 500):
         self.message = message
         self.code = code
         super().__init__(self.message)
 
 
 class ConfigError(BotError):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str):
         super().__init__(message, code=400)
 
 
 class DatabaseError(BotError):
-    def __init__(self, message: str, original_error: Exception | None = None) -> None:
+    def __init__(self, message: str, original_error: Exception | None = None):
         self.original_error = original_error
         super().__init__(message, code=500)
 
 
 class ChatUnreachableError(BotError):
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str):
         super().__init__(message, code=404)
 
 
-# --- Наборы исключений для обработки ---
-DB_ERRORS: tuple[type[BaseException], ...] = (
-    aiosqlite.Error,
-    ValueError,
-    TypeError,
-    RuntimeError,
-)
-
-TELEGRAM_ERRORS: tuple[type[BaseException], ...] = (
-    RPCError,
-    TelegramNetworkError,
-    OSError,
-    ValueError,
-    TypeError,
-    RuntimeError,
-)
-
-RUNTIME_ERRORS: tuple[type[BaseException], ...] = (
-    BotError,
-    TelegramBadRequest,
-    TelegramNetworkError,
-    OSError,
-    ValueError,
-    TypeError,
-    RuntimeError,
-)
+class NoAvailableAccountError(BotError):
+    def __init__(self, message: str):
+        super().__init__(message, code=503)
 
 
-# --- Утилиты маскирования секретов ---
-_SENSITIVE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\b\d{6,12}:[A-Za-z0-9_-]{30,}\b"), "<bot_token>"),
-    (re.compile(r"\b[1-9][A-Za-z0-9_-]{45,}\b"), "<session_string>"),
-    (
-        re.compile(
-            r"(?i)\b(api_hash|api_id|bot_token|session|password|phone_code)\b(\s*[=:]\s*)\S+"
-        ),
-        r"\1\2<masked>",
-    ),
-)
+# --- Утилиты логирования ---
+_SENSITIVE_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("BOT_TOKEN", re.compile(r"(\d{6,12}:)[A-Za-z0-9_-]{30,}")),
+    ("API_HASH", re.compile(r"\b[0-9a-fA-F]{32}\b")),
+    ("SESSION_STRING", re.compile(r"\b[1-9][A-Za-z0-9_-]{45,}\b")),
+    ("PHONE", re.compile(r"(\+\d{2,4})\d{5,12}")),
+    ("CODE", re.compile(r"(\b(?:code|phone_code|password)\s*[=:]\s*)\S+", re.IGNORECASE)),
+]
+
+_SENSITIVE_KEYS: set[str] = {
+    "API_HASH",
+    "BOT_TOKEN",
+    "PHONE",
+    "SESSION_STRING",
+    "code",
+    "password",
+    "phone",
+    "phone_code",
+}
 
 
-def mask_sensitive(text: str) -> str:
-    result = str(text)
-    for pattern, replacement in _SENSITIVE_PATTERNS:
-        result = pattern.sub(replacement, result)
-    return result
+def _mask_sensitive(data: Any) -> Any:
+    if data is None:
+        return "None"
+    if isinstance(data, (int, float, bool)):
+        return str(data)
+    if isinstance(data, (dict, list, tuple, set)):
+        if isinstance(data, dict):
+            return {
+                k: "***REDACTED***" if k in _SENSITIVE_KEYS else _mask_sensitive(v)
+                for k, v in data.items()
+            }
+        return [_mask_sensitive(item) for item in data]
+    text = str(data)
+    for _name, pattern in _SENSITIVE_PATTERNS:
+        text = pattern.sub(lambda m: (m.group(1) if m.re.groups else "") + "***", text)
+    if len(text) > 500:
+        text = text[:500] + "... [truncated]"
+    return text
 
 
 class _MaskingFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
-        record.msg = mask_sensitive(str(record.msg))
+        record.msg = _mask_sensitive(record.msg)
         record.args = ()
         return True
 
@@ -206,7 +221,7 @@ async def safe_send_message(
 async def smart_answer(
     event: Message | CallbackQuery,
     text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
+    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
     delete_origin: bool = False,
 ) -> bool:
     try:
@@ -227,22 +242,10 @@ async def smart_answer(
         return False
 
 
-async def notify_user(
-    bot: Bot,
-    user_id: int,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> bool:
-    return await safe_send_message(bot, user_id, text, reply_markup=reply_markup)
-
-
-async def notify_owners(
-    bot: Bot,
-    text: str,
-    reply_markup: InlineKeyboardMarkup | None = None,
-) -> None:
+async def notify_owners(bot: Bot, key: str, **kwargs: Any) -> None:
     for owner_id in Config.OWNER_USER_IDS:
-        await safe_send_message(bot, owner_id, text, reply_markup=reply_markup)
+        language = await user_db.get_language(owner_id)
+        await safe_send_message(bot, owner_id, translate(language, key, **kwargs))
 
 
 # --- Retry декоратор для самоисправления ---
@@ -267,22 +270,19 @@ async def retry_async(
                 )
                 await asyncio.sleep(wait_time)
             else:
-                logger.exception(f"Все {max_retries} попытки исчерпаны: {type(e).__name__}: {e}")  # noqa: TRY401
+                logger.exception(f"Все {max_retries} попытки исчерпаны")
     if last_exception is not None:
         raise last_exception
-    raise BotError("retry_async: неизвестная ошибка")
+    raise BotError(err("retry_unknown"))
 
 
 # --- Валидация данных ---
-def str_to_bool(value: str | None, default: bool = False) -> bool:
-    raw = str(value if value is not None else default).strip().lower()
-    return raw in ("1", "true", "yes", "y", "on")
+def str_to_bool(val: str) -> bool:
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
-def env_int(name: str, default: int) -> int:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
+def env_int(name: str, default: int = 0) -> int:
+    raw = str(os.getenv(name, default)).strip()
     try:
         return int(raw)
     except ValueError:
@@ -290,10 +290,8 @@ def env_int(name: str, default: int) -> int:
         return default
 
 
-def env_float(name: str, default: float) -> float:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return default
+def env_float(name: str, default: float = 0.0) -> float:
+    raw = str(os.getenv(name, default)).strip()
     try:
         return float(raw)
     except ValueError:
@@ -302,27 +300,30 @@ def env_float(name: str, default: float) -> float:
 
 
 def env_int_list(name: str) -> list[int]:
-    raw = os.getenv(name, "").strip()
+    values: list[int] = []
+    for raw in str(os.getenv(name, "")).replace(";", ",").split(","):
+        item = raw.strip()
+        if item:
+            try:
+                values.append(int(item))
+            except ValueError:
+                logger.warning(f"Некорректное значение в {name}: {item}")
+    return values
+
+
+def resolve_local_path(value: Any, default: str = "") -> str:
+    raw = str(value if value not in (None, "") else default).strip()
     if not raw:
-        return []
-    result: list[int] = []
-    for chunk in raw.replace(";", ",").split(","):
-        item = chunk.strip()
-        if not item:
-            continue
-        try:
-            result.append(int(item))
-        except ValueError:
-            logger.warning(f"{name}: '{item}' пропущено, ожидалось целое число")
-    return result
-
-
-def resolve_local_path(raw: str | None, default_name: str) -> str:
-    name = (raw or "").strip() or default_name
-    candidate = Path(name)
-    if candidate.is_absolute():
-        return str(candidate)
-    return str((BASE_DIR / candidate).resolve())
+        return ""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    resolved = path.resolve()
+    try:
+        resolved.relative_to(BASE_DIR.resolve())
+    except ValueError:
+        return ""
+    return str(resolved)
 
 
 def to_int(value: Any, default: int = 0) -> int:
@@ -448,6 +449,12 @@ def format_progress_bar(percentage: float, length: int = 12) -> str:
     return f"{'🟩' * filled}{'⬜' * (length - filled)} {percent:.1f}%"
 
 
+def kb(rows: list[list[dict[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(**btn) for btn in row] for row in rows]
+    )
+
+
 # --- Конфигурация ---
 class Config:
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "").strip()
@@ -530,7 +537,11 @@ class Config:
     SCRAPE_MIN_USER_COUNT: int = env_int("SCRAPE_MIN_USER_COUNT", 10)
     SCRAPE_MAX_USER_COUNT: int = env_int("SCRAPE_MAX_USER_COUNT", 1000)
 
-    AUTO_LEAVE_AFTER_INVITE: bool = str_to_bool(os.getenv("AUTO_LEAVE_AFTER_INVITE"), True)
+    AUTO_LEAVE_AFTER_INVITE: bool = str_to_bool(os.getenv("AUTO_LEAVE_AFTER_INVITE", "true"))
+
+    FEATURE_WORM_MODE: bool = str_to_bool(os.getenv("FEATURE_WORM_MODE", "true"))
+    FEATURE_MAILING: bool = str_to_bool(os.getenv("FEATURE_MAILING", "true"))
+    FEATURE_MAILING_TO_USERS: bool = str_to_bool(os.getenv("FEATURE_MAILING_TO_USERS", "true"))
 
     ENTITY_CACHE_TTL: int = env_int("ENTITY_CACHE_TTL", 300)
     FULL_CHAT_CACHE_TTL: int = env_int("FULL_CHAT_CACHE_TTL", 600)
@@ -541,10 +552,6 @@ class Config:
     OLD_TASK_CLEANUP_INTERVAL: int = env_int("OLD_TASK_CLEANUP_INTERVAL", 86400)
     ERROR_BACKOFF_MIN: float = env_float("ERROR_BACKOFF_MIN", 5.0)
     ERROR_BACKOFF_MAX: float = env_float("ERROR_BACKOFF_MAX", 15.0)
-
-    @classmethod
-    def owner_ids(cls) -> set[int]:
-        return set(cls.OWNER_USER_IDS)
 
     @classmethod
     def validate(cls) -> None:
@@ -560,33 +567,100 @@ class Config:
         elif not re.fullmatch(r"[0-9a-fA-F]{32}", cls.API_HASH):
             errors.append("API_HASH имеет неверный формат (ожидается 32 hex-символа)")
         if not cls.OWNER_USER_IDS:
-            errors.append("OWNER_USER_IDS пуст - бот будет недоступен")
+            errors.append("OWNER_USER_IDS не установлен")
+        if cls.DEFAULT_LANGUAGE not in get_available_languages():
+            errors.append(f"DEFAULT_LANGUAGE='{cls.DEFAULT_LANGUAGE}' не найден среди языков")
+        if not cls.LANGS_DIR:
+            errors.append("LANGS_DIR не может выходить за пределы каталога проекта")
+        if not cls.SESSIONS_DIR:
+            errors.append("SESSIONS_DIR не может выходить за пределы каталога проекта")
         if cls.MIN_INVITE_DELAY > cls.MAX_INVITE_DELAY:
-            errors.append("MIN_INVITE_DELAY больше MAX_INVITE_DELAY")
+            errors.append("MIN_INVITE_DELAY не может быть больше MAX_INVITE_DELAY")
         if cls.MIN_WORKERS > cls.MAX_WORKERS:
-            errors.append("MIN_WORKERS больше MAX_WORKERS")
+            errors.append("MIN_WORKERS не может быть больше MAX_WORKERS")
+        if cls.MAX_CONCURRENT_TASKS < 1:
+            errors.append("MAX_CONCURRENT_TASKS должен быть больше 0")
+        if cls.MAX_TASKS_PER_USER < 1:
+            errors.append("MAX_TASKS_PER_USER должен быть больше 0")
+        if cls.TASK_TIMEOUT < 60:
+            errors.append("TASK_TIMEOUT должен быть не меньше 60 секунд")
         if cls.HUMAN_BREAK_MIN > cls.HUMAN_BREAK_MAX:
-            errors.append("HUMAN_BREAK_MIN больше HUMAN_BREAK_MAX")
+            errors.append("HUMAN_BREAK_MIN не может быть больше HUMAN_BREAK_MAX")
+        if cls.HUMAN_SKIP_DELAY_MIN > cls.HUMAN_SKIP_DELAY_MAX:
+            errors.append("HUMAN_SKIP_DELAY_MIN не может быть больше HUMAN_SKIP_DELAY_MAX")
+        if cls.INVITE_JITTER_MIN > cls.INVITE_JITTER_MAX:
+            errors.append("INVITE_JITTER_MIN не может быть больше INVITE_JITTER_MAX")
+        if cls.POST_BUFFER_DELAY_MIN > cls.POST_BUFFER_DELAY_MAX:
+            errors.append("POST_BUFFER_DELAY_MIN не может быть больше POST_BUFFER_DELAY_MAX")
+        if cls.WORM_MIN_DELAY > cls.WORM_MAX_DELAY:
+            errors.append("WORM_MIN_DELAY не может быть больше WORM_MAX_DELAY")
+        if cls.MAILING_MIN_DELAY > cls.MAILING_MAX_DELAY:
+            errors.append("MAILING_MIN_DELAY не может быть больше MAILING_MAX_DELAY")
+        if cls.SCRAPE_MIN_USER_COUNT > cls.SCRAPE_MAX_USER_COUNT:
+            errors.append("SCRAPE_MIN_USER_COUNT не может быть больше SCRAPE_MAX_USER_COUNT")
+        if cls.SCRAPE_MIN_MESSAGE_LIMIT > cls.SCRAPE_MAX_MESSAGE_LIMIT:
+            errors.append("SCRAPE_MIN_MESSAGE_LIMIT не может быть больше SCRAPE_MAX_MESSAGE_LIMIT")
+        if cls.ADAPTIVE_DELAY_BASE > cls.ADAPTIVE_DELAY_MAX:
+            errors.append("ADAPTIVE_DELAY_BASE не может быть больше ADAPTIVE_DELAY_MAX")
+        if cls.ERROR_BACKOFF_MIN > cls.ERROR_BACKOFF_MAX:
+            errors.append("ERROR_BACKOFF_MIN не может быть больше ERROR_BACKOFF_MAX")
+        if cls.FLOOD_WAIT_MULTIPLIER < 1.0:
+            errors.append("FLOOD_WAIT_MULTIPLIER должен быть не меньше 1.0")
+        if cls.VALIDATOR_ANTI_FLOOD_DELAY_MIN > cls.VALIDATOR_ANTI_FLOOD_DELAY_MAX:
+            errors.append("VALIDATOR_ANTI_FLOOD_DELAY_MIN не может быть больше MAX")
+        if cls.CHAT_ADD_THROTTLE_DELAY_MIN > cls.CHAT_ADD_THROTTLE_DELAY_MAX:
+            errors.append("CHAT_ADD_THROTTLE_DELAY_MIN не может быть больше MAX")
         if errors:
-            message = "Ошибка конфигурации:\n" + "\n".join(f"  - {e}" for e in errors)
-            raise ConfigError(message)
+            error_msg = "Ошибка конфигурации:\n" + "\n".join(f"  • {e}" for e in errors)
+            logger.critical(error_msg)
+            raise ConfigError(error_msg)
 
 
+# --- Features ---
 class Features:
-    AUTO_LEAVE: bool = Config.AUTO_LEAVE_AFTER_INVITE
-    HUMAN_SIMULATION: bool = Config.SIMULATE_SKIP_RATE > 0 or Config.HUMAN_BREAK_CHANCE > 0
-    WORM_MODE: bool = str_to_bool(os.getenv("FEATURE_WORM_MODE"), True)
-    MAILING: bool = str_to_bool(os.getenv("FEATURE_MAILING"), True)
-    MAILING_TO_USERS: bool = str_to_bool(os.getenv("FEATURE_MAILING_TO_USERS"), True)
+    @staticmethod
+    def auto_leave() -> bool:
+        return bool(Config.AUTO_LEAVE_AFTER_INVITE)
 
-    @classmethod
-    def validate(cls) -> list[str]:
+    @staticmethod
+    def human_simulation() -> bool:
+        return Config.SIMULATE_SKIP_RATE > 0 or Config.HUMAN_BREAK_CHANCE > 0
+
+    @staticmethod
+    def mailing() -> bool:
+        return bool(Config.FEATURE_MAILING)
+
+    @staticmethod
+    def mailing_to_users() -> bool:
+        return bool(Config.FEATURE_MAILING_TO_USERS)
+
+    @staticmethod
+    def worm_mode() -> bool:
+        return bool(Config.FEATURE_WORM_MODE)
+
+    @staticmethod
+    def features_dict() -> dict[str, bool]:
+        return {
+            "auto_leave": Features.auto_leave(),
+            "human_simulation": Features.human_simulation(),
+            "mailing": Features.mailing(),
+            "mailing_to_users": Features.mailing_to_users(),
+            "worm_mode": Features.worm_mode(),
+        }
+
+    @staticmethod
+    def validate() -> list[str]:
         errors: list[str] = []
-        if not cls.MAILING:
+        if not Features.mailing():
             errors.append("FEATURE_MAILING=false - массовая рассылка недоступна")
-        if not cls.WORM_MODE:
-            errors.append("FEATURE_WORM_MODE=false - режим червя недоступен")
+        if not Features.worm_mode():
+            errors.append("FEATURE_WORM_MODE=false - режим червя недоступна")
+        if not Features.mailing_to_users():
+            errors.append("FEATURE_MAILING_TO_USERS=false - рассылка в личные сообщения отключена")
         return errors
+
+
+OWNER_USER_ID_SET: set[int] = set(Config.OWNER_USER_IDS)
 
 
 def rand_range(min_value: float, max_value: float) -> float:
@@ -602,7 +676,7 @@ def backoff_delay() -> float:
 
 
 def is_owner_user(user_id: int) -> bool:
-    return to_int(user_id) in set(Config.OWNER_USER_IDS)
+    return to_int(user_id) in OWNER_USER_ID_SET
 
 
 # --- Языки и перевод ---
@@ -637,6 +711,7 @@ def load_languages() -> None:
         code = str(data.get("meta", {}).get("code", path.stem)).strip().lower() or path.stem
         LANGUAGES[code] = data
         _LANG_CACHE[code] = data
+    build_nav_actions()
     logger.info(f"Языковая система инициализирована: {sorted(LANGUAGES)}")
 
 
@@ -653,7 +728,7 @@ def validate_languages() -> list[str]:
             errors.append(f"{code}: meta.code не совпадает с именем файла")
         if not str(meta.get("name", "")).strip():
             errors.append(f"{code}: пустое meta.name")
-        for section in ("buttons", "texts"):
+        for section in ("buttons", "texts", "errors"):
             if not isinstance(data.get(section), dict):
                 errors.append(f"{code}: отсутствует секция {section}")
     return errors
@@ -663,10 +738,31 @@ def get_available_languages() -> list[str]:
     return sorted(LANGUAGES)
 
 
+def build_nav_actions() -> None:
+    NAV_ACTIONS.clear()
+    for code in get_available_languages():
+        for key, action in NAV_BUTTONS.items():
+            label = translate(code, key)
+            if label and label != key:
+                NAV_ACTIONS[label] = action
+
+
 def get_language_display_name(code: str) -> str:
     data = LANGUAGES.get(code, {})
     name = str(data.get("meta", {}).get("name", "")).strip()
     return name or code
+
+
+LANGUAGE_CONTEXT: ContextVar[str] = ContextVar("language_context", default=DEFAULT_LANGUAGE)
+
+NAV_BUTTONS: dict[str, str] = {
+    "buttons.nav_menu": "menu",
+    "buttons.nav_tasks": "tasks",
+    "buttons.nav_language": "language",
+    "buttons.nav_stop_worm": "stop_worm",
+    "buttons.nav_cancel": "cancel",
+}
+NAV_ACTIONS: dict[str, str] = {}
 
 
 def _resolve_key(data: dict[str, Any], key: str) -> Any:
@@ -709,22 +805,14 @@ def translate(language_code: Any, key: str, **kwargs: Any) -> str:
         return text
 
 
-# --- Утилиты логирования ---
-def log_error(func: Callable[..., Any]) -> Callable[..., Any]:
-    async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        try:
-            return await func(*args, **kwargs)
-        except Exception as e:
-            logger.exception(f"Ошибка в {func.__name__}: {e}")  # noqa: TRY401
-            raise
-
-    return wrapper
+def err(key: str, **kwargs: Any) -> str:
+    return translate(LANGUAGE_CONTEXT.get(), f"errors.{key}", **kwargs)
 
 
 # --- Модели данных ---
 class Task:
-    ACTIVE_STATUSES: ClassVar[frozenset[str]] = frozenset({"pending", "running", "paused"})
-    FINAL_STATUSES: ClassVar[frozenset[str]] = frozenset({"completed", "cancelled", "failed"})
+    ACTIVE_STATUSES: ClassVar[frozenset[str]] = ACTIVE_TASK_STATUSES
+    FINAL_STATUSES: ClassVar[frozenset[str]] = FINAL_TASK_STATUSES
 
     __slots__ = (
         "cancelled_at",
@@ -763,7 +851,7 @@ class Task:
         cancelled_by: int | None = None,
         paused_at: str | None = None,
         resumed_at: str | None = None,
-    ) -> None:
+    ):
         self.task_id = task_id
         self.type = type
         self.status = status
@@ -786,7 +874,7 @@ class Task:
         return self.status in self.ACTIVE_STATUSES
 
     @classmethod
-    def from_row(cls, row: Any) -> Task:
+    def from_row(cls, row: Any) -> Self:
         data = dict(row)
         return cls(
             task_id=str(data.get("task_id") or ""),
@@ -901,7 +989,7 @@ class WormSourceStats:
 
 # --- База данных SQLite ---
 class SQLiteDatabase:
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str):
         self.db_path: str = db_path
         self.conn: aiosqlite.Connection | None = None
         self.lock: asyncio.Lock = asyncio.Lock()
@@ -923,7 +1011,7 @@ class SQLiteDatabase:
             )
         except Exception as e:
             logger.critical(f"Не удалось подключиться к БД {self.db_path}: {e}")
-            raise DatabaseError(f"Ошибка подключения к БД {self.db_path}: {e}", e) from e
+            raise DatabaseError(err("db_connect", path=self.db_path, error=e), e) from e
         self.conn.row_factory = aiosqlite.Row
         await self._apply_pragmas()
         await self._init_db()
@@ -950,7 +1038,7 @@ class SQLiteDatabase:
         try:
             await self.conn.close()
             logger.info(f"БД закрыта: {self.db_path}")
-        except DB_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Ошибка закрытия БД {self.db_path}: {e}")
         finally:
             self.conn = None
@@ -997,19 +1085,16 @@ class TasksDB(SQLiteDatabase):
                         await self.conn.execute(f"ALTER TABLE tasks DROP COLUMN {legacy}")
                     except (aiosqlite.OperationalError, aiosqlite.DatabaseError):
                         continue
-                for index, statement in enumerate(
-                    (
-                        "CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)",
-                        "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
-                        "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)",
-                    ),
-                    start=1,
+                for statement in (
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)",
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at)",
                 ):
                     await self.conn.execute(statement)
                 await self.conn.commit()
             except Exception as e:
                 logger.error(f"Ошибка инициализации БД задач: {e}")
-                raise DatabaseError(f"Ошибка init_db задач: {e}", e) from e
+                raise DatabaseError(err("db_init_tasks", error=e), e) from e
 
     async def add_task(self, task: Task) -> bool:
         if self.conn is None:
@@ -1046,7 +1131,7 @@ class TasksDB(SQLiteDatabase):
                     ),
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"add_task {task.task_id}: {e}")
                 return False
         return True
@@ -1060,7 +1145,7 @@ class TasksDB(SQLiteDatabase):
                     "SELECT * FROM tasks WHERE task_id = ?", (str(task_id),)
                 )
                 row = await cursor.fetchone()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"get_task {task_id}: {e}")
                 return None
         return Task.from_row(row) if row else None
@@ -1096,7 +1181,7 @@ class TasksDB(SQLiteDatabase):
                 values = [*updates.values(), str(task_id)]
                 await self.conn.execute(f"UPDATE tasks SET {set_clause} WHERE task_id = ?", values)
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"update_task {task_id}: {e}")
                 return False
         return True
@@ -1108,7 +1193,7 @@ class TasksDB(SQLiteDatabase):
             try:
                 cursor = await self.conn.execute(query, params)
                 rows = await cursor.fetchall()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"TasksDB fetch: {e}")
                 return []
         return [Task.from_row(row) for row in rows]
@@ -1157,7 +1242,7 @@ class TasksDB(SQLiteDatabase):
                 )
                 await self.conn.commit()
                 return max(0, cursor.rowcount)
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"cancel_all_active: {e}")
                 return 0
 
@@ -1173,7 +1258,7 @@ class TasksDB(SQLiteDatabase):
                 )
                 await self.conn.commit()
                 return max(0, cursor.rowcount)
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"delete_finished_before: {e}")
                 return 0
 
@@ -1189,7 +1274,7 @@ class TasksDB(SQLiteDatabase):
                 )
                 await self.conn.commit()
                 return max(0, cursor.rowcount)
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"mark_running_as_paused: {e}")
                 return 0
 
@@ -1243,7 +1328,7 @@ class ChatDB(SQLiteDatabase):
                 await self.conn.commit()
             except Exception as e:
                 logger.error(f"Ошибка инициализации БД чатов: {e}")
-                raise DatabaseError(f"Ошибка init_db чатов: {e}", e) from e
+                raise DatabaseError(err("db_init_chats", error=e), e) from e
 
     async def upsert_chat(
         self,
@@ -1277,7 +1362,7 @@ class ChatDB(SQLiteDatabase):
                     ),
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"upsert_chat {chat_id}: {e}")
                 return False
         return True
@@ -1297,7 +1382,7 @@ class ChatDB(SQLiteDatabase):
                     f"UPDATE collected_chats SET {set_clause} WHERE chat_id = ?", values
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"update_chat {chat_id}: {e}")
                 return False
         return True
@@ -1324,7 +1409,7 @@ class ChatDB(SQLiteDatabase):
                 cursor = await self.conn.execute(query, params)
                 await self.conn.commit()
                 return cursor.rowcount > 0
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"ChatDB delete: {e}")
                 return False
 
@@ -1337,7 +1422,7 @@ class ChatDB(SQLiteDatabase):
                     "SELECT * FROM collected_chats WHERE chat_id = ?", (str(chat_id),)
                 )
                 row = await cursor.fetchone()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"get_chat {chat_id}: {e}")
                 return None
         return self._to_info(row) if row else None
@@ -1353,7 +1438,7 @@ class ChatDB(SQLiteDatabase):
             try:
                 cursor = await self.conn.execute(query)
                 rows = await cursor.fetchall()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"get_all_chats: {e}")
                 return []
         return [self._to_info(row) for row in rows]
@@ -1371,7 +1456,7 @@ class ChatDB(SQLiteDatabase):
             try:
                 cursor = await self.conn.execute(query)
                 row = await cursor.fetchone()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"get_total_users: {e}")
                 return 0
         return to_int(row["total"]) if row else 0
@@ -1397,7 +1482,7 @@ class ChatDB(SQLiteDatabase):
 
 
 class CacheManager(SQLiteDatabase):
-    def __init__(self, db_path: str) -> None:
+    def __init__(self, db_path: str):
         super().__init__(db_path)
         self._participants: dict[str, tuple[list[int], float]] = {}
         self._invited: dict[str, tuple[bool, float]] = {}
@@ -1420,7 +1505,7 @@ class CacheManager(SQLiteDatabase):
                 await self.conn.commit()
             except Exception as e:
                 logger.error(f"Ошибка инициализации БД кэша: {e}")
-                raise DatabaseError(f"Ошибка init_db кэша: {e}", e) from e
+                raise DatabaseError(err("db_init_cache", error=e), e) from e
 
     async def cache_participants(self, chat_id: str, user_ids: list[int]) -> None:
         if self.conn is None:
@@ -1437,7 +1522,7 @@ class CacheManager(SQLiteDatabase):
                     [(str(chat_id), int(uid), now) for uid in user_ids],
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"cache_participants {chat_id}: {e}")
                 return
         self._participants[str(chat_id)] = (
@@ -1459,7 +1544,7 @@ class CacheManager(SQLiteDatabase):
                     "SELECT user_id FROM chat_participants WHERE chat_id = ?", (key,)
                 )
                 rows = await cursor.fetchall()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"get_cached_participants {chat_id}: {e}")
                 return []
         result = [to_int(row["user_id"]) for row in rows]
@@ -1480,14 +1565,17 @@ class CacheManager(SQLiteDatabase):
                 cursor = await self.conn.execute(query, params)
                 await self.conn.commit()
                 return max(0, cursor.rowcount)
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"clear_participants: {e}")
                 return 0
 
     async def mark_invited(self, chat_id: str, user_id: int, task_id: str | None = None) -> None:
         key = f"{chat_id}:{user_id}"
         if self.conn is None:
-            self._invited[key] = (True, datetime.now(UTC).timestamp() + Config.INVITED_CACHE_TTL)
+            self._invited[key] = (
+                True,
+                datetime.now(UTC).timestamp() + Config.INVITED_CACHE_TTL,
+            )
             return
         async with self.lock:
             try:
@@ -1497,10 +1585,13 @@ class CacheManager(SQLiteDatabase):
                     (str(chat_id), to_int(user_id), task_id, utc_now_iso()),
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"mark_invited {key}: {e}")
                 return
-        self._invited[key] = (True, datetime.now(UTC).timestamp() + Config.INVITED_CACHE_TTL)
+        self._invited[key] = (
+            True,
+            datetime.now(UTC).timestamp() + Config.INVITED_CACHE_TTL,
+        )
 
     async def is_invited(self, chat_id: str, user_id: int) -> bool:
         key = f"{chat_id}:{user_id}"
@@ -1517,7 +1608,7 @@ class CacheManager(SQLiteDatabase):
                     (str(chat_id), to_int(user_id)),
                 )
                 row = await cursor.fetchone()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"is_invited {key}: {e}")
                 return False
         result = row is not None
@@ -1534,7 +1625,7 @@ class CacheManager(SQLiteDatabase):
                 cursor = await self.conn.execute("DELETE FROM invited_users")
                 await self.conn.commit()
                 return removed + max(0, cursor.rowcount)
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"clear invited cache: {e}")
                 return removed
 
@@ -1556,7 +1647,7 @@ class UserDB(SQLiteDatabase):
                 await self.conn.commit()
             except Exception as e:
                 logger.error(f"Ошибка инициализации БД пользователей: {e}")
-                raise DatabaseError(f"Ошибка init_db пользователей: {e}", e) from e
+                raise DatabaseError(err("db_init_users", error=e), e) from e
 
     async def ensure_user(self, user_id: int) -> bool:
         if self.conn is None:
@@ -1568,7 +1659,7 @@ class UserDB(SQLiteDatabase):
                     (to_int(user_id), utc_now_iso(), DEFAULT_LANGUAGE),
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"ensure_user {user_id}: {e}")
                 return False
         return True
@@ -1582,13 +1673,16 @@ class UserDB(SQLiteDatabase):
                     "SELECT language FROM users WHERE user_id = ?", (to_int(user_id),)
                 )
                 row = await cursor.fetchone()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"get_language {user_id}: {e}")
                 return DEFAULT_LANGUAGE
         code = str(row["language"] or "").strip().lower() if row else ""
         return code if code in LANGUAGES else DEFAULT_LANGUAGE
 
     async def set_language(self, user_id: int, language: str) -> bool:
+        code = str(language).strip().lower()
+        if code not in LANGUAGES:
+            return False
         if await self.ensure_user(user_id) is False:
             return False
         if self.conn is None:
@@ -1597,10 +1691,10 @@ class UserDB(SQLiteDatabase):
             try:
                 await self.conn.execute(
                     "UPDATE users SET language = ? WHERE user_id = ?",
-                    (str(language).strip().lower(), to_int(user_id)),
+                    (code, to_int(user_id)),
                 )
                 await self.conn.commit()
-            except DB_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"set_language {user_id}: {e}")
                 return False
         return True
@@ -1612,11 +1706,6 @@ SYSTEM_VERSION: str = "Linux"
 APP_VERSION: str = "4.16.8"
 
 
-class NoAvailableAccountError(BotError):
-    def __init__(self, message: str) -> None:
-        super().__init__(message, code=409)
-
-
 def create_telegram_client(session_string: str | None = None) -> TelegramClient:
     session = StringSession(session_string) if session_string else StringSession()
     return TelegramClient(
@@ -1626,8 +1715,8 @@ def create_telegram_client(session_string: str | None = None) -> TelegramClient:
         device_model=DEVICE_MODEL,
         system_version=SYSTEM_VERSION,
         app_version=APP_VERSION,
-        system_lang_code="en",
-        lang_code="en",
+        system_lang_code=Config.DEFAULT_LANGUAGE,
+        lang_code=Config.DEFAULT_LANGUAGE,
         catch_up=False,
         connection_retries=3,
         retry_delay=2,
@@ -1635,7 +1724,7 @@ def create_telegram_client(session_string: str | None = None) -> TelegramClient:
 
 
 class EntityCache:
-    def __init__(self, ttl: int) -> None:
+    def __init__(self, ttl: int):
         self._ttl: int = ttl
         self._cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
         self._inflight: dict[str, asyncio.Future[Any | None]] = {}
@@ -1660,7 +1749,7 @@ class EntityCache:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
             raise
-        except TELEGRAM_ERRORS:
+        except Exception:  # noqa: BLE001
             return None
 
     async def _fetch(self, client: TelegramClient, identifier: int | str, key: str) -> Any | None:
@@ -1696,7 +1785,7 @@ class EntityCache:
 
 
 class FullChatCache:
-    def __init__(self, ttl: int) -> None:
+    def __init__(self, ttl: int):
         self._ttl: int = ttl
         self._cache: OrderedDict[str, tuple[Any, float]] = OrderedDict()
         self._lock: asyncio.Lock = asyncio.Lock()
@@ -1740,7 +1829,7 @@ full_chat_cache: FullChatCache = FullChatCache(Config.FULL_CHAT_CACHE_TTL)
 def require_client(account: Account) -> TelegramClient:
     client = account.client
     if client is None:
-        raise NoAvailableAccountError(f"Аккаунт {account.session_file} не подключён")
+        raise NoAvailableAccountError(err("account_not_connected", session=account.session_file))
     return client
 
 
@@ -1761,7 +1850,7 @@ async def get_cached_entity(account: Account, identifier: int | str) -> Any | No
         except AuthKeyUnregisteredError:
             account.is_valid = False
             raise
-        except TELEGRAM_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Не удалось получить сущность {identifier}: {type(e).__name__}: {e}")
             return None
     return None
@@ -1789,7 +1878,7 @@ async def get_full_chat(account: Account, identifier: int | str) -> Any | None:
         raise
     except FloodWaitError:
         raise
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Не удалось получить full chat для {identifier}: {e}")
         return None
     await full_chat_cache.set(account.session_file, identifier, full)
@@ -1810,18 +1899,18 @@ async def extract_participants_count(full: Any) -> int | None:
 async def join_chat(account: Account, identifier: str) -> tuple[Any, bool]:
     client = account.client
     if client is None:
-        raise NoAvailableAccountError("Аккаунт не подключён")
+        raise NoAvailableAccountError(err("account_no_client"))
     if identifier.startswith("https://t.me/+", "+"):
         invite_hash = identifier.split("+", 1)[1]
         result = await client(functions.messages.ImportChatInviteRequest(invite_hash))
         chats = getattr(result, "chats", None)
         entity = chats[0] if chats else await get_cached_entity(account, identifier)
         if entity is None:
-            raise ChatUnreachableError(f"Не удалось получить чат по инвайт-ссылке {identifier}")
+            raise ChatUnreachableError(err("chat_unreachable", identifier=identifier))
         return entity, True
     entity = await get_cached_entity(account, identifier)
     if entity is None:
-        raise ChatUnreachableError(f"Сущность не найдена: {identifier}")
+        raise ChatUnreachableError(err("entity_not_found", identifier=identifier))
     try:
         await client(functions.channels.JoinChannelRequest(entity))
     except UserAlreadyParticipantError:
@@ -1844,7 +1933,7 @@ async def leave_chat(account: Account, entity: Any, label: str) -> bool:
     except UserNotParticipantError:
         logger.debug(f"Аккаунт {account.session_file} и так не состоит в {label}")
         return False
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Не удалось выйти из {label}: {type(e).__name__}: {e}")
         return False
     logger.info(f"Аккаунт {account.session_file} вышел из {label}")
@@ -1873,7 +1962,7 @@ async def validate_and_test_chat(
         if update_existing:
             await chat_db.delete_chat_by_identifier(identifier)
         return None
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Ошибка входа в {identifier}: {type(e).__name__}: {e}")
         if update_existing:
             await chat_db.delete_chat_by_identifier(identifier)
@@ -1909,7 +1998,7 @@ async def validate_and_test_chat(
             user_count = 0
         except AuthKeyUnregisteredError:
             raise
-        except TELEGRAM_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Не удалось получить participant_count для {identifier}: {e}")
 
     can_write = False
@@ -1934,7 +2023,7 @@ async def validate_and_test_chat(
     except SlowModeWaitError as e:
         logger.info(f"Slow mode в {chat_name}: {getattr(e, 'seconds', 5)}с")
         can_write = False
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Ошибка проверки записи в {chat_name}: {type(e).__name__}: {e}")
         can_write = False
 
@@ -1950,7 +2039,7 @@ async def validate_and_test_chat(
         except AuthKeyUnregisteredError:
             account.is_valid = False
             raise
-        except TELEGRAM_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Не удалось удалить тестовое сообщение в {chat_name}: {e}")
 
     if joined_by_bot:
@@ -1993,7 +2082,7 @@ async def check_and_clean_chats(account: Account) -> CheckAndCleanResult:
         except FloodWaitError:
             result.errors += 1
             continue
-        except TELEGRAM_ERRORS:
+        except Exception:  # noqa: BLE001
             if await chat_db.delete_chat(chat.chat_id):
                 result.removed += 1
                 logger.info(f"Чат {chat.chat_name} удалён: недоступен")
@@ -2020,7 +2109,7 @@ async def check_and_clean_chats(account: Account) -> CheckAndCleanResult:
         except AuthKeyUnregisteredError:
             account.is_valid = False
             raise
-        except TELEGRAM_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug(f"Проба записи в {chat.chat_name} не удалась: {type(e).__name__}: {e}")
             reachable = False
 
@@ -2049,7 +2138,7 @@ async def check_and_clean_chats(account: Account) -> CheckAndCleanResult:
         except AuthKeyUnregisteredError:
             account.is_valid = False
             raise
-        except TELEGRAM_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             result.errors += 1
             logger.error(f"Ошибка обновления чата {chat.chat_name}: {e}")
     return result
@@ -2057,7 +2146,7 @@ async def check_and_clean_chats(account: Account) -> CheckAndCleanResult:
 
 # --- Пул аккаунтов ---
 class AccountPoolManager:
-    def __init__(self) -> None:
+    def __init__(self):
         self.accounts: list[Account] = []
         self.lock: asyncio.Lock = asyncio.Lock()
         self._success_rate: dict[str, float] = {}
@@ -2156,7 +2245,7 @@ class AccountPoolManager:
         return extended
 
     def should_simulate_skip(self) -> bool:
-        return Features.HUMAN_SIMULATION and rand_range(0, 1) < Config.SIMULATE_SKIP_RATE
+        return Features.human_simulation() and rand_range(0, 1) < Config.SIMULATE_SKIP_RATE
 
     async def _connect(self, account: Account) -> TelegramClient:
         async def _do_connect() -> TelegramClient:
@@ -2181,7 +2270,7 @@ class AccountPoolManager:
         if account.client is not None:
             try:
                 await account.client.disconnect()
-            except TELEGRAM_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.debug(f"disconnect {account.session_file}: {e}")
             account.client = None
         try:
@@ -2189,7 +2278,9 @@ class AccountPoolManager:
         except Exception as e:
             logger.error(f"Не удалось подключить {account.session_file}: {e}")
             account.is_valid = False
-            raise NoAvailableAccountError(f"Аккаунт {account.session_file} недоступен: {e}") from e
+            raise NoAvailableAccountError(
+                err("account_unavailable", session=account.session_file, error=e)
+            ) from e
         self._update_success_rate(account, True)
         return account.client
 
@@ -2207,19 +2298,17 @@ class AccountPoolManager:
             if session_file:
                 account = self.get_account(session_file)
                 if account is None:
-                    raise NoAvailableAccountError(f"Сессия {session_file} не найдена")
+                    raise NoAvailableAccountError(err("session_not_found", session=session_file))
                 if not account.is_valid:
-                    raise NoAvailableAccountError(f"Сессия {session_file} недействительна")
+                    raise NoAvailableAccountError(err("session_invalid", session=session_file))
                 if account.in_use:
-                    raise NoAvailableAccountError(f"Сессия {session_file} сейчас занята")
+                    raise NoAvailableAccountError(err("session_busy", session=session_file))
                 if self._flood_active(account):
-                    raise NoAvailableAccountError(
-                        f"Сессия {session_file} в режиме ожидания FloodWait"
-                    )
+                    raise NoAvailableAccountError(err("session_flood_wait", session=session_file))
             else:
                 candidates = [account for account in self.accounts if self.is_available(account)]
                 if not candidates:
-                    raise NoAvailableAccountError("Нет свободных аккаунтов")
+                    raise NoAvailableAccountError(err("no_free_accounts"))
                 candidates.sort(
                     key=lambda item: (
                         -self._success_rate.get(item.session_file, 1.0),
@@ -2248,7 +2337,7 @@ class AccountPoolManager:
             try:
                 await self.ensure_client(account)
                 logger.info(f"Проверка аккаунта {account.session_file}: ОК")
-            except RUNTIME_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Проверка аккаунта {account.session_file}: {e}")
 
     async def start_health_check(self) -> None:
@@ -2271,7 +2360,7 @@ class AccountPoolManager:
                 await self.health_check_once()
             except asyncio.CancelledError:
                 break
-            except RUNTIME_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Ошибка health check: {e}")
                 await asyncio.sleep(backoff_delay())
 
@@ -2282,18 +2371,36 @@ class AccountPoolManager:
             try:
                 if account.client.is_connected():
                     await account.client.disconnect()
-            except RUNTIME_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Ошибка отключения {account.session_file}: {e}")
             account.client = None
             account.in_use = False
 
 
-# --- Глобальные компоненты ---
+# --- Глобальные объекты ---
+_bot_token: str = Config.BOT_TOKEN if is_valid_bot_token_format(Config.BOT_TOKEN) else ""
+if not _bot_token:
+    logger.critical("BOT_TOKEN не настроен или некорректен. Бот не будет запущен.")
+    sys.exit(1)
+
+bot: Bot = Bot(
+    token=_bot_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+router: Router = Router(name="inviter")
+dp.include_router(router)
+dp.callback_query.middleware(CallbackAnswerMiddleware())
+
 tasks_db: TasksDB = TasksDB(Config.TASKS_DB_PATH)
 chat_db: ChatDB = ChatDB(Config.CHATS_DB_PATH)
 cache_db: CacheManager = CacheManager(Config.CACHE_DB_PATH)
 user_db: UserDB = UserDB(Config.USERS_DB_PATH)
 account_manager: AccountPoolManager = AccountPoolManager()
+
+LOGIN_CLIENTS: dict[int, TelegramClient] = {}
+BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
 TASK_TYPES: dict[str, str] = {
     "scrape_invite": "task_types.scrape_invite",
@@ -2400,12 +2507,15 @@ def build_task_keyboard(task: Task, language: str) -> InlineKeyboardMarkup:
             ),
         ]
     )
+    rows.append(
+        [InlineKeyboardButton(text=translate(language, "buttons.menu"), callback_data="menu:main")]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # --- Управление жизненным циклом задачи ---
 class TaskControl:
-    def __init__(self) -> None:
+    def __init__(self):
         self.task: Task | None = None
         self._cancelled: bool = False
         self._paused: bool = False
@@ -2446,8 +2556,17 @@ class TaskControl:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return not self._cancelled
-            if not await self.checkpoint():
+            if self._cancelled:
                 return False
+            if self._paused:
+                logger.info(
+                    f"Задача {self.task_id} на паузе, ждём возобновления (осталось {remaining:.1f}с)"
+                )
+                try:
+                    await asyncio.wait_for(self._resume_event.wait(), timeout=remaining)
+                except TimeoutError:
+                    return not self._cancelled
+                continue
             try:
                 await asyncio.wait_for(self._resume_event.wait(), timeout=remaining)
             except TimeoutError:
@@ -2459,7 +2578,7 @@ class TaskControl:
 
 
 class TaskQueueManager:
-    def __init__(self, bot: Bot) -> None:
+    def __init__(self, bot: Bot):
         self.bot: Bot = bot
         self.queue: asyncio.Queue[str] = asyncio.Queue()
         self.controls: dict[str, TaskControl] = {}
@@ -2613,14 +2732,14 @@ class TaskQueueManager:
                     await self._execute(task_id)
                 except asyncio.CancelledError:
                     raise
-                except Exception as e:
-                    logger.exception(f"Воркер #{index}: сбой выполнения {task_id}: {e}")  # noqa: TRY401
+                except Exception:
+                    logger.exception(f"Воркер #{index}: сбой выполнения {task_id}")
                 finally:
                     self.queue.task_done()
         except asyncio.CancelledError:
             logger.info(f"Воркер #{index} остановлен")
-        except Exception as e:
-            logger.exception(f"Воркер #{index}: критическая ошибка {e}")  # noqa: TRY401
+        except Exception:
+            logger.exception(f"Воркер #{index}: критическая ошибка")
 
     async def _execute(self, task_id: str) -> None:
         task = await tasks_db.get_task(task_id)
@@ -2656,7 +2775,7 @@ class TaskQueueManager:
                 await runner
             except asyncio.CancelledError:
                 logger.debug(f"Задача {task_id}: выполнение отменено по таймауту")
-            except RUNTIME_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.debug(f"Задача {task_id}: runner остановлен по таймауту: {e}")
             await self._finish_failed(
                 task,
@@ -2671,7 +2790,7 @@ class TaskQueueManager:
             await self._finish_cancelled(task)
             raise
         except Exception as e:
-            logger.exception(f"Задача {task_id} завершилась ошибкой: {e}")  # noqa: TRY401
+            logger.exception(f"Задача {task_id} завершилась ошибкой")
             await self._finish_failed(task, f"{type(e).__name__}: {e}")
         finally:
             async with self._lock:
@@ -2693,7 +2812,11 @@ class TaskQueueManager:
                     task_type=task.type,
                 )
             )
-        await handler(task, control)
+        token = LANGUAGE_CONTEXT.set(await user_db.get_language(task.user_id))
+        try:
+            await handler(task, control)
+        finally:
+            LANGUAGE_CONTEXT.reset(token)
 
     async def _finish_failed(self, task: Task, error: str) -> None:
         await tasks_db.update_task(
@@ -2710,6 +2833,7 @@ class TaskQueueManager:
             self.bot,
             task.user_id,
             translate(language, "texts.task_failed_report", task_id=task.task_id, error=error),
+            reply_markup=kb_main(language),
         )
         logger.error(f"Задача {task.task_id} провалена: {error}")
 
@@ -2724,7 +2848,10 @@ class TaskQueueManager:
             else "texts.task_cancelled_report"
         )
         await safe_send_message(
-            self.bot, task.user_id, translate(language, key, task_id=task.task_id)
+            self.bot,
+            task.user_id,
+            translate(language, key, task_id=task.task_id),
+            reply_markup=kb_main(language),
         )
         logger.info(f"Задача {task.task_id} отменена")
 
@@ -2752,8 +2879,8 @@ class TaskQueueManager:
                             await self._retire_worker(candidates[0])
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.exception(f"Ошибка масштабирования воркеров: {e}")  # noqa: TRY401
+            except Exception:
+                logger.exception("Ошибка масштабирования воркеров")
                 await asyncio.sleep(backoff_delay())
 
     async def _health_loop(self) -> None:
@@ -2775,8 +2902,8 @@ class TaskQueueManager:
                     )
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.exception(f"Ошибка health check задач: {e}")  # noqa: TRY401
+            except Exception:
+                logger.exception("Ошибка health check задач")
                 await asyncio.sleep(backoff_delay())
 
     async def _cleanup_loop(self) -> None:
@@ -2791,17 +2918,14 @@ class TaskQueueManager:
                     logger.info(f"Удалено старых задач: {removed}")
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.exception(f"Ошибка очистки задач: {e}")  # noqa: TRY401
+            except Exception:
+                logger.exception("Ошибка очистки задач")
                 await asyncio.sleep(backoff_delay())
-
-
-queue_manager: TaskQueueManager | None = None
 
 
 def get_queue_manager() -> TaskQueueManager:
     if queue_manager is None:
-        raise BotError("Планировщик задач не инициализирован", code=503)
+        raise BotError(err("queue_not_started"), code=503)
     return queue_manager
 
 
@@ -2809,7 +2933,7 @@ def get_queue_manager() -> TaskQueueManager:
 class TaskProgressReporter:
     UPDATE_INTERVAL: ClassVar[float] = 12.0
 
-    def __init__(self, task: Task, control: TaskControl, interval: float | None = None) -> None:
+    def __init__(self, task: Task, control: TaskControl, interval: float | None = None):
         self.task: Task = task
         self.control: TaskControl = control
         self.bot: Bot = get_queue_manager().bot
@@ -3015,7 +3139,7 @@ async def _release_chats(
     source: Any | None,
     source_joined: bool,
 ) -> None:
-    if not Features.AUTO_LEAVE:
+    if not Features.auto_leave():
         logger.info("AUTO_LEAVE выключен, чаты оставляем")
         return
     if source is not None and source_joined:
@@ -3212,7 +3336,7 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
                 account.is_valid = False
                 result.remaining = collected[processed - 1 :]
                 break
-            except TELEGRAM_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Ошибка инвайта {user_id}: {type(e).__name__}: {e}")
                 outcome = "failed"
 
@@ -3284,6 +3408,7 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
             get_queue_manager().bot,
             task.user_id,
             translate(language, "texts.task_cancelled_report", task_id=task.task_id),
+            reply_markup=kb_main(language),
         )
         await reporter.finalize()
         return
@@ -3302,6 +3427,7 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
             privacy=result.privacy_errors,
             account=html.escape(account_name),
         ),
+        reply_markup=kb_main(language),
     )
     await reporter.finalize()
 
@@ -3326,7 +3452,7 @@ async def _collect_mailing_users(
             )
             if participants:
                 await cache_db.cache_participants(identifier, participants)
-            if Features.AUTO_LEAVE and joined:
+            if Features.auto_leave() and joined:
                 await leave_chat(account, entity, identifier)
             candidates = participants
         for user_id in candidates:
@@ -3457,7 +3583,7 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
                 consecutive_errors += 1
                 failed = True
             finally:
-                if target != "users" and Features.AUTO_LEAVE and joined:
+                if target != "users" and Features.auto_leave() and joined:
                     await leave_chat(account, entity, key)
 
             task.sent = sent
@@ -3513,6 +3639,7 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
             get_queue_manager().bot,
             task.user_id,
             translate(language, "texts.mailing_cancelled_report", task_id=task.task_id),
+            reply_markup=kb_main(language),
         )
         await reporter.finalize()
         return
@@ -3538,6 +3665,7 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
         get_queue_manager().bot,
         task.user_id,
         summary,
+        reply_markup=kb_main(language),
     )
     await reporter.finalize()
 
@@ -3624,11 +3752,11 @@ async def run_worm_task(task: Task, control: TaskControl) -> None:
             except AuthKeyUnregisteredError:
                 account.is_valid = False
                 break
-            except TELEGRAM_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 stats.errors += 1
                 logger.error(f"Червь: ошибка обработки {identifier}: {e}")
             finally:
-                if Features.AUTO_LEAVE and joined:
+                if Features.auto_leave() and joined:
                     await leave_chat(account, entity, identifier)
 
             processed_sources.append(identifier)
@@ -3699,10 +3827,6 @@ class InviterStates(StatesGroup):
     waiting_mail_total: State = State()
 
 
-LOGIN_CLIENTS: dict[int, TelegramClient] = {}
-BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
-
-
 async def _drop_login_client(user_id: int) -> None:
     client = LOGIN_CLIENTS.pop(user_id, None)
     if client is None:
@@ -3723,174 +3847,183 @@ def parse_identifier(value: str) -> str | None:
 
 # --- Клавиатуры ---
 def kb_main(language: str) -> InlineKeyboardMarkup:
-    rows = [
+    rows: list[list[dict[str, str]]] = [
         [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.add_chats_to_db"),
-                callback_data="menu:add_chats",
-            ),
-            InlineKeyboardButton(
-                text=translate(language, "buttons.update_chats_db"),
-                callback_data="menu:update_chats",
-            ),
+            {
+                "text": translate(language, "buttons.add_chats_to_db"),
+                "callback_data": "menu:add_chats",
+            },
+            {
+                "text": translate(language, "buttons.update_chats_db"),
+                "callback_data": "menu:update_chats",
+            },
         ],
         [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.start_scraping"),
-                callback_data="menu:scrape",
-            ),
-            InlineKeyboardButton(
-                text=translate(language, "buttons.bulk_mailing"),
-                callback_data="menu:mailing",
-            ),
+            {
+                "text": translate(language, "buttons.start_scraping"),
+                "callback_data": "menu:scrape",
+            },
+            {
+                "text": translate(language, "buttons.bulk_mailing"),
+                "callback_data": "menu:mailing",
+            },
         ],
     ]
-    if Features.WORM_MODE:
+    if Features.worm_mode():
         rows.append(
-            [
-                InlineKeyboardButton(
-                    text=translate(language, "buttons.worm_mode"),
-                    callback_data="menu:worm",
-                )
-            ]
+            [{"text": translate(language, "buttons.worm_mode"), "callback_data": "menu:worm"}]
         )
     rows.append(
         [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.my_tasks"),
-                callback_data="task:list:mine",
-            ),
-            InlineKeyboardButton(
-                text=translate(language, "buttons.task_list"),
-                callback_data="task:list:active",
-            ),
+            {"text": translate(language, "buttons.my_tasks"), "callback_data": "task:list:mine"},
+            {"text": translate(language, "buttons.task_list"), "callback_data": "task:list:active"},
         ]
     )
     rows.append(
         [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.add_account"),
-                callback_data="menu:add_account",
-            ),
-            InlineKeyboardButton(
-                text=translate(language, "buttons.list_accounts"),
-                callback_data="menu:accounts",
-            ),
+            {
+                "text": translate(language, "buttons.add_account"),
+                "callback_data": "menu:add_account",
+            },
+            {
+                "text": translate(language, "buttons.list_accounts"),
+                "callback_data": "menu:accounts",
+            },
         ]
     )
     rows.append(
         [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.clear_cache"),
-                callback_data="menu:clear_cache",
-            ),
-            InlineKeyboardButton(
-                text=translate(language, "buttons.cancel_all_tasks"),
-                callback_data="menu:cancel_all",
-            ),
+            {
+                "text": translate(language, "buttons.clear_cache"),
+                "callback_data": "menu:clear_cache",
+            },
+            {
+                "text": translate(language, "buttons.cancel_all_tasks"),
+                "callback_data": "menu:cancel_all",
+            },
         ]
     )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.append(
+        [{"text": translate(language, "buttons.language"), "callback_data": "menu:language"}]
+    )
+    return kb(rows)
+
+
+def kb_language(language: str) -> InlineKeyboardMarkup:
+    rows: list[list[dict[str, str]]] = [
+        [
+            {"text": get_language_display_name(code), "callback_data": f"lang:{code}"}
+            for code in get_available_languages()
+        ]
+    ]
+    rows.append([{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}])
+    return kb(rows)
 
 
 def kb_cancel(language: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return kb([[{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}]])
+
+
+def kb_nav(language: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
             [
-                InlineKeyboardButton(
-                    text=translate(language, "buttons.cancel"), callback_data="menu:main"
-                )
-            ]
-        ]
+                {"text": translate(language, "buttons.nav_menu")},
+                {"text": translate(language, "buttons.nav_tasks")},
+            ],
+            [
+                {"text": translate(language, "buttons.nav_language")},
+                {"text": translate(language, "buttons.nav_stop_worm")},
+            ],
+            [{"text": translate(language, "buttons.nav_cancel")}],
+        ],
+        resize_keyboard=True,
     )
 
 
 def kb_source_choice(language: str, prefix: str) -> InlineKeyboardMarkup:
-    rows = [
+    return kb(
         [
-            InlineKeyboardButton(
-                text=translate(language, "texts.bulkmail_source_db_btn"),
-                callback_data=f"{prefix}:db",
-            )
-        ],
+            [
+                {
+                    "text": translate(language, "texts.bulkmail_source_db_btn"),
+                    "callback_data": f"{prefix}:db",
+                }
+            ],
+            [
+                {
+                    "text": translate(language, "texts.bulkmail_source_manual"),
+                    "callback_data": f"{prefix}:manual",
+                }
+            ],
+            [{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}],
+        ]
+    )
+
+
+def kb_accounts_empty(language: str) -> InlineKeyboardMarkup:
+    return kb(
         [
-            InlineKeyboardButton(
-                text=translate(language, "texts.bulkmail_source_manual"),
-                callback_data=f"{prefix}:manual",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.cancel"), callback_data="menu:main"
-            )
-        ],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+            [
+                {
+                    "text": translate(language, "buttons.add_account"),
+                    "callback_data": "menu:add_account",
+                }
+            ],
+            [{"text": translate(language, "buttons.menu"), "callback_data": "menu:main"}],
+        ]
+    )
 
 
 def kb_account_choice(
     language: str, prefix: str, auto_key: str = "texts.scrape_auto"
 ) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text=translate(language, auto_key), callback_data=f"{prefix}:auto")]
+    rows: list[list[dict[str, str]]] = [
+        [{"text": translate(language, auto_key), "callback_data": f"{prefix}:auto"}]
     ]
     for account in account_manager.accounts[:10]:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text=f"🧾 {account.session_file}",
-                    callback_data=f"{prefix}:session:{account.session_file}",
-                )
+                {
+                    "text": f"🧾 {account.session_file}",
+                    "callback_data": f"{prefix}:session:{account.session_file}",
+                }
             ]
         )
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text=translate(language, "buttons.cancel"), callback_data="menu:main"
-            )
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.append([{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}])
+    return kb(rows)
 
 
 def kb_mail_target(language: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return kb(
+        [
             [
-                InlineKeyboardButton(
-                    text=translate(language, "texts.bulkmail_target_chats"),
-                    callback_data="mail:target:chats",
-                )
+                {
+                    "text": translate(language, "texts.bulkmail_target_chats"),
+                    "callback_data": "mail:target:chats",
+                }
             ],
             [
-                InlineKeyboardButton(
-                    text=translate(language, "texts.bulkmail_target_users"),
-                    callback_data="mail:target:users",
-                )
+                {
+                    "text": translate(language, "texts.bulkmail_target_users"),
+                    "callback_data": "mail:target:users",
+                }
             ],
-            [
-                InlineKeyboardButton(
-                    text=translate(language, "buttons.cancel"), callback_data="menu:main"
-                )
-            ],
+            [{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}],
         ]
     )
 
 
 def kb_mail_more_text(language: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+    return kb(
+        [
             [
-                InlineKeyboardButton(
-                    text=translate(language, "texts.bulkmail_texts_done"),
-                    callback_data="mail:texts_done",
-                )
+                {
+                    "text": translate(language, "texts.bulkmail_texts_done"),
+                    "callback_data": "mail:texts_done",
+                }
             ],
-            [
-                InlineKeyboardButton(
-                    text=translate(language, "buttons.cancel"), callback_data="menu:main"
-                )
-            ],
+            [{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}],
         ]
     )
 
@@ -3909,14 +4042,20 @@ class OwnerMiddleware(BaseMiddleware):
         user_id = to_int(getattr(user, "id", 0))
         if not is_owner_user(user_id):
             logger.warning(f"Отклонён доступ для {user_id}")
+            client_code = str(getattr(user, "language_code", "") or "").strip().lower()
+            client_language = client_code if client_code in LANGUAGES else DEFAULT_LANGUAGE
             if isinstance(event, Message):
-                await event.answer(translate(DEFAULT_LANGUAGE, "texts.only_admin"))
+                await event.answer(translate(client_language, "texts.only_admin"))
             elif isinstance(event, CallbackQuery):
-                await event.answer(translate(DEFAULT_LANGUAGE, "texts.only_admin"), show_alert=True)
+                await event.answer(translate(client_language, "texts.only_admin"), show_alert=True)
             return None
         data["user_id"] = user_id
         data["language"] = await user_db.get_language(user_id)
-        return await handler(event, data)
+        token = LANGUAGE_CONTEXT.set(data["language"])
+        try:
+            return await handler(event, data)
+        finally:
+            LANGUAGE_CONTEXT.reset(token)
 
 
 class ErrorLogMiddleware(BaseMiddleware):
@@ -3932,25 +4071,27 @@ class ErrorLogMiddleware(BaseMiddleware):
             logger.warning(f"Сетевая ошибка Telegram: {e}")
         except BotError as e:
             logger.error(f"Ошибка бота: {e}")
+            error_text = translate(
+                data.get("language", DEFAULT_LANGUAGE),
+                "texts.error_prefix",
+                error=html.escape(e.message),
+            )
             if isinstance(event, Message):
                 with suppress(TelegramBadRequest, TelegramNetworkError):
-                    await event.answer(f"⚠️ {html.escape(e.message)}")
+                    await event.answer(error_text)
             elif isinstance(event, CallbackQuery):
                 with suppress(TelegramBadRequest, TelegramNetworkError):
-                    await event.answer(f"⚠️ {html.escape(e.message)}", show_alert=True)
+                    await event.answer(error_text, show_alert=True)
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            logger.exception(f"Необработанная ошибка: {e}")  # noqa: TRY401
+        except Exception:
+            logger.exception("Необработанная ошибка")
             if isinstance(event, Message):
                 with suppress(TelegramBadRequest, TelegramNetworkError):
                     await event.answer(
                         translate(data.get("language", DEFAULT_LANGUAGE), "texts.invalid_format")
                     )
         return None
-
-
-router: Router = Router(name="inviter")
 
 
 # --- Хелперы для сообщений ---
@@ -3987,29 +4128,11 @@ async def parse_links_from_message(message: Message) -> list[str]:
     return extract_telegram_links(message.text or message.caption or "")
 
 
-# --- Обработчики: старт и меню ---
-@router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext, language: str) -> None:
-    await state.clear()
-    await user_db.ensure_user(message.from_user.id)
-    chats = await chat_db.get_active_chats_count()
-    users = await chat_db.get_total_users()
-    text = translate(
-        language,
-        "texts.welcome_admin",
-        accounts=len(account_manager.accounts),
-        chats=chats,
-        users=users,
-    )
-    await smart_answer(message, text, reply_markup=kb_main(language))
-
-
-@router.callback_query(F.data == "menu:main")
-async def cb_main(call: CallbackQuery, state: FSMContext, language: str) -> None:
-    await state.clear()
-    await call.answer()
+async def render_main_menu(
+    event: Message | CallbackQuery, language: str, delete_origin: bool = False
+) -> None:
     await smart_answer(
-        call,
+        event,
         translate(
             language,
             "texts.welcome_admin",
@@ -4018,8 +4141,138 @@ async def cb_main(call: CallbackQuery, state: FSMContext, language: str) -> None
             users=await chat_db.get_total_users(),
         ),
         reply_markup=kb_main(language),
+        delete_origin=delete_origin,
+    )
+
+
+async def render_task_list(
+    event: Message | CallbackQuery, language: str, scope: str, delete_origin: bool = False
+) -> None:
+    title_key = "texts.task_list_mine" if scope == "mine" else "texts.task_list_active"
+    if scope == "mine":
+        tasks = [
+            task for task in await tasks_db.get_user_tasks(event.from_user.id) if task.is_active
+        ]
+    else:
+        tasks = list(await tasks_db.get_active_tasks())
+    if not tasks:
+        await smart_answer(
+            event,
+            translate(language, "texts.no_active_tasks"),
+            reply_markup=kb_main(language),
+            delete_origin=delete_origin,
+        )
+        return
+    lines = [translate(language, title_key)]
+    lines.extend(format_task_row(task, language) for task in tasks[:20])
+    rows: list[list[dict[str, str]]] = [
+        [
+            {
+                "text": f"{task_status_emoji(task.status)} {html.escape(task.task_id)}",
+                "callback_data": f"task:view:{task.task_id}",
+            }
+        ]
+        for task in tasks[:8]
+    ]
+    rows.append(
+        [{"text": translate(language, "texts.task_refresh"), "callback_data": "task:list:active"}]
+    )
+    rows.append([{"text": translate(language, "buttons.menu"), "callback_data": "menu:main"}])
+    await smart_answer(
+        event,
+        "\n".join(lines),
+        reply_markup=kb(rows),
+        delete_origin=delete_origin,
+    )
+
+
+# --- Обработчики: навигация ---
+@router.message(F.text.func(lambda text: text in NAV_ACTIONS))
+async def on_nav_button(message: Message, state: FSMContext, language: str) -> None:
+    action = NAV_ACTIONS.get(message.text or "")
+    if action is None:
+        return
+    if action == "menu":
+        await state.clear()
+        await render_main_menu(message, language)
+    elif action == "tasks":
+        await state.clear()
+        await render_task_list(message, language, "active")
+    elif action == "language":
+        await smart_answer(
+            message,
+            translate(language, "texts.language_select"),
+            reply_markup=kb_language(language),
+        )
+    elif action == "stop_worm":
+        await state.clear()
+        await cmd_stop_worm(message, language)
+    elif action == "cancel":
+        had_state = await state.get_state() is not None
+        await state.clear()
+        if had_state:
+            await smart_answer(
+                message,
+                translate(language, "texts.action_cancelled"),
+                reply_markup=kb_main(language),
+            )
+        else:
+            await render_main_menu(message, language)
+
+
+# --- Обработчики: старт и меню ---
+@router.message(Command("start"))
+async def cmd_start(message: Message, state: FSMContext, language: str) -> None:
+    await state.clear()
+    await user_db.ensure_user(message.from_user.id)
+    await smart_answer(
+        message,
+        translate(language, "texts.menu_hint"),
+        reply_markup=kb_nav(language),
+    )
+    await render_main_menu(message, language)
+
+
+@router.message(Command("language"))
+async def cmd_language(message: Message, language: str) -> None:
+    await message.answer(
+        translate(language, "texts.language_select"),
+        reply_markup=kb_language(language),
+    )
+
+
+@router.callback_query(F.data == "menu:language")
+async def cb_language(call: CallbackQuery, language: str) -> None:
+    await smart_answer(
+        call,
+        translate(language, "texts.language_select"),
+        reply_markup=kb_language(language),
         delete_origin=True,
     )
+
+
+@router.callback_query(F.data.startswith("lang:"))
+async def cb_language_set(call: CallbackQuery, state: FSMContext, language: str) -> None:
+    code = str(call.data or "").split(":", 1)[1].strip().lower()
+    if code not in LANGUAGES:
+        await call.answer(translate(language, "texts.language_unknown"), show_alert=True)
+        return
+    await user_db.set_language(call.from_user.id, code)
+    await state.clear()
+    await call.answer()
+    await smart_answer(
+        call,
+        translate(code, "texts.language_selected", name=get_language_display_name(code)),
+        reply_markup=kb_main(code),
+        delete_origin=True,
+    )
+
+
+@router.callback_query(F.data == "menu:main")
+async def cb_main(call: CallbackQuery, state: FSMContext, language: str) -> None:
+    await state.clear()
+    await call.answer()
+    await render_main_menu(call, language, delete_origin=True)
 
 
 # --- Аккаунты ---
@@ -4040,7 +4293,9 @@ async def cb_add_account(call: CallbackQuery, state: FSMContext, language: str) 
 async def on_phone(message: Message, state: FSMContext, language: str) -> None:
     phone = (message.text or "").strip()
     if not is_phone(phone):
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await _drop_login_client(message.from_user.id)
     client = create_telegram_client()
@@ -4049,13 +4304,17 @@ async def on_phone(message: Message, state: FSMContext, language: str) -> None:
         sent = await client.send_code_request(phone)
     except (PhoneNumberInvalidError, FloodError) as e:
         await client.disconnect()
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         logger.warning(f"Ошибка отправки кода: {e}")
         return
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         await client.disconnect()
         logger.error(f"Ошибка подключения при добавлении аккаунта: {e}")
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     LOGIN_CLIENTS[message.from_user.id] = client
     await state.update_data(
@@ -4075,7 +4334,9 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
     data = await state.get_data()
     client = LOGIN_CLIENTS.get(message.from_user.id)
     if client is None or not code:
-        await smart_answer(message, translate(language, "texts.auth_error_state"))
+        await smart_answer(
+            message, translate(language, "texts.auth_error_state"), reply_markup=kb_cancel(language)
+        )
         return
     try:
         await client.sign_in(
@@ -4091,13 +4352,17 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
         return
     except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
         logger.warning(f"Неверный код: {e}")
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Ошибка входа: {e}")
         await _drop_login_client(message.from_user.id)
         await state.clear()
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await _finish_account_login(message, state, client, language)
 
@@ -4106,18 +4371,24 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
 async def on_password(message: Message, state: FSMContext, language: str) -> None:
     client = LOGIN_CLIENTS.get(message.from_user.id)
     if client is None:
-        await smart_answer(message, translate(language, "texts.auth_error_state"))
+        await smart_answer(
+            message, translate(language, "texts.auth_error_state"), reply_markup=kb_cancel(language)
+        )
         return
     try:
         await client.sign_in(password=message.text or "")
     except PasswordHashInvalidError:
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Ошибка ввода пароля: {e}")
         await _drop_login_client(message.from_user.id)
         await state.clear()
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await _finish_account_login(message, state, client, language)
 
@@ -4130,16 +4401,20 @@ async def _finish_account_login(
     try:
         me = await client.get_me()
         session_string = client.session.save()
-    except TELEGRAM_ERRORS as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Не удалось сохранить сессию: {e}")
         await _drop_login_client(message.from_user.id)
         await state.clear()
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await _drop_login_client(message.from_user.id)
     await state.clear()
     if not account_manager.add_account(session_string, session_name):
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await smart_answer(
         message,
@@ -4158,7 +4433,12 @@ async def _finish_account_login(
 async def cb_accounts(call: CallbackQuery, language: str) -> None:
     await call.answer()
     if not account_manager.accounts:
-        await smart_answer(call, translate(language, "texts.no_accounts"), delete_origin=True)
+        await smart_answer(
+            call,
+            translate(language, "texts.no_accounts"),
+            reply_markup=kb_accounts_empty(language),
+            delete_origin=True,
+        )
         return
     lines = [translate(language, "texts.accounts_list")]
     now = datetime.now(UTC)
@@ -4206,12 +4486,20 @@ async def cb_add_chats(call: CallbackQuery, state: FSMContext, language: str) ->
 async def on_links(message: Message, state: FSMContext, language: str) -> None:
     links = await parse_links_from_message(message)
     if not links:
-        await smart_answer(message, translate(language, "texts.worm_wait_links_input"))
+        await smart_answer(
+            message,
+            translate(language, "texts.worm_wait_links_input"),
+            reply_markup=kb_cancel(language),
+        )
         return
     added: list[str] = []
     failed = 0
     if not account_manager.accounts:
-        await smart_answer(message, translate(language, "texts.scrape_no_accounts"))
+        await smart_answer(
+            message,
+            translate(language, "texts.scrape_no_accounts"),
+            reply_markup=kb_cancel(language),
+        )
         await state.clear()
         return
     async with account_manager.acquire(None) as account:
@@ -4230,7 +4518,7 @@ async def on_links(message: Message, state: FSMContext, language: str) -> None:
             except AuthKeyUnregisteredError:
                 account.is_valid = False
                 break
-            except TELEGRAM_ERRORS as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning(f"Ошибка добавления {identifier}: {e}")
                 failed += 1
                 continue
@@ -4273,6 +4561,7 @@ async def cb_update_chats(call: CallbackQuery, language: str) -> None:
             call.bot,
             call.from_user.id,
             translate(language, "texts.no_available_accounts"),
+            reply_markup=kb_main(language),
         )
         return
     async with account_manager.acquire(None) as account:
@@ -4281,7 +4570,10 @@ async def cb_update_chats(call: CallbackQuery, language: str) -> None:
         except AuthKeyUnregisteredError:
             account.is_valid = False
             await safe_send_message(
-                call.bot, call.from_user.id, translate(language, "texts.invalid_account")
+                call.bot,
+                call.from_user.id,
+                translate(language, "texts.invalid_account"),
+                reply_markup=kb_main(language),
             )
             return
         except FloodWaitError as e:
@@ -4291,6 +4583,7 @@ async def cb_update_chats(call: CallbackQuery, language: str) -> None:
                 call.bot,
                 call.from_user.id,
                 translate(language, "texts.floodwait_pause", task_id="-", seconds=int(seconds)),
+                reply_markup=kb_main(language),
             )
             return
     await safe_send_message(
@@ -4304,6 +4597,7 @@ async def cb_update_chats(call: CallbackQuery, language: str) -> None:
             removed=result.removed,
             errors=result.errors,
         ),
+        reply_markup=kb_main(language),
     )
 
 
@@ -4316,6 +4610,7 @@ async def cb_clear_cache(call: CallbackQuery, language: str) -> None:
     await smart_answer(
         call,
         translate(language, "texts.cache_cleared", count=removed),
+        reply_markup=kb_main(language),
         delete_origin=True,
     )
 
@@ -4324,25 +4619,13 @@ async def cb_clear_cache(call: CallbackQuery, language: str) -> None:
 @router.callback_query(F.data == "task:list:active")
 async def cb_task_list_active(call: CallbackQuery, language: str) -> None:
     await call.answer()
-    tasks = [task for task in await tasks_db.get_active_tasks()]
-    if not tasks:
-        await smart_answer(call, translate(language, "texts.no_active_tasks"), delete_origin=True)
-        return
-    lines = ["📋 " + translate(language, "buttons.task_list")]
-    lines.extend(format_task_row(task, language) for task in tasks[:20])
-    await smart_answer(call, "\n".join(lines), reply_markup=kb_main(language), delete_origin=True)
+    await render_task_list(call, language, "active", delete_origin=True)
 
 
 @router.callback_query(F.data == "task:list:mine")
 async def cb_task_list_mine(call: CallbackQuery, language: str) -> None:
     await call.answer()
-    tasks = [task for task in await tasks_db.get_user_tasks(call.from_user.id) if task.is_active]
-    if not tasks:
-        await smart_answer(call, translate(language, "texts.no_active_tasks"), delete_origin=True)
-        return
-    lines = ["📋 " + translate(language, "buttons.my_tasks")]
-    lines.extend(format_task_row(task, language) for task in tasks[:20])
-    await smart_answer(call, "\n".join(lines), reply_markup=kb_main(language), delete_origin=True)
+    await render_task_list(call, language, "mine", delete_origin=True)
 
 
 @router.callback_query(F.data.startswith("task:view:"))
@@ -4369,7 +4652,10 @@ async def cb_task_pause(call: CallbackQuery, language: str) -> None:
         return
     await call.answer()
     await smart_answer(
-        call, translate(language, "texts.task_paused", task_id=task_id), delete_origin=True
+        call,
+        translate(language, "texts.task_paused", task_id=task_id),
+        reply_markup=kb_main(language),
+        delete_origin=True,
     )
 
 
@@ -4381,7 +4667,10 @@ async def cb_task_resume(call: CallbackQuery, language: str) -> None:
         return
     await call.answer()
     await smart_answer(
-        call, translate(language, "texts.task_resumed", task_id=task_id), delete_origin=True
+        call,
+        translate(language, "texts.task_resumed", task_id=task_id),
+        reply_markup=kb_main(language),
+        delete_origin=True,
     )
 
 
@@ -4395,6 +4684,7 @@ async def cb_task_cancel(call: CallbackQuery, language: str) -> None:
     await smart_answer(
         call,
         translate(language, "texts.task_cancelled_confirm", task_id=task_id),
+        reply_markup=kb_main(language),
         delete_origin=True,
     )
 
@@ -4428,6 +4718,8 @@ async def cb_cancel_all_yes(call: CallbackQuery, language: str) -> None:
     await call.answer()
     count = await tasks_db.cancel_all_active()
     for task in await tasks_db.get_user_tasks(call.from_user.id):
+        if not task.is_active:
+            continue
         control = get_queue_manager().get_control(task.task_id)
         if control is not None:
             control.cancel()
@@ -4448,7 +4740,12 @@ async def _submit_task(
     launch_text: str,
 ) -> bool:
     if not account_manager.accounts:
-        await safe_send_message(bot, user_id, translate(language, "texts.scrape_no_accounts"))
+        await safe_send_message(
+            bot,
+            user_id,
+            translate(language, "texts.scrape_no_accounts"),
+            reply_markup=kb_main(language),
+        )
         return False
     task = Task(
         task_id=new_task_id(),
@@ -4463,6 +4760,7 @@ async def _submit_task(
             bot,
             user_id,
             translate(language, "texts.max_tasks", max_tasks=Config.MAX_TASKS_PER_USER),
+            reply_markup=kb_main(language),
         )
         return False
     await safe_send_message(bot, user_id, launch_text, reply_markup=kb_main(language))
@@ -4487,7 +4785,9 @@ async def cb_scrape(call: CallbackQuery, state: FSMContext, language: str) -> No
 async def on_scrape_source(message: Message, state: FSMContext, language: str) -> None:
     identifier = parse_identifier(message.text or "")
     if not identifier:
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await state.update_data(source=identifier)
     await smart_answer(
@@ -4502,11 +4802,15 @@ async def on_scrape_source(message: Message, state: FSMContext, language: str) -
 async def on_scrape_target(message: Message, state: FSMContext, language: str) -> None:
     identifier = parse_identifier(message.text or "")
     if not identifier:
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     data = await state.get_data()
     if identifier == data.get("source"):
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     await state.update_data(target=identifier)
     await smart_answer(
@@ -4570,6 +4874,7 @@ async def on_scrape_limit(message: Message, state: FSMContext, language: str) ->
                     min_val=Config.SCRAPE_MIN_MESSAGE_LIMIT,
                     max_val=Config.SCRAPE_MAX_MESSAGE_LIMIT,
                 ),
+                reply_markup=kb_cancel(language),
             )
             return
         await state.update_data(message_limit=value)
@@ -4583,6 +4888,7 @@ async def on_scrape_limit(message: Message, state: FSMContext, language: str) ->
                     min_val=Config.SCRAPE_MIN_USER_COUNT,
                     max_val=Config.SCRAPE_MAX_USER_COUNT,
                 ),
+                reply_markup=kb_cancel(language),
             )
             return
         await state.update_data(user_limit=value)
@@ -4618,7 +4924,7 @@ async def cb_scrape_account(call: CallbackQuery, state: FSMContext, language: st
         translate(
             language,
             "texts.task_launched",
-            task_id="(см. карточку ниже)",
+            task_id=translate(language, "texts.see_card_below"),
             source=html.escape(str(task_data["source"])),
             target=html.escape(str(task_data["target"])),
             mode=translate(language, "texts.mode_messages")
@@ -4635,8 +4941,8 @@ async def cb_scrape_account(call: CallbackQuery, state: FSMContext, language: st
 # --- Режим червя ---
 @router.callback_query(F.data == "menu:worm")
 async def cb_worm(call: CallbackQuery, state: FSMContext, language: str) -> None:
-    if not Features.WORM_MODE:
-        await call.answer(translate(language, "texts.invalid_format"), show_alert=True)
+    if not Features.worm_mode():
+        await call.answer(translate(language, "texts.feature_disabled_worm"), show_alert=True)
         return
     await state.clear()
     await call.answer()
@@ -4658,11 +4964,15 @@ async def on_worm_chats(message: Message, state: FSMContext, language: str) -> N
         if identifier and identifier not in sources:
             sources.append(identifier)
     if not sources:
-        await smart_answer(message, translate(language, "texts.invalid_format"))
+        await smart_answer(
+            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+        )
         return
     if len(sources) > Config.WORM_MAX_SOURCES:
         await smart_answer(
-            message, translate(language, "texts.worm_max_sources", count=Config.WORM_MAX_SOURCES)
+            message,
+            translate(language, "texts.worm_max_sources", count=Config.WORM_MAX_SOURCES),
+            reply_markup=kb_cancel(language),
         )
         sources = sources[: Config.WORM_MAX_SOURCES]
     await state.clear()
@@ -4684,13 +4994,37 @@ async def on_worm_chats(message: Message, state: FSMContext, language: str) -> N
 @router.message(Command("stop_worm"))
 async def cmd_stop_worm(message: Message, language: str) -> None:
     cancelled = 0
+    messages = links = added = errors = 0
     for task in await tasks_db.get_user_tasks(message.from_user.id):
-        if task.type == "worm" and task.is_active:
-            await get_queue_manager().request_cancel(task.task_id, message.from_user.id)
-            cancelled += 1
+        if task.type != "worm" or not task.is_active:
+            continue
+        await get_queue_manager().request_cancel(task.task_id, message.from_user.id)
+        cancelled += 1
+        task_results = task.results or {}
+        for key in ("messages", "links", "added", "errors"):
+            value = task_results.get(key, 0)
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = 0
+            if key == "messages":
+                messages += value
+            elif key == "links":
+                links += value
+            elif key == "added":
+                added += value
+            elif key == "errors":
+                errors += value
     await smart_answer(
         message,
-        translate(language, "texts.worm_stopped_multi", messages=0, links=0, added=0, errors=0)
+        translate(
+            language,
+            "texts.worm_stopped_multi",
+            messages=messages,
+            links=links,
+            added=added,
+            errors=errors,
+        )
         if cancelled
         else translate(language, "texts.no_active_tasks"),
         reply_markup=kb_main(language),
@@ -4700,8 +5034,8 @@ async def cmd_stop_worm(message: Message, language: str) -> None:
 # --- Массовая рассылка ---
 @router.callback_query(F.data == "menu:mailing")
 async def cb_mailing(call: CallbackQuery, state: FSMContext, language: str) -> None:
-    if not Features.MAILING:
-        await call.answer(translate(language, "texts.invalid_format"), show_alert=True)
+    if not Features.mailing():
+        await call.answer(translate(language, "texts.feature_disabled_mailing"), show_alert=True)
         return
     await state.clear()
     await call.answer()
@@ -4719,8 +5053,10 @@ async def cb_mail_target(call: CallbackQuery, state: FSMContext, language: str) 
     if target not in ("chats", "users"):
         await call.answer(translate(language, "texts.invalid_format"), show_alert=True)
         return
-    if target == "users" and not Features.MAILING_TO_USERS:
-        await call.answer(translate(language, "texts.invalid_format"), show_alert=True)
+    if target == "users" and not Features.mailing_to_users():
+        await call.answer(
+            translate(language, "texts.feature_disabled_mailing_users"), show_alert=True
+        )
         return
     await state.update_data(target=target)
     chat_count = await chat_db.get_active_chats_count()
@@ -4776,7 +5112,11 @@ async def on_mail_chats(message: Message, state: FSMContext, language: str) -> N
         if identifier and identifier not in identifiers:
             identifiers.append(identifier)
     if not identifiers:
-        await smart_answer(message, translate(language, "texts.bulkmail_empty_chats"))
+        await smart_answer(
+            message,
+            translate(language, "texts.bulkmail_empty_chats"),
+            reply_markup=kb_cancel(language),
+        )
         return
     await state.update_data(chats=identifiers)
     await smart_answer(
@@ -4791,11 +5131,19 @@ async def on_mail_chats(message: Message, state: FSMContext, language: str) -> N
 async def on_mail_delay(message: Message, state: FSMContext, language: str) -> None:
     parts = re.split(r"[\s,]+", (message.text or "").strip())
     if len(parts) != 2:
-        await smart_answer(message, translate(language, "texts.bulkmail_invalid_delay"))
+        await smart_answer(
+            message,
+            translate(language, "texts.bulkmail_invalid_delay"),
+            reply_markup=kb_cancel(language),
+        )
         return
     min_delay, max_delay = to_int(parts[0], -1), to_int(parts[1], -1)
     if min_delay < 0 or max_delay < 0 or min_delay > max_delay:
-        await smart_answer(message, translate(language, "texts.bulkmail_invalid_delay"))
+        await smart_answer(
+            message,
+            translate(language, "texts.bulkmail_invalid_delay"),
+            reply_markup=kb_cancel(language),
+        )
         return
     await state.update_data(min_delay=min_delay, max_delay=max_delay)
     await smart_answer(
@@ -4810,7 +5158,9 @@ async def on_mail_delay(message: Message, state: FSMContext, language: str) -> N
 async def on_mail_text(message: Message, state: FSMContext, language: str) -> None:
     text_value = (message.text or "").strip()
     if not text_value:
-        await smart_answer(message, translate(language, "texts.empty_input"))
+        await smart_answer(
+            message, translate(language, "texts.empty_input"), reply_markup=kb_cancel(language)
+        )
         return
     data = await state.get_data()
     texts: list[str] = list(data.get("texts", []))
@@ -4858,7 +5208,11 @@ async def cb_mail_account(call: CallbackQuery, state: FSMContext, language: str)
 async def on_mail_total(message: Message, state: FSMContext, language: str) -> None:
     total = to_int(message.text or "", 0)
     if total <= 0:
-        await smart_answer(message, translate(language, "texts.bulkmail_total_error"))
+        await smart_answer(
+            message,
+            translate(language, "texts.bulkmail_total_error"),
+            reply_markup=kb_cancel(language),
+        )
         return
     data = await state.get_data()
     chats: list[str] = list(data.get("chats", []))
@@ -4883,7 +5237,7 @@ async def on_mail_total(message: Message, state: FSMContext, language: str) -> N
         translate(
             language,
             "texts.bulkmail_sent",
-            task_id="(см. карточку ниже)",
+            task_id=translate(language, "texts.see_card_below"),
             sent=total,
         ),
     )
@@ -4897,25 +5251,8 @@ async def cmd_cancel(message: Message, state: FSMContext, language: str) -> None
     await state.clear()
     await _drop_login_client(message.from_user.id)
     await smart_answer(
-        message, translate(language, "buttons.cancel"), reply_markup=kb_main(language)
+        message, translate(language, "texts.action_cancelled"), reply_markup=kb_main(language)
     )
-
-
-@router.message(Command("done"))
-async def cmd_done(message: Message, state: FSMContext, language: str) -> None:
-    if await state.get_state() != InviterStates.waiting_mail_text.state:
-        await smart_answer(message, translate(language, "texts.invalid_format"))
-        return
-    data = await state.get_data()
-    if not data.get("texts"):
-        await smart_answer(message, translate(language, "texts.bulkmail_no_texts"))
-        return
-    await smart_answer(
-        message,
-        translate(language, "texts.bulkmail_step4_account"),
-        reply_markup=kb_account_choice(language, "mail:account"),
-    )
-    await state.set_state(InviterStates.waiting_mail_account)
 
 
 async def cache_cleanup_loop() -> None:
@@ -4929,114 +5266,181 @@ async def cache_cleanup_loop() -> None:
                 logger.info(f"Кэш очищен: сущностей {entities}, полных чатов {chats}")
         except asyncio.CancelledError:
             break
-        except RUNTIME_ERRORS as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Ошибка очистки кэша: {e}")
 
 
 # --- Запуск ---
-async def on_startup(bot: Bot, dispatcher: Dispatcher) -> None:
-    global queue_manager
-    Config.validate()
+async def release_webhook() -> None:
+    try:
+        webhook_info = await bot.get_webhook_info()
+    except TelegramAPIError as e:
+        logger.warning(f"Не удалось проверить webhook: {type(e).__name__}: {e}")
+        return
+    url = str(getattr(webhook_info, "url", "") or "").strip()
+    if not url:
+        return
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        logger.warning(f"Удалён активный webhook '{url}', включён long polling")
+    except TelegramAPIError as e:
+        logger.error(f"Не удалось удалить webhook '{url}': {type(e).__name__}: {e}")
+        raise BotError(err("webhook_release_failed", url=url, error=e)) from e
+
+
+async def on_startup() -> None:
+    await release_webhook()
+
     load_languages()
     language_errors = validate_languages()
     for error in language_errors:
         logger.error(f"Языки: {error}")
-    feature_errors = Features.validate()
-    for error in feature_errors:
-        logger.warning(f"Функции: {error}")
+
     await tasks_db.connect()
     await chat_db.connect()
     await cache_db.connect()
     await user_db.connect()
     account_manager.load_accounts()
+    global queue_manager
     queue_manager = TaskQueueManager(bot=bot)
     await queue_manager.start()
     await account_manager.start_health_check()
     BACKGROUND_TASKS.add(asyncio.create_task(cache_cleanup_loop(), name="cache-cleanup"))
+
     me = await bot.get_me()
     logger.info(f"Бот запущен: @{me.username}")
     await notify_owners(
         bot,
-        translate(
-            DEFAULT_LANGUAGE,
-            "texts.admin_startup",
-            accounts=len(account_manager.accounts),
-            chats=await chat_db.get_active_chats_count(),
-            users=await chat_db.get_total_users(),
-            max_tasks=Config.MAX_CONCURRENT_TASKS,
-            max_per_user=Config.MAX_TASKS_PER_USER,
-            min_delay=Config.MIN_INVITE_DELAY,
-            max_delay=Config.MAX_INVITE_DELAY,
-            flood_multiplier=Config.FLOOD_WAIT_MULTIPLIER,
-            retries=Config.MAX_RETRIES,
-        ),
+        "texts.admin_startup",
+        accounts=len(account_manager.accounts),
+        chats=await chat_db.get_active_chats_count(),
+        users=await chat_db.get_total_users(),
+        max_tasks=Config.MAX_CONCURRENT_TASKS,
+        max_per_user=Config.MAX_TASKS_PER_USER,
+        min_delay=Config.MIN_INVITE_DELAY,
+        max_delay=Config.MAX_INVITE_DELAY,
+        flood_multiplier=Config.FLOOD_WAIT_MULTIPLIER,
+        retries=Config.MAX_RETRIES,
     )
 
 
-async def on_shutdown(bot: Bot) -> None:
-    logger.info("Останавливаю компоненты...")
+async def on_shutdown() -> None:
+    logger.info("🛑 Запуск graceful shutdown...")
+    logger.info("Остановка фоновых задач...")
     for task in list(BACKGROUND_TASKS):
-        task.cancel()
-    for task in list(BACKGROUND_TASKS):
-        with suppress(asyncio.CancelledError, Exception):
-            await task
+        if not task.done():
+            task.cancel()
+    if BACKGROUND_TASKS:
+        try:
+            await asyncio.gather(*BACKGROUND_TASKS, return_exceptions=True)
+        except asyncio.CancelledError:
+            pass
     BACKGROUND_TASKS.clear()
+
     if queue_manager is not None:
         await queue_manager.stop()
     await account_manager.stop_health_check()
     await account_manager.release_all()
+
+    await notify_owners(bot, "texts.admin_shutdown")
     await tasks_db.close()
     await chat_db.close()
     await cache_db.close()
     await user_db.close()
-    await notify_owners(bot, translate(DEFAULT_LANGUAGE, "texts.admin_shutdown"))
-    logger.info("Остановка завершена")
 
-
-def install_signal_handlers(stop_event: asyncio.Event) -> None:
-    loop = asyncio.get_running_loop()
-
-    def _request_stop() -> None:
-        logger.info("Получен сигнал остановки")
-        stop_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with suppress(NotImplementedError, ValueError, RuntimeError):
-            loop.add_signal_handler(sig, _request_stop)
+    if bot.session:
+        await bot.session.close()
+    logger.info("✅ Бот остановлен")
 
 
 async def main() -> None:
-    Config.validate()
+    background_tasks: list[asyncio.Task[Any]] = []
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    async def stop_polling_safely() -> None:
+        try:
+            await dp.stop_polling()
+        except RuntimeError:
+            pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Ошибка остановки polling: {type(e).__name__}: {e}")
+
+    def signal_handler(sig: int, frame: Any) -> None:
+        logger.info(f"Получен сигнал {sig}. Запуск graceful shutdown...")
+        shutdown_event.set()
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        background_tasks.append(loop.create_task(stop_polling_safely()))
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, signal_handler)
+        except (AttributeError, ValueError):
+            pass
+
     load_languages()
     if not LANGUAGES:
-        raise ConfigError(f"Не найдены языковые файлы в {LANGS_PATH}")
-    bot = Bot(
-        token=Config.BOT_TOKEN,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
-    )
-    dispatcher = Dispatcher(storage=MemoryStorage())
-    dispatcher.update.outer_middleware(ErrorLogMiddleware())
-    dispatcher.update.middleware(OwnerMiddleware())
-    dispatcher.include_router(router)
+        logger.critical(f"Не найдены языковые файлы в {LANGS_PATH}")
+        sys.exit(1)
 
-    stop_event = asyncio.Event()
-    install_signal_handlers(stop_event)
-
-    await on_startup(bot, dispatcher)
-    polling = asyncio.create_task(
-        dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types()),
-        name="polling",
-    )
-    stop_wait = asyncio.create_task(stop_event.wait(), name="stop-signal")
     try:
-        await asyncio.wait({polling, stop_wait}, return_when=asyncio.FIRST_COMPLETED)
+        Config.validate()
+        logger.info("Конфигурация валидна")
+    except ConfigError as e:
+        logger.critical(f"Ошибка конфигурации:\n{e}")
+        sys.exit(1)
+
+    feature_errors = Features.validate()
+    if feature_errors:
+        error_msg = "Ошибка конфигурации функций:\n" + "\n".join(f"  • {e}" for e in feature_errors)
+        logger.critical(error_msg)
+        for owner_id in OWNER_USER_ID_SET:
+            try:
+                await safe_send_message(bot, owner_id, html.escape(error_msg))
+            except Exception:  # noqa: BLE001, S110
+                pass
+        if bot.session:
+            await bot.session.close()
+        sys.exit(1)
+    logger.info("Функции валидированы")
+
+    dp.update.outer_middleware(ErrorLogMiddleware())
+    dp.update.middleware(OwnerMiddleware())
+
+    try:
+        await on_startup()
+        logger.info("Запуск polling...")
+        background_tasks.append(asyncio.create_task(shutdown_event.wait()))
+        await dp.start_polling(bot)
+        logger.info("Polling завершен")
+    except ConfigError as e:
+        logger.critical(f"Ошибка конфигурации: {e}")
+        sys.exit(1)
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        logger.info("Остановка бота")
+    except TelegramConflictError:
+        logger.critical(
+            "Конфликт опроса: бот уже запущен в другом процессе или на нём висит webhook.\n"
+            "  • Проверь, что не запущен второй экземпляр main.py\n"
+            "  • Проверь webhook: https://api.telegram.org/bot<TOKEN>/getWebhookInfo\n"
+            "  • Удали webhook: https://api.telegram.org/bot<TOKEN>/deleteWebhook"
+        )
+        sys.exit(1)
+    except Exception as e:
+        logger.critical(f"Неожиданная ошибка: {type(e).__name__}: {e}", exc_info=True)
+        sys.exit(1)
     finally:
-        stop_wait.cancel()
-        polling.cancel()
-        with suppress(asyncio.CancelledError, Exception):
-            await polling
-        await on_shutdown(bot)
-        await bot.session.close()
+        for task in background_tasks:
+            if not task.done():
+                task.cancel()
+        if background_tasks:
+            try:
+                await asyncio.gather(*background_tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+        await on_shutdown()
 
 
 if __name__ == "__main__":
@@ -5044,9 +5448,6 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Принудительная остановка")
-    except ConfigError as error:
-        logger.critical(error.message)
-        sys.exit(1)
-    except BotError as error:
-        logger.critical(f"Критическая ошибка: {error}")
+    except Exception as e:
+        logger.critical(f"Фатальная ошибка: {e}", exc_info=True)
         sys.exit(1)
