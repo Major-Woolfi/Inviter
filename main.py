@@ -11,10 +11,11 @@ import sys
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import wraps
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -37,7 +38,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
-    ReplyKeyboardMarkup,
 )
 from aiogram.utils.callback_answer import CallbackAnswerMiddleware
 from dotenv import load_dotenv
@@ -45,6 +45,7 @@ from telethon import TelegramClient, functions
 from telethon import types as telethon_types
 from telethon.errors import (
     AuthKeyUnregisteredError,
+    BadRequestError,
     ChannelInvalidError,
     ChannelPrivateError,
     ChatAdminRequiredError,
@@ -104,6 +105,7 @@ if not logger.handlers:
 # --- Константы ---
 ACTIVE_TASK_STATUSES: frozenset[str] = frozenset({"pending", "running", "paused"})
 FINAL_TASK_STATUSES: frozenset[str] = frozenset({"completed", "cancelled", "failed"})
+PLACEHOLDER_PATTERN: re.Pattern[str] = re.compile(r"\{[a-z_][a-z0-9_]*\}")
 
 
 # --- Кастомные исключения ---
@@ -135,7 +137,12 @@ class NoAvailableAccountError(BotError):
         super().__init__(message, code=503)
 
 
-# --- Утилиты логирования ---
+class AccountWaitCancelled(BotError):
+    def __init__(self, message: str = "Ожидание аккаунта отменено"):
+        super().__init__(message, code=499)
+
+
+# --- Утилиты маскирования секретов ---
 _SENSITIVE_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("BOT_TOKEN", re.compile(r"(\d{6,12}:)[A-Za-z0-9_-]{30,}")),
     ("API_HASH", re.compile(r"\b[0-9a-fA-F]{32}\b")),
@@ -187,6 +194,29 @@ logger.addFilter(_MaskingFilter())
 
 
 # --- Утилиты для работы с событиями ---
+_HTML_TAG_RE: re.Pattern[str] = re.compile(r"<[^>]+>")
+
+
+def strip_html(text: str) -> str:
+    return _HTML_TAG_RE.sub("", text or "").strip()
+
+
+def truncate(text: str, limit: int = 4096) -> str:
+    return text if len(text) <= limit else f"{text[: limit - 1].rstrip()}…"
+
+
+def log_error(func: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(func)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except Exception:
+            logger.exception(f"Ошибка в {func.__name__}")
+            raise
+
+    return wrapper
+
+
 async def safe_send_message(
     bot: Bot,
     user_id: int,
@@ -196,19 +226,21 @@ async def safe_send_message(
     if user_id <= 0:
         return False
     try:
-        await bot.send_message(user_id, text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        await bot.send_message(
+            user_id, truncate(text), parse_mode=ParseMode.HTML, reply_markup=reply_markup
+        )
         return True
     except TelegramBadRequest as e:
         error_msg = str(e).lower()
-        if "blocked" in error_msg or "deactivated" in error_msg:
+        if "blocked" in error_msg or "chat not found" in error_msg or "deactivated" in error_msg:
             return False
         try:
             await bot.send_message(
                 user_id,
-                html.escape(text),
-                parse_mode=ParseMode.HTML,
+                truncate(strip_html(text)),
                 reply_markup=reply_markup,
             )
+            logger.warning(f"HTML не прошёл, отправлен plain-текст для {user_id}")
             return True
         except (TelegramBadRequest, TelegramNetworkError) as fallback_error:
             logger.error(f"safe_send_message {user_id}: {fallback_error}")
@@ -221,16 +253,16 @@ async def safe_send_message(
 async def smart_answer(
     event: Message | CallbackQuery,
     text: str,
-    reply_markup: InlineKeyboardMarkup | ReplyKeyboardMarkup | None = None,
+    reply_markup: InlineKeyboardMarkup | None = None,
     delete_origin: bool = False,
 ) -> bool:
     try:
         if isinstance(event, Message):
-            await event.answer(text, reply_markup=reply_markup)
+            await event.answer(truncate(text), reply_markup=reply_markup)
             return True
         if event.message is None:
             return False
-        await event.message.answer(text, reply_markup=reply_markup)
+        await event.message.answer(truncate(text), reply_markup=reply_markup)
         if delete_origin:
             try:
                 await event.message.delete()
@@ -326,7 +358,7 @@ def resolve_local_path(value: Any, default: str = "") -> str:
     return str(resolved)
 
 
-def to_int(value: Any, default: int = 0) -> int:
+def to_int(value: Any, *, default: int = 0) -> int:
     try:
         if value is None:
             return default
@@ -338,7 +370,7 @@ def to_int(value: Any, default: int = 0) -> int:
             return default
 
 
-def to_float(value: Any, default: float = 0.0) -> float:
+def to_float(value: Any, *, default: float = 0.0) -> float:
     try:
         if value is None:
             return default
@@ -376,6 +408,10 @@ _TELEGRAM_LINK_RE: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 _TELEGRAM_USERNAME_RE: re.Pattern[str] = re.compile(r"@([A-Za-z0-9_]{3,32})\b")
+_INVITE_LINK_RE: re.Pattern[str] = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:t\.me/|telegram\.me/|telegram\.dog/)?"
+    r"\+(?P<hash>[A-Za-z0-9_-]{5,64})"
+)
 _NON_TARGET_WORDS: frozenset[str] = frozenset(
     {"all", "channel", "bot", "support", "help", "admin", "joinchat"}
 )
@@ -419,11 +455,10 @@ def parse_link_to_identifier(link: str) -> str | None:
     if not raw:
         return None
     if raw.startswith("+"):
-        return f"https://t.me/{raw}" if len(raw) > 1 else None
+        invite = f"https://t.me/{raw}"
+        return invite if is_invite_link(invite) else None
     if raw.startswith("joinchat/"):
         return None
-    if re.fullmatch(r"c/\d+", raw):
-        return raw
     if re.fullmatch(r"[A-Za-z0-9_]{3,32}", raw):
         return raw
     return None
@@ -443,16 +478,43 @@ def collect_identifier_variants(identifier: str) -> list[str]:
     return variants
 
 
+def is_invite_link(identifier: str) -> bool:
+    return bool(_INVITE_LINK_RE.fullmatch(str(identifier or "").strip()))
+
+
+def build_chat_reference(username: str | None, identifier: str) -> str:
+    if username:
+        return f"https://t.me/{username}"
+    raw = str(identifier or "").strip()
+    if is_invite_link(raw) or raw.lower().startswith(("http://", "https://")):
+        return raw
+    bare = raw.removeprefix("@")
+    if re.fullmatch(r"[A-Za-z0-9_]{3,32}", bare):
+        return f"https://t.me/{bare}"
+    return ""
+
+
+def parse_invite_hash(identifier: str) -> str:
+    match = _INVITE_LINK_RE.fullmatch(str(identifier or "").strip())
+    if match is None:
+        return ""
+    return match.group("hash")
+
+
 def format_progress_bar(percentage: float, length: int = 12) -> str:
     percent = max(0.0, min(100.0, percentage))
     filled = int(length * percent / 100)
     return f"{'🟩' * filled}{'⬜' * (length - filled)} {percent:.1f}%"
 
 
-def kb(rows: list[list[dict[str, str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(**btn) for btn in row] for row in rows]
-    )
+def format_accounts_summary(sessions: list[str], limit: int = 5) -> str:
+    unique = list(dict.fromkeys(session for session in sessions if session))
+    if not unique:
+        return "-"
+    shown = ", ".join(unique[:limit])
+    if len(unique) > limit:
+        shown += f" +{len(unique) - limit}"
+    return shown
 
 
 # --- Конфигурация ---
@@ -493,13 +555,18 @@ class Config:
     INVITE_BUFFER_SIZE: int = env_int("INVITE_BUFFER_SIZE", 10)
     INVITE_JITTER_MIN: float = env_float("INVITE_JITTER_MIN", 0.8)
     INVITE_JITTER_MAX: float = env_float("INVITE_JITTER_MAX", 1.2)
-    POST_BUFFER_DELAY_MIN: int = env_int("POST_BUFFER_DELAY_MIN", 30)
-    POST_BUFFER_DELAY_MAX: int = env_int("POST_BUFFER_DELAY_MAX", 60)
+    POST_BUFFER_DELAY_MIN: float = env_float("POST_BUFFER_DELAY_MIN", 30)
+    POST_BUFFER_DELAY_MAX: float = env_float("POST_BUFFER_DELAY_MAX", 60)
     MAX_INVITES_PER_ACCOUNT: int = env_int("MAX_INVITES_PER_ACCOUNT", 500)
+
+    ACCOUNT_ROLLER_WAIT_TIMEOUT: float = env_float("ACCOUNT_ROLLER_WAIT_TIMEOUT", 15.0)
+    INVITE_STEP_USERS: int = env_int("INVITE_STEP_USERS", 1)
+    MAILING_STEP_MESSAGES: int = env_int("MAILING_STEP_MESSAGES", 1)
 
     ADAPTIVE_DELAY_BASE: float = env_float("ADAPTIVE_DELAY_BASE", 5.0)
     ADAPTIVE_DELAY_MAX: float = env_float("ADAPTIVE_DELAY_MAX", 120.0)
     MAX_ACCOUNT_CONSECUTIVE_ERRORS: int = env_int("MAX_ACCOUNT_CONSECUTIVE_ERRORS", 5)
+    ACCOUNT_ERROR_COOLDOWN: int = env_int("ACCOUNT_ERROR_COOLDOWN", 300)
 
     FLOOD_WAIT_MULTIPLIER: float = env_float("FLOOD_WAIT_MULTIPLIER", 1.5)
     FLOOD_WAIT_PADDING: int = env_int("FLOOD_WAIT_PADDING", 5)
@@ -527,6 +594,7 @@ class Config:
     MAILING_MAX_TOTAL_SENDS: int = env_int("MAILING_MAX_TOTAL_SENDS", 5000)
 
     VALIDATOR_TEST_DELETE_WAIT: int = env_int("VALIDATOR_TEST_DELETE_WAIT", 5)
+    MAX_CHATS_PER_IMPORT: int = env_int("MAX_CHATS_PER_IMPORT", 50)
     VALIDATOR_ANTI_FLOOD_DELAY_MIN: int = env_int("VALIDATOR_ANTI_FLOOD_DELAY_MIN", 3)
     VALIDATOR_ANTI_FLOOD_DELAY_MAX: int = env_int("VALIDATOR_ANTI_FLOOD_DELAY_MAX", 7)
     CHAT_ADD_THROTTLE_DELAY_MIN: float = env_float("CHAT_ADD_THROTTLE_DELAY_MIN", 1.0)
@@ -576,6 +644,12 @@ class Config:
             errors.append("SESSIONS_DIR не может выходить за пределы каталога проекта")
         if cls.MIN_INVITE_DELAY > cls.MAX_INVITE_DELAY:
             errors.append("MIN_INVITE_DELAY не может быть больше MAX_INVITE_DELAY")
+        if cls.ACCOUNT_ROLLER_WAIT_TIMEOUT < 1:
+            errors.append("ACCOUNT_ROLLER_WAIT_TIMEOUT должен быть не меньше 1 секунды")
+        if cls.INVITE_STEP_USERS < 1:
+            errors.append("INVITE_STEP_USERS должен быть не меньше 1")
+        if cls.MAILING_STEP_MESSAGES < 1:
+            errors.append("MAILING_STEP_MESSAGES должен быть не меньше 1")
         if cls.MIN_WORKERS > cls.MAX_WORKERS:
             errors.append("MIN_WORKERS не может быть больше MAX_WORKERS")
         if cls.MAX_CONCURRENT_TASKS < 1:
@@ -711,7 +785,6 @@ def load_languages() -> None:
         code = str(data.get("meta", {}).get("code", path.stem)).strip().lower() or path.stem
         LANGUAGES[code] = data
         _LANG_CACHE[code] = data
-    build_nav_actions()
     logger.info(f"Языковая система инициализирована: {sorted(LANGUAGES)}")
 
 
@@ -728,7 +801,7 @@ def validate_languages() -> list[str]:
             errors.append(f"{code}: meta.code не совпадает с именем файла")
         if not str(meta.get("name", "")).strip():
             errors.append(f"{code}: пустое meta.name")
-        for section in ("buttons", "texts", "errors"):
+        for section in ("buttons", "texts"):
             if not isinstance(data.get(section), dict):
                 errors.append(f"{code}: отсутствует секция {section}")
     return errors
@@ -738,15 +811,6 @@ def get_available_languages() -> list[str]:
     return sorted(LANGUAGES)
 
 
-def build_nav_actions() -> None:
-    NAV_ACTIONS.clear()
-    for code in get_available_languages():
-        for key, action in NAV_BUTTONS.items():
-            label = translate(code, key)
-            if label and label != key:
-                NAV_ACTIONS[label] = action
-
-
 def get_language_display_name(code: str) -> str:
     data = LANGUAGES.get(code, {})
     name = str(data.get("meta", {}).get("name", "")).strip()
@@ -754,15 +818,6 @@ def get_language_display_name(code: str) -> str:
 
 
 LANGUAGE_CONTEXT: ContextVar[str] = ContextVar("language_context", default=DEFAULT_LANGUAGE)
-
-NAV_BUTTONS: dict[str, str] = {
-    "buttons.nav_menu": "menu",
-    "buttons.nav_tasks": "tasks",
-    "buttons.nav_language": "language",
-    "buttons.nav_stop_worm": "stop_worm",
-    "buttons.nav_cancel": "cancel",
-}
-NAV_ACTIONS: dict[str, str] = {}
 
 
 def _resolve_key(data: dict[str, Any], key: str) -> Any:
@@ -806,7 +861,7 @@ def translate(language_code: Any, key: str, **kwargs: Any) -> str:
 
 
 def err(key: str, **kwargs: Any) -> str:
-    return translate(LANGUAGE_CONTEXT.get(), f"errors.{key}", **kwargs)
+    return translate(LANGUAGE_CONTEXT.get(), f"texts.error_{key}", **kwargs)
 
 
 # --- Модели данных ---
@@ -928,7 +983,7 @@ def decode_json_object(raw: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-@dataclass
+@dataclass(eq=False)
 class Account:
     session_file: str
     session_string: str
@@ -939,6 +994,7 @@ class Account:
     invite_count: int = 0
     consecutive_errors: int = 0
     flood_wait_until: datetime | None = None
+    joined_chats: list[tuple[Any, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -964,10 +1020,16 @@ class ValidatedChat:
 
 @dataclass
 class CheckAndCleanResult:
+    total: int = 0
     checked: int = 0
+    added: int = 0
     removed: int = 0
     updated: int = 0
     errors: int = 0
+    flood_seconds: float = 0.0
+    flood_events: int = 0
+    accounts_used: list[str] = field(default_factory=list)
+    stop_reason: str = ""
 
 
 @dataclass
@@ -1229,7 +1291,7 @@ class TasksDB(SQLiteDatabase):
             updates["cancelled_by"] = to_int(cancelled_by)
         return await self.update_task(task_id, updates)
 
-    async def cancel_all_active(self) -> int:
+    async def cancel_all_active(self, user_id: int) -> int:
         if self.conn is None:
             return 0
         now = utc_now_iso()
@@ -1237,13 +1299,13 @@ class TasksDB(SQLiteDatabase):
             try:
                 cursor = await self.conn.execute(
                     "UPDATE tasks SET status = 'cancelled', completed_at = ?, cancelled_at = ? "
-                    "WHERE status IN ('pending', 'running', 'paused')",
-                    (now, now),
+                    "WHERE user_id = ? AND status IN ('pending', 'running', 'paused')",
+                    (now, now, to_int(user_id)),
                 )
                 await self.conn.commit()
                 return max(0, cursor.rowcount)
             except Exception as e:  # noqa: BLE001
-                logger.error(f"cancel_all_active: {e}")
+                logger.error(f"cancel_all_active {user_id}: {e}")
                 return 0
 
     async def delete_finished_before(self, cutoff_iso: str) -> int:
@@ -1749,7 +1811,16 @@ class EntityCache:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except FloodWaitError:
+            async with self._lock:
+                self._inflight.pop(key, None)
+            raise
+        except (ChatUnreachableError, ValueError, AuthKeyUnregisteredError):
+            async with self._lock:
+                self._inflight.pop(key, None)
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Не удалось получить сущность {identifier}: {type(e).__name__}: {e}")
             return None
 
     async def _fetch(self, client: TelegramClient, identifier: int | str, key: str) -> Any | None:
@@ -1837,23 +1908,16 @@ async def get_cached_entity(account: Account, identifier: int | str) -> Any | No
     client = account.client
     if client is None:
         return None
-    for attempt in range(1, 4):
-        try:
-            return await entity_cache.get(account.session_file, client, identifier)
-        except FloodWaitError as e:
-            wait_time = float(getattr(e, "seconds", 60))
-            logger.warning(
-                f"FloodWait при получении сущности {identifier}: {wait_time:.0f}с "
-                f"(попытка {attempt}/3)"
-            )
-            await asyncio.sleep(wait_time)
-        except AuthKeyUnregisteredError:
-            account.is_valid = False
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Не удалось получить сущность {identifier}: {type(e).__name__}: {e}")
-            return None
-    return None
+    try:
+        return await entity_cache.get(account.session_file, client, identifier)
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Не удалось получить сущность {identifier}: {type(e).__name__}: {e}")
+        return None
 
 
 async def get_full_chat(account: Account, identifier: int | str) -> Any | None:
@@ -1896,30 +1960,155 @@ async def extract_participants_count(full: Any) -> int | None:
     return None
 
 
+def is_broadcast_channel(entity: Any) -> bool:
+    """Канал-вещание: вступать в него не нужно, группы для выборки не подходят."""
+    return (
+        isinstance(entity, telethon_types.Channel)
+        and bool(getattr(entity, "broadcast", False))
+        and not bool(getattr(entity, "megagroup", False))
+    )
+
+
 async def join_chat(account: Account, identifier: str) -> tuple[Any, bool]:
     client = account.client
     if client is None:
         raise NoAvailableAccountError(err("account_no_client"))
-    if identifier.startswith("https://t.me/+", "+"):
-        invite_hash = identifier.split("+", 1)[1]
-        result = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+    if is_invite_link(identifier):
+        invite_hash = parse_invite_hash(identifier)
+        if not invite_hash:
+            raise ChatUnreachableError(err("chat_unreachable", identifier=identifier))
+        try:
+            result = await client(functions.messages.ImportChatInviteRequest(invite_hash))
+        except UserAlreadyParticipantError:
+            entity = await _resolve_invited_entity(client, invite_hash)
+            if entity is None:
+                raise ChatUnreachableError(err("chat_unreachable", identifier=identifier))
+            return entity, False
         chats = getattr(result, "chats", None)
-        entity = chats[0] if chats else await get_cached_entity(account, identifier)
+        entity = chats[0] if chats else await get_cached_entity(account, invite_hash)
         if entity is None:
             raise ChatUnreachableError(err("chat_unreachable", identifier=identifier))
+        track_joined_chat(account, entity, identifier)
         return entity, True
     entity = await get_cached_entity(account, identifier)
     if entity is None:
         raise ChatUnreachableError(err("entity_not_found", identifier=identifier))
+    if is_broadcast_channel(entity):
+        logger.info(f"Канал (не группа), вход пропущен: {identifier}")
+        return entity, False
     try:
         await client(functions.channels.JoinChannelRequest(entity))
     except UserAlreadyParticipantError:
         return entity, False
+    except InviteRequestSentError:
+        logger.warning(
+            f"{identifier}: чат требует подтверждения входа, бот не сможет писать и уйдёт из проверки"
+        )
+        raise
+    track_joined_chat(account, entity, identifier)
     return entity, True
+
+
+def entity_key(entity: Any) -> tuple[str, int] | None:
+    if entity is None:
+        return None
+    kind = "channel" if isinstance(entity, telethon_types.Channel) else "chat"
+    entity_id = to_int(getattr(entity, "id", 0), default=0)
+    if entity_id == 0:
+        return None
+    return kind, entity_id
+
+
+def _same_entity(left: Any, right: Any) -> bool:
+    if left is right:
+        return True
+    left_key = entity_key(left)
+    return left_key is not None and left_key == entity_key(right)
+
+
+def track_joined_chat(account: Account, entity: Any, label: str) -> None:
+    account.joined_chats = [
+        item for item in account.joined_chats if not _same_entity(item[0], entity)
+    ]
+    account.joined_chats.append((entity, label))
+
+
+def hold_task_chat(
+    joined_targets: dict[str, tuple[Any, str]], account: Account, entity: Any, label: str
+) -> None:
+    """Оставляет чат в аккаунте до конца задачи: авто-выход отменяется."""
+    account.joined_chats = [
+        item for item in account.joined_chats if not _same_entity(item[0], entity)
+    ]
+    joined_targets[account.session_file] = (entity, label)
+
+
+async def leave_task_chats(joined_targets: dict[str, tuple[Any, str]]) -> None:
+    for session_file, (entity, label) in list(joined_targets.items()):
+        joined_targets.pop(session_file, None)
+        account = account_manager.get_account(session_file)
+        if account is None:
+            continue
+        if not Features.auto_leave():
+            logger.info("AUTO_LEAVE выключен, чаты задачи оставляем")
+            return
+        if account.client is None or not account.client.is_connected():
+            with suppress(Exception):
+                await account_manager.ensure_client(account)
+        await leave_chat(account, entity, label)
+
+
+async def _resolve_invited_entity(client: TelegramClient, invite_hash: str) -> Any | None:
+    try:
+        result = await client(functions.messages.CheckChatInviteRequest(invite_hash))
+    except (FloodWaitError, AuthKeyUnregisteredError):
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Инвайт {invite_hash} не проверен: {type(e).__name__}: {e}")
+        return None
+    chat = getattr(result, "chat", None)
+    if chat is None:
+        logger.warning(f"Инвайт {invite_hash}: чат не возвращён проверкой")
+        return None
+    if isinstance(chat, telethon_types.Channel):
+        return chat
+    chat_id = to_int(getattr(chat, "id", 0))
+    if chat_id <= 0:
+        return None
+    return chat
+
+
+async def _send_probe(client: TelegramClient, entity: Any, language: str) -> Any:
+    return await client.send_message(entity, pick_probe_text(language))
+
+
+PARSE_ERROR_MARKERS = ("MESSAGE_PARSE_ENTITY", "MESSAGE_PARSE_MODE", "MESSAGE_PARSE_MARKDOWN")
+
+
+def is_parse_error(error: Exception) -> bool:
+    if isinstance(error, ValueError):
+        return True
+    if isinstance(error, BadRequestError):
+        message = str(getattr(error, "message", "") or "")
+        return any(marker in message for marker in PARSE_ERROR_MARKERS)
+    return False
+
+
+async def send_formatted(client: TelegramClient, destination: Any, text: str) -> Any:
+    try:
+        return await client.send_message(destination, text, parse_mode="html")
+    except (BadRequestError, ValueError) as e:
+        if not is_parse_error(e):
+            raise
+        logger.debug(f"Разбор HTML не удался ({type(e).__name__}), отправляем без разметки")
+        return await client.send_message(destination, strip_html(text))
 
 
 async def leave_chat(account: Account, entity: Any, label: str) -> bool:
     client = account.client
+    account.joined_chats = [
+        item for item in account.joined_chats if not _same_entity(item[0], entity)
+    ]
     if client is None:
         return False
     try:
@@ -1929,7 +2118,10 @@ async def leave_chat(account: Account, entity: Any, label: str) -> bool:
             await client(functions.messages.DeleteChatUserRequest(chat_id=entity.id, user_id="me"))
     except AuthKeyUnregisteredError:
         account.is_valid = False
-        raise
+        logger.warning(
+            f"Аккаунт {account.session_file} не авторизован, выход из {label} не выполнен"
+        )
+        return False
     except UserNotParticipantError:
         logger.debug(f"Аккаунт {account.session_file} и так не состоит в {label}")
         return False
@@ -1943,6 +2135,7 @@ async def leave_chat(account: Account, entity: Any, label: str) -> bool:
 async def validate_and_test_chat(
     account: Account,
     identifier: str,
+    language: str,
     update_existing: bool = False,
 ) -> ValidatedChat | None:
     try:
@@ -1985,8 +2178,7 @@ async def validate_and_test_chat(
 
     chat_id = str(entity.id)
     chat_name = str(getattr(entity, "title", "") or identifier)
-    username = getattr(entity, "username", None)
-    chat_url = f"https://t.me/{username}" if username else f"https://t.me/{identifier}"
+    chat_url = build_chat_reference(getattr(entity, "username", None), identifier)
 
     user_count = to_int(getattr(entity, "participants_count", None))
     if not user_count:
@@ -2003,10 +2195,24 @@ async def validate_and_test_chat(
 
     can_write = False
     try:
-        sent = await require_client(account).send_message(
-            entity, translate(DEFAULT_LANGUAGE, "texts.validator_probe")
-        )
+        sent = await _send_probe(require_client(account), entity, language)
         can_write = True
+    except SlowModeWaitError as e:
+        logger.info(f"Slow mode в {chat_name}: {getattr(e, 'seconds', 5)}с, повтор пробы")
+        try:
+            await asyncio.sleep(min(float(getattr(e, "seconds", 5)), 30.0))
+            sent = await _send_probe(require_client(account), entity, language)
+            can_write = True
+        except FloodWaitError:
+            raise
+        except AuthKeyUnregisteredError:
+            account.is_valid = False
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Slow mode в {chat_name} не позволил повторить пробу: {type(e).__name__}"
+            )
+            can_write = False
     except FloodWaitError:
         raise
     except AuthKeyUnregisteredError:
@@ -2019,9 +2225,6 @@ async def validate_and_test_chat(
         UserPrivacyRestrictedError,
     ) as e:
         logger.info(f"Нет прав на запись в {chat_name}: {type(e).__name__}")
-        can_write = False
-    except SlowModeWaitError as e:
-        logger.info(f"Slow mode в {chat_name}: {getattr(e, 'seconds', 5)}с")
         can_write = False
     except Exception as e:  # noqa: BLE001
         logger.warning(f"Ошибка проверки записи в {chat_name}: {type(e).__name__}: {e}")
@@ -2043,7 +2246,7 @@ async def validate_and_test_chat(
             logger.warning(f"Не удалось удалить тестовое сообщение в {chat_name}: {e}")
 
     if joined_by_bot:
-        await leave_chat(account, entity, chat_url)
+        await leave_chat(account, entity, chat_url or chat_name)
 
     if not can_write:
         if update_existing:
@@ -2068,79 +2271,133 @@ async def validate_and_test_chat(
     )
 
 
-async def check_and_clean_chats(account: Account) -> CheckAndCleanResult:
+async def check_one_chat(
+    account: Account, chat: Any, language: str, result: CheckAndCleanResult
+) -> None:
+    """Проверяет один чат из БД. FloodWait и AuthKeyUnregisteredError пробрасываются."""
+    identifier = chat.chat_url or chat.chat_id
+    try:
+        entity, _ = await join_chat(account, identifier)
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.info(f"Чат {chat.chat_name} недоступен: {type(e).__name__}")
+        result.errors += 1
+        return
+
+    if entity is None or not isinstance(entity, (telethon_types.Channel, telethon_types.Chat)):
+        if await chat_db.delete_chat(chat.chat_id):
+            result.removed += 1
+            logger.info(f"Чат {chat.chat_name} удалён: больше не группа")
+        return
+    if isinstance(entity, telethon_types.Channel) and not getattr(entity, "megagroup", False):
+        if await chat_db.delete_chat(chat.chat_id):
+            result.removed += 1
+            logger.info(f"Чат {chat.chat_name} удалён: это канал, а не группа")
+        return
+
+    reachable = True
+    try:
+        probe = await _send_probe(require_client(account), entity, language)
+        try:
+            await require_client(account).delete_messages(entity, probe.id)
+        except FloodWaitError:
+            raise
+        except AuthKeyUnregisteredError:
+            account.is_valid = False
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Чат {chat.chat_name}: не удалось удалить проверочное сообщение: {type(e).__name__}"
+            )
+    except (ChatAdminRequiredError, ChannelPrivateError, ChatWriteForbiddenError):
+        reachable = False
+    except SlowModeWaitError as e:
+        logger.info(f"Чат {chat.chat_name}: slow mode {getattr(e, 'seconds', 5)}с")
+        result.errors += 1
+        return
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Проба записи в {chat.chat_name} не удалась: {type(e).__name__}: {e}")
+        result.errors += 1
+        return
+
+    if not reachable:
+        if await chat_db.delete_chat(chat.chat_id):
+            result.removed += 1
+            logger.info(f"Чат {chat.chat_name} удалён: нет доступа на запись")
+        return
+
+    try:
+        new_count = to_int(getattr(entity, "participants_count", None))
+        if not new_count:
+            new_count = to_int(
+                await extract_participants_count(await get_full_chat(account, identifier))
+            )
+        fields: dict[str, Any] = {"last_check": utc_now_iso()}
+        if new_count and new_count != chat.user_count:
+            fields["user_count"] = new_count
+            result.updated += 1
+            logger.info(f"Чат {chat.chat_name}: участников {chat.user_count} -> {new_count}")
+        if not await chat_db.update_chat(chat.chat_id, fields):
+            logger.error(f"Не удалось обновить чат {chat.chat_name} в БД")
+            result.errors += 1
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except Exception as e:  # noqa: BLE001
+        result.errors += 1
+        logger.error(f"Ошибка обновления чата {chat.chat_name}: {e}")
+
+
+async def check_and_clean_chats(
+    language: str, control: "TaskControl | None" = None
+) -> CheckAndCleanResult:
+    """Проверяет чаты из БД, ротируя аккаунт после каждого чата."""
     result = CheckAndCleanResult()
     chats = await chat_db.get_all_chats(verified_only=False)
-    result.checked = len(chats)
+    result.total = len(chats)
     for chat in chats:
-        identifier = chat.chat_url or chat.chat_id
         try:
-            entity = await get_cached_entity(account, identifier)
-        except AuthKeyUnregisteredError:
-            account.is_valid = False
-            raise
-        except FloodWaitError:
-            result.errors += 1
-            continue
-        except Exception:  # noqa: BLE001
-            if await chat_db.delete_chat(chat.chat_id):
-                result.removed += 1
-                logger.info(f"Чат {chat.chat_name} удалён: недоступен")
-            continue
-
-        if entity is None or not isinstance(entity, (telethon_types.Channel, telethon_types.Chat)):
-            if await chat_db.delete_chat(chat.chat_id):
-                result.removed += 1
-                logger.info(f"Чат {chat.chat_name} удалён: больше не группа")
-            continue
-
-        reachable = True
-        try:
-            probe = await require_client(account).send_message(
-                entity, translate(DEFAULT_LANGUAGE, "texts.validator_probe")
-            )
-            with suppress(Exception):
-                await require_client(account).delete_messages(entity, probe.id)
-        except (ChatAdminRequiredError, ChannelPrivateError, ChatWriteForbiddenError):
-            reachable = False
-        except FloodWaitError:
-            result.errors += 1
-            continue
-        except AuthKeyUnregisteredError:
-            account.is_valid = False
-            raise
-        except Exception as e:  # noqa: BLE001
-            logger.debug(f"Проба записи в {chat.chat_name} не удалась: {type(e).__name__}: {e}")
-            reachable = False
-
-        if not reachable:
-            if await chat_db.delete_chat(chat.chat_id):
-                result.removed += 1
-                logger.info(f"Чат {chat.chat_name} удалён: нет доступа на запись")
-            continue
-
-        try:
-            new_count = to_int(getattr(entity, "participants_count", None))
-            if not new_count:
-                new_count = to_int(
-                    await extract_participants_count(await get_full_chat(account, identifier))
-                )
-            fields: dict[str, Any] = {"last_check": utc_now_iso()}
-            if new_count and new_count != chat.user_count:
-                fields["user_count"] = new_count
-                result.updated += 1
-                logger.info(f"Чат {chat.chat_name}: участников {chat.user_count} -> {new_count}")
-            if not await chat_db.update_chat(chat.chat_id, fields):
-                logger.error(f"Не удалось обновить чат {chat.chat_name} в БД")
-                result.errors += 1
-        except FloodWaitError:
-            result.errors += 1
-        except AuthKeyUnregisteredError:
-            account.is_valid = False
-            raise
-        except Exception as e:  # noqa: BLE001
-            result.errors += 1
-            logger.error(f"Ошибка обновления чата {chat.chat_name}: {e}")
+            async with account_manager.acquire_step(None, control) as account:
+                if account.session_file not in result.accounts_used:
+                    result.accounts_used.append(account.session_file)
+                result.checked += 1
+                try:
+                    await check_one_chat(account, chat, language, result)
+                except FloodWaitError as e:
+                    seconds = float(getattr(e, "seconds", 60))
+                    extended = account_manager.handle_flood_wait(account, seconds)
+                    result.flood_seconds = max(result.flood_seconds, seconds)
+                    result.flood_events += 1
+                    result.errors += 1
+                    logger.warning(
+                        f"FloodWait на чате {chat.chat_name}: {seconds:.0f}с "
+                        f"(пауза {extended:.0f}с), продолжаю на другом аккаунте"
+                    )
+                    continue
+                except AuthKeyUnregisteredError:
+                    account.is_valid = False
+                    result.errors += 1
+                    result.stop_reason = translate(language, "texts.invalid_account_continue")
+                    logger.warning(f"Аккаунт {account.session_file} сброшен, продолжаю на другом")
+                    continue
+        except AccountWaitCancelled:
+            result.stop_reason = translate(language, "texts.roller_stopped")
+            break
+        except NoAvailableAccountError as e:
+            result.stop_reason = str(e.message)
+            logger.warning(f"Проверка чатов остановлена: {e.message}")
+            break
     return result
 
 
@@ -2150,12 +2407,15 @@ class AccountPoolManager:
         self.accounts: list[Account] = []
         self.lock: asyncio.Lock = asyncio.Lock()
         self._success_rate: dict[str, float] = {}
+        self._rr_cursor: int = 0
+        self._free_event: asyncio.Event = asyncio.Event()
         self._health_task: asyncio.Task[None] | None = None
         self.load_accounts()
 
     def load_accounts(self) -> None:
         self.accounts.clear()
         self._success_rate.clear()
+        self._rr_cursor = 0
         directory = Path(Config.SESSIONS_DIR)
         if not directory.exists():
             logger.warning(f"Папка сессий не найдена: {directory}")
@@ -2193,13 +2453,23 @@ class AccountPoolManager:
                 return account
         return None
 
-    def _update_success_rate(self, account: Account, success: bool) -> None:
+    def update_success_rate(self, account: Account, success: bool) -> None:
         current = self._success_rate.setdefault(account.session_file, 1.0)
         self._success_rate[account.session_file] = 0.1 * (1.0 if success else 0.0) + (0.9 * current)
-        if not success:
-            account.consecutive_errors += 1
-        else:
+        if success:
             account.consecutive_errors = 0
+            return
+        account.consecutive_errors += 1
+        if account.consecutive_errors < Config.MAX_ACCOUNT_CONSECUTIVE_ERRORS:
+            return
+        account.consecutive_errors = 0
+        cooldown_until = datetime.now(UTC) + timedelta(seconds=Config.ACCOUNT_ERROR_COOLDOWN)
+        if account.flood_wait_until is None or account.flood_wait_until < cooldown_until:
+            account.flood_wait_until = cooldown_until
+        logger.warning(
+            f"Аккаунт {account.session_file}: {Config.MAX_ACCOUNT_CONSECUTIVE_ERRORS} ошибок подряд, "
+            f"пауза {Config.ACCOUNT_ERROR_COOLDOWN}с"
+        )
 
     def _adaptive_delay(self, account: Account) -> float:
         rate = max(self._success_rate.get(account.session_file, 1.0), 0.1)
@@ -2235,9 +2505,9 @@ class AccountPoolManager:
         return any(self.is_available(account) for account in self.accounts)
 
     def handle_flood_wait(self, account: Account, wait_seconds: float) -> float:
-        extended = float(wait_seconds) * Config.FLOOD_WAIT_MULTIPLIER
+        extended = float(wait_seconds) * Config.FLOOD_WAIT_MULTIPLIER + Config.FLOOD_WAIT_PADDING
         account.flood_wait_until = datetime.now(UTC) + timedelta(seconds=extended)
-        self._update_success_rate(account, False)
+        self.update_success_rate(account, False)
         logger.warning(
             f"FloodWait для {account.session_file}: пауза {extended:.0f}с "
             f"(запрошено {wait_seconds:.0f}с)"
@@ -2281,54 +2551,196 @@ class AccountPoolManager:
             raise NoAvailableAccountError(
                 err("account_unavailable", session=account.session_file, error=e)
             ) from e
-        self._update_success_rate(account, True)
+        self.update_success_rate(account, True)
         return account.client
 
     @asynccontextmanager
-    async def acquire(self, session_file: str | None = None) -> AsyncIterator[Account]:
-        account = await self._acquire_locked(session_file)
+    async def acquire(
+        self, session_file: str | None = None, control: "TaskControl | None" = None
+    ) -> AsyncIterator[Account]:
+        account = await self._take_account(session_file, control)
         try:
             yield account
         finally:
-            async with self.lock:
-                account.in_use = False
+            await self.release(account)
 
-    async def _acquire_locked(self, session_file: str | None) -> Account:
-        async with self.lock:
-            if session_file:
-                account = self.get_account(session_file)
-                if account is None:
-                    raise NoAvailableAccountError(err("session_not_found", session=session_file))
-                if not account.is_valid:
-                    raise NoAvailableAccountError(err("session_invalid", session=session_file))
-                if account.in_use:
-                    raise NoAvailableAccountError(err("session_busy", session=session_file))
-                if self._flood_active(account):
-                    raise NoAvailableAccountError(err("session_flood_wait", session=session_file))
-            else:
-                candidates = [account for account in self.accounts if self.is_available(account)]
-                if not candidates:
-                    raise NoAvailableAccountError(err("no_free_accounts"))
-                candidates.sort(
-                    key=lambda item: (
-                        -self._success_rate.get(item.session_file, 1.0),
-                        item.last_used or datetime.min.replace(tzinfo=UTC),
-                    )
-                )
-                account = candidates[0]
-            account.in_use = True
-            account.last_used = datetime.now(UTC)
-            if account.invite_count >= Config.MAX_INVITES_PER_ACCOUNT:
-                logger.info(f"Сброс счётчика инвайтов для {account.session_file}")
-                account.invite_count = 0
+    def acquire_step(
+        self, session_file: str | None = None, control: "TaskControl | None" = None
+    ) -> AbstractAsyncContextManager[Account]:
+        """Один шаг задачи: аккаунт берётся по кругу, используется и сразу освобождается."""
+        return self.acquire(session_file, control)
+
+    async def release(self, account: Account) -> None:
         try:
-            await self.ensure_client(account)
-        except Exception:
+            await self.release_joined_chats(account)
+        finally:
             async with self.lock:
                 account.in_use = False
-            raise
-        logger.info(f"Аккаунт {account.session_file} взят в работу")
-        return account
+            self._free_event.set()
+
+    async def release_joined_chats(self, account: Account) -> None:
+        pending: list[tuple[Any, str]] = list(account.joined_chats)
+        account.joined_chats.clear()
+        if not pending:
+            return
+        if not Features.auto_leave():
+            logger.info("AUTO_LEAVE выключен, чаты оставляем")
+            return
+        for entity, label in reversed(pending):
+            with suppress(Exception):
+                await leave_chat(account, entity, label)
+
+    def _budget_exhausted(self, account: Account) -> bool:
+        return account.invite_count >= Config.MAX_INVITES_PER_ACCOUNT
+
+    def _account_index(self, account: Account) -> int:
+        for index, item in enumerate(self.accounts):
+            if item is account:
+                return index
+        return -1
+
+    def _pick_auto_locked(self) -> Account | None:
+        """Следующий свободный аккаунт по кругу: 1, 2, 3, снова 1."""
+        total = len(self.accounts)
+        if total == 0:
+            return None
+        start = self._rr_cursor % total
+        for offset in range(total):
+            account = self.accounts[(start + offset) % total]
+            if self.is_available(account):
+                return account
+        return None
+
+    def _pick_locked(self, session_file: str | None) -> Account | None:
+        if not session_file:
+            return self._pick_auto_locked()
+        account = self.get_account(session_file)
+        if account is None:
+            raise NoAvailableAccountError(err("session_not_found", session=session_file))
+        if not account.is_valid:
+            raise NoAvailableAccountError(err("session_invalid", session=session_file))
+        return account if self.is_available(account) else None
+
+    def _mark_acquired_locked(self, account: Account) -> None:
+        account.in_use = True
+        account.last_used = datetime.now(UTC)
+        index = self._account_index(account)
+        if index >= 0 and self.accounts:
+            self._rr_cursor = (index + 1) % len(self.accounts)
+        if self._budget_exhausted(account):
+            logger.info(f"Сброс счётчика инвайтов для {account.session_file}")
+            account.invite_count = 0
+
+    def _available_delay(self, account: Account) -> float | None:
+        """0 - аккаунт свободен, секунды до освобождения, None - аккаунт непригоден."""
+        if not account.is_valid:
+            return None
+        if self._flood_active(account):
+            until = account.flood_wait_until or datetime.now(UTC)
+            return max(0.0, (until - datetime.now(UTC)).total_seconds())
+        if account.last_used is not None and self._rate_limited(account):
+            last_used = account.last_used
+            if last_used.tzinfo is None:
+                last_used = last_used.replace(tzinfo=UTC)
+            remaining = (
+                self._adaptive_delay(account) - (datetime.now(UTC) - last_used).total_seconds()
+            )
+            return max(0.0, remaining)
+        return 0.0
+
+    def _next_ready_delay_locked(self, session_file: str | None) -> float | None:
+        delays: list[float] = []
+        for account in self.accounts:
+            if session_file and account.session_file != session_file:
+                continue
+            if account.in_use:
+                continue
+            delay = self._available_delay(account)
+            if delay is None or delay <= 0:
+                continue
+            delays.append(delay)
+        return min(delays) if delays else None
+
+    def pool_state_locked(self) -> tuple[int, int, int]:
+        busy = sum(1 for account in self.accounts if account.in_use)
+        flood = sum(
+            1 for account in self.accounts if not account.in_use and self._flood_active(account)
+        )
+        invalid = sum(1 for account in self.accounts if not account.is_valid)
+        return busy, flood, invalid
+
+    async def _wait_for_account(
+        self, session_file: str | None, control: "TaskControl | None"
+    ) -> None:
+        async with self.lock:
+            if self._pick_locked(session_file) is not None:
+                return
+        with suppress(TimeoutError):
+            await asyncio.wait_for(
+                self._free_event.wait(), timeout=Config.ACCOUNT_ROLLER_WAIT_TIMEOUT
+            )
+        async with self.lock:
+            if self._pick_locked(session_file) is not None:
+                return
+            if not self.accounts:
+                raise NoAvailableAccountError(err("no_free_accounts"))
+            if not any(account.is_valid for account in self.accounts):
+                raise NoAvailableAccountError(err("no_valid_accounts"))
+            delay = self._next_ready_delay_locked(session_file)
+            busy, flood, invalid = self.pool_state_locked()
+        if delay is not None and delay > 0:
+            wait_time = max(0.1, delay)
+            logger.info(
+                f"Роллер: свободных аккаунтов нет, ждём {wait_time:.0f}с "
+                f"(в работе {busy}, пауза {flood}, недействительных {invalid})"
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(self._free_event.wait(), timeout=wait_time)
+        else:
+            logger.info(
+                f"Роллер: свободных аккаунтов нет, ждём (в работе {busy}, "
+                f"пауза {flood}, недействительных {invalid})"
+            )
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    self._free_event.wait(), timeout=Config.ACCOUNT_ROLLER_WAIT_TIMEOUT
+                )
+        if control is not None and not await control.checkpoint():
+            raise AccountWaitCancelled
+
+    async def _take_account(
+        self, session_file: str | None, control: "TaskControl | None"
+    ) -> Account:
+        failures = 0
+        while True:
+            account: Account | None = None
+            async with self.lock:
+                account = self._pick_locked(session_file)
+                if account is not None:
+                    self._mark_acquired_locked(account)
+            if account is None:
+                await self._wait_for_account(session_file, control)
+                continue
+            try:
+                await self.ensure_client(account)
+            except asyncio.CancelledError:
+                async with self.lock:
+                    account.in_use = False
+                self._free_event.set()
+                raise
+            except Exception:
+                async with self.lock:
+                    account.in_use = False
+                self._free_event.set()
+                failures += 1
+                if session_file or failures >= max(1, len(self.accounts)):
+                    raise
+                logger.warning(
+                    f"Аккаунт {account.session_file} не подключился, роутер берёт следующий"
+                )
+                continue
+            logger.info(f"Аккаунт {account.session_file} взят в работу")
+            return account
 
     async def health_check_once(self) -> None:
         for account in list(self.accounts):
@@ -2375,6 +2787,7 @@ class AccountPoolManager:
                 logger.error(f"Ошибка отключения {account.session_file}: {e}")
             account.client = None
             account.in_use = False
+        self._free_event.set()
 
 
 # --- Глобальные объекты ---
@@ -2402,19 +2815,34 @@ account_manager: AccountPoolManager = AccountPoolManager()
 LOGIN_CLIENTS: dict[int, TelegramClient] = {}
 BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
 
+queue_manager: "TaskQueueManager | None" = None
+
 TASK_TYPES: dict[str, str] = {
-    "scrape_invite": "task_types.scrape_invite",
-    "bulkmail": "task_types.bulkmail",
-    "worm": "task_types.worm",
+    "scrape_invite": "texts.task_type_scrape_invite",
+    "bulkmail": "texts.task_type_bulkmail",
+    "worm": "texts.task_type_worm",
 }
+
+PROBE_MESSAGE_KEYS: tuple[str, ...] = (
+    "texts.probe_message_1",
+    "texts.probe_message_2",
+    "texts.probe_message_3",
+    "texts.probe_message_4",
+    "texts.probe_message_5",
+    "texts.probe_message_6",
+)
 
 
 def new_task_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def pick_probe_text(language: str) -> str:
+    return translate(language, random.choice(PROBE_MESSAGE_KEYS))
+
+
 def format_task_status(status: str, language: str) -> str:
-    return translate(language, f"statuses.{status}")
+    return translate(language, f"texts.status_{status}")
 
 
 def format_task_type(task_type: str, language: str) -> str:
@@ -2422,95 +2850,93 @@ def format_task_type(task_type: str, language: str) -> str:
     return translate(language, key) if key else task_type
 
 
-def format_chat_label(chat_url: str, chat_name: str = "") -> str:
-    if chat_name and chat_url:
-        return f"{chat_name} ({chat_url})"
-    return chat_url or chat_name or "?"
-
-
 def format_task_card(task: Task, language: str = DEFAULT_LANGUAGE) -> str:
     data = task.data
     source = str(data.get("source") or data.get("chats_label") or "-")
     target = str(data.get("target") or "-")
+    account = str(data.get("account") or "-")
     lines = [
-        translate(language, "texts.task_id_label") + f" <code>{html.escape(task.task_id)}</code>",
-        translate(language, "texts.task_type_label") + f" {format_task_type(task.type, language)}",
-        translate(language, "texts.task_status_label")
-        + f" {format_task_status(task.status, language)}",
-        translate(language, "texts.task_created_label") + f" {html.escape(task.created_at or '-')}",
-        translate(language, "texts.task_source_label") + f" {html.escape(source)}",
+        f"{task_status_emoji(task.status)} <b>{translate(language, 'texts.task_card_title')}</b>",
+        "",
+        (f"{translate(language, 'texts.task_id_label')} <code>{html.escape(task.task_id)}</code>"),
+        f"{translate(language, 'texts.task_type_label')} {format_task_type(task.type, language)}",
+        f"{translate(language, 'texts.task_status_label')} {format_task_status(task.status, language)}",
+        f"{translate(language, 'texts.task_source_label')} <code>{html.escape(source)}</code>",
     ]
     if target != "-":
-        lines.append(translate(language, "texts.task_target_label") + f" {html.escape(target)}")
-    if to_int(data.get("message_limit")):
         lines.append(
-            translate(language, "texts.task_messages_label")
-            + f" {to_int(data.get('message_limit'))}"
+            f"{translate(language, 'texts.task_target_label')} <code>{html.escape(target)}</code>"
         )
-    if to_int(data.get("user_limit")):
+    if account not in ("", "-"):
+        account_value = (
+            translate(language, "buttons.auto_account")
+            if account == "auto"
+            else html.escape(account)
+        )
+        lines.append(f"{translate(language, 'texts.task_account_label')} {account_value}")
+    used_accounts = task.results.get("accounts") if isinstance(task.results, dict) else None
+    if isinstance(used_accounts, list) and used_accounts:
         lines.append(
-            translate(language, "texts.task_users_label") + f" {to_int(data.get('user_limit'))}"
+            f"{translate(language, 'texts.task_accounts_label', count=len(used_accounts))} "
+            f"<code>{html.escape(format_accounts_summary([str(item) for item in used_accounts]))}</code>"
         )
-    if to_int(data.get("chat_count")):
-        lines.append(
-            translate(language, "texts.task_chats_label") + f" {to_int(data.get('chat_count'))}"
-        )
-    lines.append(translate(language, "texts.task_sent_label") + f" {task.sent}")
-    lines.append(
-        translate(language, "texts.task_progress_label") + f" {format_progress_bar(task.progress)}"
-    )
+    for label_key, data_key in (
+        ("texts.task_messages_label", "message_limit"),
+        ("texts.task_users_label", "user_limit"),
+        ("texts.task_chats_label", "chat_count"),
+        ("texts.task_total_label", "total"),
+    ):
+        value = to_int(data.get(data_key))
+        if value:
+            lines.append(f"{translate(language, label_key)} <b>{value}</b>")
+    lines.append(f"{translate(language, 'texts.task_sent_label')} <b>{task.sent}</b>")
+    lines.append("")
+    lines.append(format_progress_bar(task.progress))
     if task.progress_text:
-        lines.append(
-            translate(language, "texts.task_current_status_label")
-            + f" {html.escape(task.progress_text)}"
-        )
+        lines.append(html.escape(task.progress_text))
+    if task.error:
+        lines.append(translate(language, "texts.task_error_line", error=task.error))
     return "\n".join(lines)
 
 
 def build_task_keyboard(task: Task, language: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
+    rows: list[list[dict[str, str]]] = []
     if task.status == "running":
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=translate(language, "texts.task_pause"),
-                    callback_data=f"task:pause:{task.task_id}",
-                ),
-                InlineKeyboardButton(
-                    text=translate(language, "texts.task_cancel_btn"),
-                    callback_data=f"task:cancel:{task.task_id}",
-                ),
-            ]
+        action = (
+            translate(language, "buttons.task_pause"),
+            f"task:pause:{task.task_id}",
         )
     elif task.status in ("pending", "paused"):
+        action = (
+            translate(language, "buttons.task_resume"),
+            f"task:resume:{task.task_id}",
+        )
+    else:
+        action = None
+    if action is not None:
         rows.append(
             [
-                InlineKeyboardButton(
-                    text=translate(language, "texts.task_resume"),
-                    callback_data=f"task:resume:{task.task_id}",
-                ),
-                InlineKeyboardButton(
-                    text=translate(language, "texts.task_cancel_btn"),
-                    callback_data=f"task:cancel:{task.task_id}",
-                ),
+                {"text": action[0], "callback_data": action[1]},
+                {
+                    "text": translate(language, "buttons.task_cancel"),
+                    "callback_data": f"task:cancel:{task.task_id}",
+                },
             ]
         )
     rows.append(
         [
-            InlineKeyboardButton(
-                text=translate(language, "texts.task_refresh"),
-                callback_data=f"task:view:{task.task_id}",
-            ),
-            InlineKeyboardButton(
-                text=translate(language, "texts.task_all_tasks"),
-                callback_data="task:list:active",
-            ),
+            {
+                "text": translate(language, "buttons.task_refresh"),
+                "callback_data": f"task:view:{task.task_id}",
+            },
+            {
+                "text": translate(language, "buttons.task_view_all"),
+                "callback_data": "task:list:active",
+            },
         ]
     )
-    rows.append(
-        [InlineKeyboardButton(text=translate(language, "buttons.menu"), callback_data="menu:main")]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows.append([{"text": translate(language, "buttons.main"), "callback_data": "start"}])
+    return kb(rows)
 
 
 # --- Управление жизненным циклом задачи ---
@@ -2560,7 +2986,8 @@ class TaskControl:
                 return False
             if self._paused:
                 logger.info(
-                    f"Задача {self.task_id} на паузе, ждём возобновления (осталось {remaining:.1f}с)"
+                    f"Задача {self.task_id} на паузе, "
+                    f"ждём возобновления (осталось {remaining:.1f}с)"
                 )
                 try:
                     await asyncio.wait_for(self._resume_event.wait(), timeout=remaining)
@@ -2575,6 +3002,39 @@ class TaskControl:
     @property
     def task_id(self) -> str:
         return self.task.task_id if self.task else "-"
+
+
+def resolve_final_status(control: TaskControl, fatal_error: str = "") -> str:
+    if control.is_cancelled:
+        return "cancelled"
+    if fatal_error:
+        return "failed"
+    if control.is_paused:
+        return "paused"
+    return "completed"
+
+
+def build_final_updates(
+    control: TaskControl, results: dict[str, Any], fatal_error: str = ""
+) -> dict[str, Any]:
+    status = resolve_final_status(control, fatal_error)
+    updates: dict[str, Any] = {
+        "status": status,
+        "results": json.dumps(results, ensure_ascii=False),
+    }
+    if status == "completed":
+        updates["progress"] = 100.0
+        updates["completed_at"] = utc_now_iso()
+    elif status == "failed":
+        updates["completed_at"] = utc_now_iso()
+        updates["error"] = fatal_error[:900]
+        updates["progress_text"] = fatal_error[:200]
+    elif status == "cancelled":
+        updates["completed_at"] = utc_now_iso()
+        updates["cancelled_at"] = utc_now_iso()
+    else:
+        updates["paused_at"] = utc_now_iso()
+    return updates
 
 
 class TaskQueueManager:
@@ -2823,9 +3283,9 @@ class TaskQueueManager:
             task.task_id,
             {
                 "status": "failed",
-                "error": html.escape(error)[:900],
+                "error": error[:900],
                 "completed_at": utc_now_iso(),
-                "progress_text": html.escape(error)[:200],
+                "progress_text": error[:200],
             },
         )
         language = await user_db.get_language(task.user_id)
@@ -2833,7 +3293,7 @@ class TaskQueueManager:
             self.bot,
             task.user_id,
             translate(language, "texts.task_failed_report", task_id=task.task_id, error=error),
-            reply_markup=kb_main(language),
+            reply_markup=main_menu_keyboard(language),
         )
         logger.error(f"Задача {task.task_id} провалена: {error}")
 
@@ -2851,7 +3311,7 @@ class TaskQueueManager:
             self.bot,
             task.user_id,
             translate(language, key, task_id=task.task_id),
-            reply_markup=kb_main(language),
+            reply_markup=main_menu_keyboard(language),
         )
         logger.info(f"Задача {task.task_id} отменена")
 
@@ -2970,7 +3430,7 @@ class TaskProgressReporter:
                 self.task.task_id,
                 {
                     "progress": max(0.0, min(100.0, progress)),
-                    "progress_text": html.escape(text)[:200],
+                    "progress_text": text[:200],
                 },
             )
             self.task.progress = max(0.0, min(100.0, progress))
@@ -3148,15 +3608,76 @@ async def _release_chats(
         await leave_chat(account, target, "цель")
 
 
+async def _collect_invite_batch(
+    account: Account,
+    source_identifier: str,
+    target_identifier: str,
+    mode: str,
+    message_limit: int,
+    user_limit: int,
+    control: TaskControl,
+    language: str,
+    joined_targets: dict[str, tuple[Any, str]],
+) -> tuple[list[int], str, str]:
+    """Собирает пользователей и проверяет цель. Возвращает (пользователи, ключ цели, ошибка)."""
+    source_entity = None
+    source_joined = False
+    try:
+        source_entity, source_joined = await join_chat(account, source_identifier)
+        if mode == "users":
+            collected = await _collect_users_from_participants(
+                account, source_entity, user_limit or Config.SCRAPE_MAX_USER_COUNT, control
+            )
+        else:
+            collected = await _collect_users_from_messages(
+                account, source_entity, message_limit, control
+            )
+        if user_limit:
+            collected = collected[:user_limit]
+        if not collected:
+            return [], "", translate(language, "texts.no_users_found", source=source_identifier)
+        target_entity, target_joined = await join_chat(account, target_identifier)
+        target_key = str(getattr(target_entity, "id", target_identifier))
+        if target_joined:
+            hold_task_chat(joined_targets, account, target_entity, target_identifier)
+        return collected, target_key, ""
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except ChatUnreachableError as e:
+        return [], "", str(e)[:900]
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Сбор не удался: {type(e).__name__}: {e}")
+        return [], "", f"{type(e).__name__}: {e}"[:900]
+    finally:
+        await _release_chats(account, None, False, source_entity, source_joined)
+
+
+async def _invite_one_with_account(
+    account: Account,
+    target_identifier: str,
+    user_id: int,
+    joined_targets: dict[str, tuple[Any, str]],
+) -> str:
+    """Входит в цель этим аккаунтом и приглашает одного пользователя."""
+    target_entity, target_joined = await join_chat(account, target_identifier)
+    if target_joined:
+        hold_task_chat(joined_targets, account, target_entity, target_identifier)
+    return await _invite_user(account, target_entity, user_id)
+
+
 async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
     data = task.data
     language = await user_db.get_language(task.user_id)
     source_identifier = str(data.get("source") or "").strip()
     target_identifier = str(data.get("target") or "").strip()
     mode = str(data.get("mode") or "messages")
-    message_limit = to_int(data.get("message_limit"), Config.SCRAPE_MAX_MESSAGE_LIMIT)
-    user_limit = to_int(data.get("user_limit"), 0)
-    session_file = str(data.get("account") or "auto")
+    message_limit = to_int(data.get("message_limit"), default=Config.SCRAPE_MAX_MESSAGE_LIMIT)
+    user_limit = to_int(data.get("user_limit"))
+    chosen = str(data.get("account") or "auto")
+    pinned = "" if chosen == "auto" else chosen
 
     reporter = TaskProgressReporter(task, control)
     await reporter.start()
@@ -3173,188 +3694,190 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
         await reporter.finalize()
         return
 
-    async with account_manager.acquire(None if session_file == "auto" else session_file) as account:
-        account_name = account.session_file
-        task.data["account"] = account_name
-        await tasks_db.update_task(task.task_id, {"data": {"account": account_name}})
-        result = InviteResult()
+    result = InviteResult()
+    joined_targets: dict[str, tuple[Any, str]] = {}
+    accounts_used: list[str] = []
+    collected: list[int] = []
+    target_key = ""
+    total = 0
+    processed = 0
+    stop_reason = ""
+    fatal_error = ""
+    flood_events = 0
+    flood_seconds = 0.0
 
-        try:
-            await reporter.update(
-                5.0,
-                translate(
-                    language,
-                    "texts.progress_scraping",
-                    progress_text=format_progress_bar(5),
-                    processed=0,
-                    limit=message_limit or user_limit,
-                ),
-                force=True,
-            )
-            source_entity, source_joined = await join_chat(account, source_identifier)
-        except FloodWaitError as e:
-            seconds = float(getattr(e, "seconds", 60))
-            extended = account_manager.handle_flood_wait(account, seconds)
-            await tasks_db.update_task(
-                task.task_id, {"status": "paused", "paused_at": utc_now_iso()}
-            )
-            await reporter.finalize(
-                translate(
-                    language,
-                    "texts.floodwait_extended_pause",
-                    task_id=task.task_id,
-                    seconds=seconds,
-                    extended=extended,
-                )
-            )
-            return
-        except (AuthKeyUnregisteredError, ChatUnreachableError) as e:
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": html.escape(str(e))[:900],
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-
-        try:
-            if mode == "users":
-                collected = await _collect_users_from_participants(
-                    account, source_entity, user_limit or Config.SCRAPE_MAX_USER_COUNT, control
-                )
-            else:
-                collected = await _collect_users_from_messages(
-                    account, source_entity, message_limit, control
-                )
-            if user_limit:
-                collected = collected[:user_limit]
-        except FloodWaitError as e:
-            seconds = float(getattr(e, "seconds", 60))
-            account_manager.handle_flood_wait(account, seconds)
-            await _release_chats(account, None, False, source_entity, source_joined)
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": translate(
-                        language, "texts.task_failed_flood_scrape", seconds=int(seconds)
-                    ),
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-        except AuthKeyUnregisteredError:
-            account.is_valid = False
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": translate(language, "texts.task_failed_auth_reset"),
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-
-        if not collected:
-            await _release_chats(account, None, False, source_entity, source_joined)
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": translate(language, "texts.no_users_found", source=source_identifier),
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-
-        logger.info(f"Задача {task.task_id}: собрано {len(collected)} пользователей")
-
-        target_entity = None
-        target_joined = False
-        try:
-            target_entity, target_joined = await join_chat(account, target_identifier)
-        except FloodWaitError as e:
-            seconds = float(getattr(e, "seconds", 60))
-            account_manager.handle_flood_wait(account, seconds)
-            await _release_chats(account, None, False, source_entity, source_joined)
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": translate(
-                        language, "texts.task_failed_flood_target", seconds=int(seconds)
-                    ),
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-        except (ChatUnreachableError, AuthKeyUnregisteredError) as e:
-            await _release_chats(account, None, False, source_entity, source_joined)
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": html.escape(str(e))[:900],
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-
-        target_key = str(getattr(target_entity, "id", target_identifier))
-        total = len(collected)
-        processed = 0
-        for user_id in collected:
+    try:
+        await reporter.update(
+            5.0,
+            translate(
+                language,
+                "texts.progress_scraping",
+                progress_text=format_progress_bar(5),
+                processed=0,
+                limit=message_limit or user_limit,
+            ),
+            force=True,
+        )
+        attempts = max(1, len(account_manager.accounts))
+        for attempt in range(1, attempts + 1):
             if not await control.checkpoint():
-                result.remaining = collected[processed:]
+                stop_reason = "cancelled"
                 break
-            processed += 1
-            if await cache_db.is_invited(target_key, user_id):
-                result.already_members += 1
-                continue
-            if account_manager.should_simulate_skip():
-                delay = rand_range(Config.HUMAN_SKIP_DELAY_MIN, Config.HUMAN_SKIP_DELAY_MAX)
-                await control.wait(delay)
-                continue
             try:
-                outcome = await _invite_user(account, target_entity, user_id)
+                async with account_manager.acquire(pinned or None, control) as account:
+                    if account.session_file not in accounts_used:
+                        accounts_used.append(account.session_file)
+                    collected, target_key, batch_error = await _collect_invite_batch(
+                        account,
+                        source_identifier,
+                        target_identifier,
+                        mode,
+                        message_limit,
+                        user_limit,
+                        control,
+                        language,
+                        joined_targets,
+                    )
+                    if batch_error:
+                        fatal_error = batch_error
+                    break
             except FloodWaitError as e:
                 seconds = float(getattr(e, "seconds", 60))
                 extended = account_manager.handle_flood_wait(account, seconds)
-                logger.warning(f"FloodWait на инвайте: {seconds:.0f}с -> {extended:.0f}с")
-                await control.wait(min(extended, 300.0))
-                result.remaining = collected[processed - 1 :]
-                break
+                flood_events += 1
+                flood_seconds = max(flood_seconds, seconds)
+                logger.warning(
+                    f"Сбор: FloodWait {seconds:.0f}с (пауза {extended:.0f}с), "
+                    f"пробую другой аккаунт ({attempt}/{attempts})"
+                )
+                continue
             except AuthKeyUnregisteredError:
-                account.is_valid = False
-                result.remaining = collected[processed - 1 :]
+                fatal_error = translate(language, "texts.task_failed_auth_reset")
                 break
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"Ошибка инвайта {user_id}: {type(e).__name__}: {e}")
-                outcome = "failed"
+            except AccountWaitCancelled:
+                stop_reason = "cancelled"
+                break
 
-            if outcome == "success":
-                result.success += 1
-                await cache_db.mark_invited(target_key, user_id, task.task_id)
-                account.invite_count += 1
-            elif outcome == "already":
-                result.already_members += 1
-                await cache_db.mark_invited(target_key, user_id, task.task_id)
-            elif outcome == "privacy":
-                result.privacy_errors += 1
-            elif outcome == "request":
-                result.success += 1
-                await cache_db.mark_invited(target_key, user_id, task.task_id)
+        if not fatal_error and not collected and not stop_reason:
+            fatal_error = translate(language, "texts.no_users_found", source=source_identifier)
+        if fatal_error or (stop_reason and not collected):
+            status_text = fatal_error or translate(language, "texts.task_cancelled_report")
+            await tasks_db.update_task(
+                task.task_id,
+                {
+                    "status": "failed" if fatal_error else "cancelled",
+                    "error": status_text[:900],
+                    "completed_at": utc_now_iso(),
+                },
+            )
+            if flood_events:
+                await reporter.finalize(
+                    translate(
+                        language,
+                        "texts.roller_flood_summary",
+                        count=flood_events,
+                        seconds=int(flood_seconds),
+                    )
+                )
+            else:
+                await reporter.finalize()
+            return
 
-            if processed % max(1, Config.INVITE_BUFFER_SIZE) == 0 or processed == total:
-                task.sent = result.success
+        logger.info(
+            f"Задача {task.task_id}: собрано {len(collected)} пользователей, "
+            f"ротация по {max(1, Config.INVITE_STEP_USERS)} на аккаунт"
+        )
+        total = len(collected)
+        await reporter.update(
+            10.0,
+            translate(
+                language,
+                "texts.progress_inviting",
+                progress_text=format_progress_bar(10),
+                processed=0,
+                total=total,
+            ),
+            force=True,
+        )
+
+        step_users = max(1, Config.INVITE_STEP_USERS)
+        while processed < total:
+            if not await control.checkpoint():
+                stop_reason = "cancelled"
+                break
+            batch = collected[processed : processed + step_users]
+            try:
+                async with account_manager.acquire_step(pinned or None, control) as account:
+                    if account.session_file not in accounts_used:
+                        accounts_used.append(account.session_file)
+                    for user_id in batch:
+                        if not await control.checkpoint():
+                            stop_reason = "cancelled"
+                            break
+                        if await cache_db.is_invited(target_key, user_id):
+                            processed += 1
+                            result.already_members += 1
+                            continue
+                        if account_manager.should_simulate_skip():
+                            logger.debug(
+                                f"Задача {task.task_id}: пользователь {user_id} пропущен "
+                                f"аккаунтом {account.session_file}, беру другой"
+                            )
+                            break
+                        processed += 1
+                        try:
+                            outcome = await _invite_one_with_account(
+                                account, target_identifier, user_id, joined_targets
+                            )
+                        except FloodWaitError as e:
+                            seconds = float(getattr(e, "seconds", 60))
+                            extended = account_manager.handle_flood_wait(account, seconds)
+                            flood_events += 1
+                            flood_seconds = max(flood_seconds, seconds)
+                            processed -= 1
+                            logger.warning(
+                                f"FloodWait на инвайте {seconds:.0f}с -> {extended:.0f}с, "
+                                f"перехожу на другой аккаунт"
+                            )
+                            break
+                        except AuthKeyUnregisteredError:
+                            account.is_valid = False
+                            fatal_error = translate(language, "texts.task_failed_auth_reset")
+                            processed -= 1
+                            break
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(f"Ошибка инвайта {user_id}: {type(e).__name__}: {e}")
+                            outcome = "failed"
+
+                        if outcome == "success":
+                            result.success += 1
+                            await cache_db.mark_invited(target_key, user_id, task.task_id)
+                            account.invite_count += 1
+                        elif outcome == "already":
+                            result.already_members += 1
+                            await cache_db.mark_invited(target_key, user_id, task.task_id)
+                        elif outcome == "privacy":
+                            result.privacy_errors += 1
+                        elif outcome == "request":
+                            result.success += 1
+                            await cache_db.mark_invited(target_key, user_id, task.task_id)
+                        else:
+                            result.failed += 1
+                        account_manager.update_success_rate(account, outcome == "success")
+                        if control.is_paused or control.is_cancelled:
+                            stop_reason = "cancelled"
+                            break
+                    if fatal_error or stop_reason:
+                        break
+            except AccountWaitCancelled:
+                stop_reason = "cancelled"
+                break
+            except NoAvailableAccountError as e:
+                fatal_error = str(e.message)
+                break
+
+            task.sent = result.success
+            if processed % max(1, Config.INVITE_BUFFER_SIZE) == 0 or processed >= total:
                 await _apply_progress(
                     control,
                     reporter,
@@ -3368,8 +3891,7 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
                         total=total,
                     ),
                 )
-            account_manager._update_success_rate(account, outcome == "success")
-            if control.is_paused or control.is_cancelled:
+            if stop_reason or fatal_error:
                 break
             delay = rand_range(Config.MIN_INVITE_DELAY, Config.MAX_INVITE_DELAY)
             if processed % max(1, Config.HUMAN_DELAY_EVERY) == 0:
@@ -3377,19 +3899,23 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
             if processed % max(1, Config.INVITE_BUFFER_SIZE) == 0:
                 delay += rand_range(Config.POST_BUFFER_DELAY_MIN, Config.POST_BUFFER_DELAY_MAX)
             if not await control.wait(delay):
+                stop_reason = "cancelled"
                 break
+    finally:
+        await leave_task_chats(joined_targets)
 
-        await _release_chats(account, target_entity, target_joined, source_entity, source_joined)
+    if processed < total:
+        result.remaining = collected[processed:]
 
     task.sent = result.success
-    status = "cancelled" if control.is_cancelled else "completed"
+    status = resolve_final_status(control, fatal_error)
+    if status == "completed" and stop_reason == "cancelled":
+        status = "cancelled"
     await tasks_db.update_task(
         task.task_id,
         {
-            "status": status,
-            "progress": 100.0,
-            "sent": result.success,
-            "results": json.dumps(
+            **build_final_updates(
+                control,
                 {
                     "success": result.success,
                     "failed": result.failed,
@@ -3397,38 +3923,68 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
                     "already": result.already_members,
                     "processed": processed,
                     "total": total,
+                    "remaining": len(result.remaining),
+                    "accounts": accounts_used,
+                    "flood_events": flood_events,
                 },
-                ensure_ascii=False,
+                fatal_error,
             ),
-            "completed_at": utc_now_iso(),
+            "sent": result.success,
         },
     )
-    if status == "cancelled":
+    if status != "completed":
         await safe_send_message(
             get_queue_manager().bot,
             task.user_id,
-            translate(language, "texts.task_cancelled_report", task_id=task.task_id),
-            reply_markup=kb_main(language),
+            translate(
+                language,
+                "texts.task_failed_report"
+                if status == "failed"
+                else (
+                    "texts.task_paused_report"
+                    if status == "paused"
+                    else "texts.task_cancelled_report"
+                ),
+                task_id=task.task_id,
+                processed=processed,
+                total=total,
+                error=fatal_error,
+            ),
+            reply_markup=main_menu_keyboard(language),
         )
         await reporter.finalize()
         return
+    accounts_label = format_accounts_summary(accounts_used)
     await safe_send_message(
         get_queue_manager().bot,
         task.user_id,
         translate(
             language,
-            "texts.task_completed_report",
+            "texts.task_completed_report_multi"
+            if len(accounts_used) > 1
+            else "texts.task_completed_report",
             task_id=task.task_id,
-            source=html.escape(source_identifier),
-            target=html.escape(target_identifier),
+            source=source_identifier,
+            target=target_identifier,
             invited=processed,
             success=result.success,
+            already=result.already_members,
             failed=result.failed,
             privacy=result.privacy_errors,
-            account=html.escape(account_name),
+            account=accounts_label,
         ),
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
     )
+    if flood_events:
+        await reporter.finalize(
+            translate(
+                language,
+                "texts.roller_flood_summary",
+                count=flood_events,
+                seconds=int(flood_seconds),
+            )
+        )
+        return
     await reporter.finalize()
 
 
@@ -3469,10 +4025,11 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
     language = await user_db.get_language(task.user_id)
     chats: list[str] = [str(item) for item in data.get("chats", []) if str(item).strip()]
     texts: list[str] = [str(item) for item in data.get("texts", []) if str(item).strip()]
-    min_delay = to_int(data.get("min_delay"), Config.MAILING_MIN_DELAY)
-    max_delay = to_int(data.get("max_delay"), Config.MAILING_MAX_DELAY)
-    max_sends = to_int(data.get("total"), Config.MAILING_MAX_TOTAL_SENDS)
+    min_delay = to_int(data.get("min_delay"), default=Config.MAILING_MIN_DELAY)
+    max_delay = to_int(data.get("max_delay"), default=Config.MAILING_MAX_DELAY)
+    max_sends = to_int(data.get("total"), default=Config.MAILING_MAX_TOTAL_SENDS)
     sender = str(data.get("account") or "auto")
+    pinned = "" if sender == "auto" else sender
     target = str(data.get("target") or "chats")
 
     reporter = TaskProgressReporter(task, control, interval=float(Config.MAILING_CHECK_INTERVAL))
@@ -3494,152 +4051,236 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
     per_chat: dict[str, int] = {}
     errors = 0
     privacy = 0
-    session_file = "" if sender == "auto" else sender
+    fatal_error = ""
+    flood_events = 0
+    flood_seconds = 0.0
+    accounts_used: list[str] = []
+    recipients: list[Any] = []
+    total = 0
+    processed = 0
 
-    async with account_manager.acquire(session_file or None) as account:
-        session_file = account.session_file
-        await tasks_db.update_task(task.task_id, {"data": {"account": session_file}})
-
-        if target == "users":
-            recipients: list[Any] = await _collect_mailing_users(
-                account, chats, Config.SCRAPE_MAX_USER_COUNT, control
-            )
-        else:
-            recipients = list(chats)
-            total_planned = min(
-                max_sends if max_sends > 0 else Config.MAILING_MAX_TOTAL_SENDS,
-                Config.MAILING_MAX_TOTAL_SENDS,
-            )
-            if total_planned > len(recipients):
-                recipients = [recipients[index % len(recipients)] for index in range(total_planned)]
-
-        if not recipients:
-            await tasks_db.update_task(
-                task.task_id,
-                {
-                    "status": "failed",
-                    "error": translate(language, "texts.bulkmail_no_users"),
-                    "completed_at": utc_now_iso(),
-                },
-            )
-            await reporter.finalize()
-            return
-
-        consecutive_errors = 0
-        for index, recipient in enumerate(recipients, start=1):
-            if not await control.checkpoint():
-                break
-            key = str(recipient)
-            entity: Any = None
-            joined = False
-            failed = False
-
-            if target != "users":
-                try:
-                    entity, joined = await join_chat(account, key)
-                except FloodWaitError as e:
-                    seconds = float(getattr(e, "seconds", 60)) + Config.MAILING_FLOOD_WAIT_PADDING
-                    account_manager.handle_flood_wait(account, seconds)
-                    await control.wait(min(seconds, 300.0))
-                    errors += 1
-                    continue
-                except ChatUnreachableError as e:
-                    logger.warning(f"Рассылка: чат {key} недоступен: {e}")
-                    errors += 1
-                    continue
-                except AuthKeyUnregisteredError:
-                    account.is_valid = False
-                    break
-                destination = entity
-            else:
-                destination = key
-
-            text = texts[random.randrange(len(texts))]
-            try:
-                await require_client(account).send_message(destination, text)
-                sent += 1
-                per_chat[key] = per_chat.get(key, 0) + 1
-                consecutive_errors = 0
-            except FloodWaitError as e:
-                seconds = float(getattr(e, "seconds", 60)) + Config.MAILING_FLOOD_WAIT_PADDING
-                account_manager.handle_flood_wait(account, seconds)
-                await control.wait(min(seconds, 300.0))
-                errors += 1
-                consecutive_errors += 1
-                failed = True
-            except AuthKeyUnregisteredError:
-                account.is_valid = False
-                break
-            except UserPrivacyRestrictedError:
-                privacy += 1
-                consecutive_errors += 1
-            except (UserIsBlockedError, InputUserDeactivatedError) as e:
-                logger.debug(f"Рассылка в ЛС {key} невозможна: {type(e).__name__}")
-                errors += 1
-                consecutive_errors += 1
-            except (ChatWriteForbiddenError, ChatAdminRequiredError) as e:
-                logger.warning(f"Рассылка в {key} запрещена: {e}")
-                errors += 1
-                consecutive_errors += 1
-                failed = True
-            finally:
-                if target != "users" and Features.auto_leave() and joined:
-                    await leave_chat(account, entity, key)
-
-            task.sent = sent
-            await _apply_progress(
-                control,
-                reporter,
-                index,
-                len(recipients),
-                f"{target}: {index}/{len(recipients)}",
-            )
-            if failed and target != "users":
-                continue
-            if consecutive_errors >= Config.MAILING_MAX_CONSECUTIVE_ERRORS:
-                logger.warning(
-                    f"Рассылка: {consecutive_errors} ошибок подряд, пауза "
-                    f"{Config.MAILING_CONSECUTIVE_ERROR_LONG_DELAY}с"
+    if target == "users":
+        try:
+            async with account_manager.acquire(pinned or None, control) as account:
+                if account.session_file not in accounts_used:
+                    accounts_used.append(account.session_file)
+                recipients = await _collect_mailing_users(
+                    account, chats, Config.SCRAPE_MAX_USER_COUNT, control
                 )
-                if not await control.wait(Config.MAILING_CONSECUTIVE_ERROR_LONG_DELAY):
+        except FloodWaitError as e:
+            seconds = float(getattr(e, "seconds", 60))
+            account_manager.handle_flood_wait(account, seconds)
+            flood_events += 1
+            flood_seconds = max(flood_seconds, seconds)
+            fatal_error = translate(
+                language, "texts.task_failed_flood_scrape", seconds=int(seconds)
+            )
+        except AuthKeyUnregisteredError:
+            fatal_error = translate(language, "texts.task_failed_auth_reset")
+        except AccountWaitCancelled:
+            pass
+        except NoAvailableAccountError as e:
+            fatal_error = str(e.message)
+    else:
+        recipients = list(chats)
+        total_planned = min(
+            max_sends if max_sends > 0 else Config.MAILING_MAX_TOTAL_SENDS,
+            Config.MAILING_MAX_TOTAL_SENDS,
+        )
+        if total_planned > len(recipients):
+            recipients = [recipients[index % len(recipients)] for index in range(total_planned)]
+
+    if fatal_error:
+        await tasks_db.update_task(
+            task.task_id,
+            {
+                "status": "failed",
+                "error": fatal_error,
+                "completed_at": utc_now_iso(),
+            },
+        )
+        await reporter.finalize()
+        return
+
+    if not recipients:
+        await tasks_db.update_task(
+            task.task_id,
+            {
+                "status": "failed",
+                "error": translate(language, "texts.bulkmail_no_users"),
+                "completed_at": utc_now_iso(),
+            },
+        )
+        await reporter.finalize()
+        return
+
+    total = len(recipients)
+    step_messages = max(1, Config.MAILING_STEP_MESSAGES)
+    consecutive_errors = 0
+    while processed < total:
+        if not await control.checkpoint():
+            break
+        batch = recipients[processed : processed + step_messages]
+        try:
+            async with account_manager.acquire_step(pinned or None, control) as account:
+                if account.session_file not in accounts_used:
+                    accounts_used.append(account.session_file)
+                for recipient in batch:
+                    key = str(recipient)
+                    entity: Any = None
+                    joined = False
+                    if target != "users":
+                        try:
+                            entity, joined = await join_chat(account, key)
+                        except FloodWaitError as e:
+                            seconds = float(getattr(e, "seconds", 60))
+                            account_manager.handle_flood_wait(
+                                account,
+                                seconds + Config.MAILING_FLOOD_WAIT_PADDING,
+                            )
+                            flood_events += 1
+                            flood_seconds = max(flood_seconds, seconds)
+                            errors += 1
+                            processed += 1
+                            logger.warning(
+                                f"Рассылка: FloodWait на {key} {seconds:.0f}с, "
+                                f"перехожу на другой аккаунт"
+                            )
+                            continue
+                        except ChatUnreachableError as e:
+                            logger.warning(f"Рассылка: чат {key} недоступен: {e}")
+                            errors += 1
+                            processed += 1
+                            continue
+                        except AuthKeyUnregisteredError:
+                            account.is_valid = False
+                            fatal_error = translate(language, "texts.task_failed_auth_reset")
+                            break
+                        destination: Any = entity
+                    else:
+                        destination = key
+
+                    text = texts[random.randrange(len(texts))]
+                    try:
+                        await send_formatted(require_client(account), destination, text)
+                        sent += 1
+                        per_chat[key] = per_chat.get(key, 0) + 1
+                        consecutive_errors = 0
+                    except FloodWaitError as e:
+                        seconds = float(getattr(e, "seconds", 60))
+                        account_manager.handle_flood_wait(
+                            account, seconds + Config.MAILING_FLOOD_WAIT_PADDING
+                        )
+                        flood_events += 1
+                        flood_seconds = max(flood_seconds, seconds)
+                        errors += 1
+                        consecutive_errors += 1
+                    except AuthKeyUnregisteredError:
+                        account.is_valid = False
+                        fatal_error = translate(language, "texts.task_failed_auth_reset")
+                        break
+                    except UserPrivacyRestrictedError:
+                        privacy += 1
+                        consecutive_errors += 1
+                    except (UserIsBlockedError, InputUserDeactivatedError) as e:
+                        logger.debug(f"Рассылка в ЛС {key} невозможна: {type(e).__name__}")
+                        errors += 1
+                        consecutive_errors += 1
+                    except (ChatWriteForbiddenError, ChatAdminRequiredError) as e:
+                        logger.warning(f"Рассылка в {key} запрещена: {e}")
+                        errors += 1
+                        consecutive_errors += 1
+                    finally:
+                        processed += 1
+                        if target != "users" and Features.auto_leave() and joined:
+                            await leave_chat(account, entity, key)
+                    if fatal_error or control.is_cancelled:
+                        break
+                if fatal_error:
                     break
-                consecutive_errors = 0
-            elif consecutive_errors:
-                if not await control.wait(Config.MAILING_CONSECUTIVE_ERROR_SHORT_DELAY):
-                    break
-            elif not await control.wait(rand_range(min_delay, max_delay)):
+        except AccountWaitCancelled:
+            break
+        except NoAvailableAccountError as e:
+            fatal_error = str(e.message)
+            break
+
+        task.sent = sent
+        await _apply_progress(
+            control,
+            reporter,
+            processed,
+            total,
+            translate(
+                language,
+                "texts.progress_mailing",
+                progress_text=format_progress_bar(processed / total * 100),
+                processed=processed,
+                total=total,
+            ),
+        )
+        if fatal_error:
+            break
+        if consecutive_errors >= Config.MAILING_MAX_CONSECUTIVE_ERRORS:
+            logger.warning(
+                f"Рассылка: {consecutive_errors} ошибок подряд, пауза "
+                f"{Config.MAILING_CONSECUTIVE_ERROR_LONG_DELAY}с"
+            )
+            if not await control.wait(Config.MAILING_CONSECUTIVE_ERROR_LONG_DELAY):
                 break
+            consecutive_errors = 0
+        elif consecutive_errors:
+            if not await control.wait(Config.MAILING_CONSECUTIVE_ERROR_SHORT_DELAY):
+                break
+        elif not await control.wait(rand_range(min_delay, max_delay)):
+            break
 
     task.sent = sent
-    status = "cancelled" if control.is_cancelled else "completed"
+    status = resolve_final_status(control, fatal_error)
     report_lines = "\n".join(
-        f"• {html.escape(chat)}: {count}" for chat, count in list(per_chat.items())[:20]
+        translate(language, "texts.mailing_chat_line", chat=chat, count=count)
+        for chat, count in list(per_chat.items())[:20]
     )
     await tasks_db.update_task(
         task.task_id,
         {
-            "status": status,
-            "progress": 100.0,
-            "sent": sent,
-            "results": json.dumps(
+            **build_final_updates(
+                control,
                 {
                     "sent": sent,
                     "chats": per_chat,
                     "errors": errors,
                     "privacy": privacy,
                     "target": target,
+                    "processed": processed,
+                    "total": total,
+                    "accounts": accounts_used,
+                    "flood_events": flood_events,
                 },
-                ensure_ascii=False,
+                fatal_error,
             ),
-            "completed_at": utc_now_iso(),
+            "sent": sent,
         },
     )
-    if status == "cancelled":
+    if status != "completed":
         await safe_send_message(
             get_queue_manager().bot,
             task.user_id,
-            translate(language, "texts.mailing_cancelled_report", task_id=task.task_id),
-            reply_markup=kb_main(language),
+            translate(
+                language,
+                "texts.task_failed_report"
+                if status == "failed"
+                else (
+                    "texts.mailing_cancelled_report"
+                    if status == "cancelled"
+                    else "texts.task_paused_report"
+                ),
+                task_id=task.task_id,
+                sent=sent,
+                processed=processed,
+                total=total,
+                error=fatal_error,
+            ),
+            reply_markup=main_menu_keyboard(language),
         )
         await reporter.finalize()
         return
@@ -3661,13 +4302,93 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
             texts_count=len(texts),
             chats_report=report_lines or "-",
         )
+    if accounts_used:
+        summary += "\n\n" + translate(
+            language,
+            "texts.roller_accounts_used",
+            count=len(accounts_used),
+            accounts=format_accounts_summary(accounts_used),
+        )
+    if flood_events:
+        summary += "\n\n" + translate(
+            language,
+            "texts.roller_flood_summary",
+            count=flood_events,
+            seconds=int(flood_seconds),
+        )
     await safe_send_message(
         get_queue_manager().bot,
         task.user_id,
         summary,
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
     )
     await reporter.finalize()
+
+
+async def _scan_worm_source(
+    account: Account,
+    identifier: str,
+    language: str,
+    seen: set[str],
+    control: TaskControl,
+) -> WormSourceStats:
+    """Сканирует один источник. FloodWait и AuthKeyUnregisteredError пробрасываются."""
+    stats = WormSourceStats()
+    entity = None
+    joined = False
+    try:
+        entity, joined = await join_chat(account, identifier)
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except (ChatUnreachableError, ValueError) as e:
+        stats.errors += 1
+        logger.warning(f"Червь: источник {identifier} недоступен: {e}")
+        return stats
+
+    client = require_client(account)
+    try:
+        async for message in client.iter_messages(entity, limit=Config.WORM_SCAN_LIMIT):
+            if not await control.checkpoint():
+                break
+            stats.messages += 1
+            text = getattr(message, "message", None) or getattr(message, "text", None)
+            if not text:
+                continue
+            for link in extract_telegram_links(text):
+                stats.links += 1
+                target = parse_link_to_identifier(link)
+                if not target or target in seen:
+                    continue
+                seen.add(target)
+                if len(seen) > Config.WORM_SEEN_LIMIT:
+                    logger.info(f"Червь: достигнут лимит {Config.WORM_SEEN_LIMIT} ссылок")
+                    break
+                if await chat_db.get_chat(target) or await chat_db.get_chat(
+                    f"https://t.me/{target}"
+                ):
+                    continue
+                if stats.added >= Config.WORM_MAX_SOURCES:
+                    break
+                validated = await validate_and_test_chat(account, target, language)
+                if validated is not None:
+                    stats.added += 1
+                if not await control.wait(rand_range(Config.WORM_MIN_DELAY, Config.WORM_MAX_DELAY)):
+                    break
+    except FloodWaitError:
+        raise
+    except AuthKeyUnregisteredError:
+        account.is_valid = False
+        raise
+    except Exception as e:  # noqa: BLE001
+        stats.errors += 1
+        logger.error(f"Червь: ошибка обработки {identifier}: {e}")
+    finally:
+        if joined:
+            await leave_chat(account, entity, identifier)
+    return stats
 
 
 async def run_worm_task(task: Task, control: TaskControl) -> None:
@@ -3692,119 +4413,109 @@ async def run_worm_task(task: Task, control: TaskControl) -> None:
     totals = WormSourceStats()
     processed_sources: list[str] = []
     seen: set[str] = set(sources)
+    fatal_error = ""
+    flood_events = 0
+    flood_seconds = 0.0
+    accounts_used: list[str] = []
 
-    async with account_manager.acquire(None) as account:
-        session_file = account.session_file
-        await tasks_db.update_task(task.task_id, {"data": {"account": session_file}})
-        for identifier in sources:
-            if not await control.checkpoint():
-                break
-            stats = WormSourceStats()
-            entity = None
-            joined = False
-            try:
-                entity, joined = await join_chat(account, identifier)
-            except FloodWaitError as e:
-                seconds = float(getattr(e, "seconds", 60))
-                account_manager.handle_flood_wait(account, seconds)
-                await control.wait(min(seconds, 300.0))
-                continue
-            except (ChatUnreachableError, AuthKeyUnregisteredError) as e:
-                stats.errors += 1
-                logger.warning(f"Червь: источник {identifier} недоступен: {e}")
-                continue
+    for identifier in sources:
+        if not await control.checkpoint():
+            break
+        try:
+            async with account_manager.acquire_step(None, control) as account:
+                if account.session_file not in accounts_used:
+                    accounts_used.append(account.session_file)
+                stats = await _scan_worm_source(account, identifier, language, seen, control)
+        except FloodWaitError as e:
+            seconds = float(getattr(e, "seconds", 60))
+            account_manager.handle_flood_wait(account, seconds)
+            flood_events += 1
+            flood_seconds = max(flood_seconds, seconds)
+            logger.warning(f"Червь: FloodWait на {identifier} {seconds:.0f}с, беру другой аккаунт")
+            continue
+        except AuthKeyUnregisteredError:
+            fatal_error = translate(language, "texts.task_failed_auth_reset")
+            break
+        except AccountWaitCancelled:
+            break
+        except NoAvailableAccountError as e:
+            fatal_error = str(e.message)
+            break
 
-            client = require_client(account)
-            try:
-                async for message in client.iter_messages(entity, limit=Config.WORM_SCAN_LIMIT):
-                    if not await control.checkpoint():
-                        break
-                    stats.messages += 1
-                    text = getattr(message, "message", None) or getattr(message, "text", None)
-                    if not text:
-                        continue
-                    for link in extract_telegram_links(text):
-                        stats.links += 1
-                        target = parse_link_to_identifier(link)
-                        if not target or target in seen:
-                            continue
-                        seen.add(target)
-                        if len(seen) > Config.WORM_SEEN_LIMIT:
-                            logger.info(f"Червь: достигнут лимит {Config.WORM_SEEN_LIMIT} ссылок")
-                            break
-                        if await chat_db.get_chat(target) or await chat_db.get_chat(
-                            f"https://t.me/{target}"
-                        ):
-                            continue
-                        if stats.added >= Config.WORM_MAX_SOURCES:
-                            break
-                        validated = await validate_and_test_chat(account, target)
-                        if validated is not None:
-                            stats.added += 1
-                        if not await control.wait(
-                            rand_range(Config.WORM_MIN_DELAY, Config.WORM_MAX_DELAY)
-                        ):
-                            break
-            except FloodWaitError as e:
-                seconds = float(getattr(e, "seconds", 60))
-                account_manager.handle_flood_wait(account, seconds)
-                await control.wait(min(seconds, 300.0))
-            except AuthKeyUnregisteredError:
-                account.is_valid = False
-                break
-            except Exception as e:  # noqa: BLE001
-                stats.errors += 1
-                logger.error(f"Червь: ошибка обработки {identifier}: {e}")
-            finally:
-                if Features.auto_leave() and joined:
-                    await leave_chat(account, entity, identifier)
+        processed_sources.append(identifier)
+        totals.messages += stats.messages
+        totals.links += stats.links
+        totals.added += stats.added
+        totals.errors += stats.errors
+        await _apply_progress(
+            control,
+            reporter,
+            len(processed_sources),
+            len(sources),
+            translate(
+                language,
+                "texts.progress_worm",
+                added=stats.added,
+                processed=len(processed_sources),
+                total=len(sources),
+            ),
+        )
+        if processed_sources[-1] != sources[-1] and not await control.wait(
+            rand_range(Config.WORM_MIN_DELAY, Config.WORM_MAX_DELAY)
+        ):
+            break
 
-            processed_sources.append(identifier)
-            totals.messages += stats.messages
-            totals.links += stats.links
-            totals.added += stats.added
-            totals.errors += stats.errors
-            await _apply_progress(
-                control,
-                reporter,
-                len(processed_sources),
-                len(sources),
-                f"{identifier}: +{stats.added} чатов",
-            )
-            if processed_sources[-1] != sources[-1] and not await control.wait(
-                rand_range(Config.WORM_MIN_DELAY, Config.WORM_MAX_DELAY)
-            ):
-                break
-
-    status = "cancelled" if control.is_cancelled else "completed"
+    status = resolve_final_status(control, fatal_error)
     await tasks_db.update_task(
         task.task_id,
-        {
-            "status": status,
-            "progress": 100.0,
-            "results": json.dumps(
-                {
-                    "messages": totals.messages,
-                    "links": totals.links,
-                    "added": totals.added,
-                    "errors": totals.errors,
-                },
-                ensure_ascii=False,
-            ),
-            "completed_at": utc_now_iso(),
-        },
+        build_final_updates(
+            control,
+            {
+                "messages": totals.messages,
+                "links": totals.links,
+                "added": totals.added,
+                "errors": totals.errors,
+                "accounts": accounts_used,
+                "flood_events": flood_events,
+            },
+            fatal_error,
+        ),
     )
+    if accounts_used:
+        await safe_send_message(
+            get_queue_manager().bot,
+            task.user_id,
+            translate(
+                language,
+                "texts.roller_accounts_used",
+                count=len(accounts_used),
+                accounts=format_accounts_summary(accounts_used),
+            ),
+            reply_markup=main_menu_keyboard(language),
+        )
     await reporter.finalize(
         translate(
             language,
-            "texts.worm_stopped_multi",
+            "texts.worm_stopped_multi"
+            if status == "completed"
+            else (
+                "texts.task_failed_report"
+                if status == "failed"
+                else (
+                    "texts.task_paused_report"
+                    if status == "paused"
+                    else "texts.task_cancelled_report"
+                )
+            ),
             messages=totals.messages,
             links=totals.links,
             added=totals.added,
             errors=totals.errors,
+            task_id=task.task_id,
+            processed=len(processed_sources),
+            total=len(sources),
+            error=fatal_error,
         )
-        if status == "completed"
-        else ""
     )
 
 
@@ -3817,13 +4528,10 @@ class InviterStates(StatesGroup):
     waiting_worm_chats: State = State()
     waiting_scrape_source: State = State()
     waiting_scrape_target: State = State()
-    waiting_scrape_mode: State = State()
     waiting_scrape_limit: State = State()
-    waiting_scrape_account: State = State()
     waiting_mail_chats: State = State()
     waiting_mail_delay: State = State()
     waiting_mail_text: State = State()
-    waiting_mail_account: State = State()
     waiting_mail_total: State = State()
 
 
@@ -3846,186 +4554,308 @@ def parse_identifier(value: str) -> str | None:
 
 
 # --- Клавиатуры ---
-def kb_main(language: str) -> InlineKeyboardMarkup:
+def kb(rows: list[list[dict[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(**btn) for btn in row] for row in rows]
+    )
+
+
+CALLBACK_DATA_MAX_BYTES: int = 64
+
+
+def parse_account_callback(data: str, prefix: str) -> str:
+    raw = str(data or "")
+    if raw == f"{prefix}auto":
+        return "auto"
+    marker = f"{prefix}session:"
+    return raw[len(marker) :] if raw.startswith(marker) else "auto"
+
+
+# Принцип построения клавиатур - как в эталоне VPN_service_for_3X-UI:
+# у каждого экрана своя функция и только свои кнопки. Экран, который ждёт ввода,
+# несёт кнопку отмены и ничего больше - кнопки главного меню на нём быть не должно.
+
+
+def main_row(language: str) -> list[dict[str, str]]:
+    return [{"text": translate(language, "buttons.main"), "callback_data": "start"}]
+
+
+def cancel_row(language: str) -> list[dict[str, str]]:
+    return [{"text": translate(language, "buttons.cancel"), "callback_data": "cancel"}]
+
+
+def main_menu_keyboard(language: str, *, worm_active: bool = False) -> InlineKeyboardMarkup:
+    """Главное меню. Последняя кнопка - имя текущего языка, как в эталоне."""
+    if not account_manager.accounts:
+        return kb(
+            [
+                [
+                    {
+                        "text": translate(language, "buttons.add_account"),
+                        "callback_data": "add_account",
+                    }
+                ],
+                [
+                    {
+                        "text": get_language_display_name(language),
+                        "callback_data": "change_language",
+                    }
+                ],
+            ]
+        )
     rows: list[list[dict[str, str]]] = [
         [
             {
-                "text": translate(language, "buttons.add_chats_to_db"),
-                "callback_data": "menu:add_chats",
+                "text": translate(language, "buttons.start_scraping"),
+                "callback_data": "scrape",
             },
             {
-                "text": translate(language, "buttons.update_chats_db"),
-                "callback_data": "menu:update_chats",
+                "text": translate(language, "buttons.bulk_mailing"),
+                "callback_data": "mailing",
             },
         ],
         [
             {
-                "text": translate(language, "buttons.start_scraping"),
-                "callback_data": "menu:scrape",
+                "text": translate(language, "buttons.my_tasks"),
+                "callback_data": "task:list:mine",
             },
             {
-                "text": translate(language, "buttons.bulk_mailing"),
-                "callback_data": "menu:mailing",
+                "text": translate(language, "buttons.task_list"),
+                "callback_data": "task:list:active",
+            },
+        ],
+        [
+            {
+                "text": translate(language, "buttons.add_chats_to_db"),
+                "callback_data": "add_chats",
+            },
+            {
+                "text": translate(language, "buttons.update_chats_db"),
+                "callback_data": "update_chats",
+            },
+        ],
+        [
+            {
+                "text": translate(language, "buttons.add_account"),
+                "callback_data": "add_account",
+            },
+            {
+                "text": translate(language, "buttons.list_accounts"),
+                "callback_data": "accounts",
+            },
+        ],
+        [
+            {
+                "text": translate(language, "buttons.clear_cache"),
+                "callback_data": "clear_cache",
+            },
+            {
+                "text": translate(language, "buttons.cancel_all_tasks"),
+                "callback_data": "cancel_all",
             },
         ],
     ]
     if Features.worm_mode():
+        rows.append([{"text": translate(language, "buttons.worm_mode"), "callback_data": "worm"}])
+    if worm_active:
         rows.append(
-            [{"text": translate(language, "buttons.worm_mode"), "callback_data": "menu:worm"}]
+            [{"text": translate(language, "buttons.stop_worm"), "callback_data": "stop_worm"}]
         )
     rows.append(
         [
-            {"text": translate(language, "buttons.my_tasks"), "callback_data": "task:list:mine"},
-            {"text": translate(language, "buttons.task_list"), "callback_data": "task:list:active"},
+            {
+                "text": get_language_display_name(language),
+                "callback_data": "change_language",
+            }
         ]
-    )
-    rows.append(
-        [
-            {
-                "text": translate(language, "buttons.add_account"),
-                "callback_data": "menu:add_account",
-            },
-            {
-                "text": translate(language, "buttons.list_accounts"),
-                "callback_data": "menu:accounts",
-            },
-        ]
-    )
-    rows.append(
-        [
-            {
-                "text": translate(language, "buttons.clear_cache"),
-                "callback_data": "menu:clear_cache",
-            },
-            {
-                "text": translate(language, "buttons.cancel_all_tasks"),
-                "callback_data": "menu:cancel_all",
-            },
-        ]
-    )
-    rows.append(
-        [{"text": translate(language, "buttons.language"), "callback_data": "menu:language"}]
     )
     return kb(rows)
 
 
-def kb_language(language: str) -> InlineKeyboardMarkup:
+def build_language_keyboard(language: str) -> InlineKeyboardMarkup:
+    """Экран выбора языка: по кнопке на язык, снизу возврат на главную."""
     rows: list[list[dict[str, str]]] = [
-        [
-            {"text": get_language_display_name(code), "callback_data": f"lang:{code}"}
-            for code in get_available_languages()
-        ]
+        [{"text": get_language_display_name(code), "callback_data": f"lang:{code}"}]
+        for code in get_available_languages()
     ]
-    rows.append([{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}])
+    rows.append(main_row(language))
     return kb(rows)
 
 
-def kb_cancel(language: str) -> InlineKeyboardMarkup:
-    return kb([[{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}]])
+def cancel_keyboard(language: str) -> InlineKeyboardMarkup:
+    """Шаг мастера, ожидающий свободный ввод: только отмена."""
+    return kb([cancel_row(language)])
 
 
-def kb_nav(language: str) -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [
-                {"text": translate(language, "buttons.nav_menu")},
-                {"text": translate(language, "buttons.nav_tasks")},
-            ],
-            [
-                {"text": translate(language, "buttons.nav_language")},
-                {"text": translate(language, "buttons.nav_stop_worm")},
-            ],
-            [{"text": translate(language, "buttons.nav_cancel")}],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def kb_source_choice(language: str, prefix: str) -> InlineKeyboardMarkup:
-    return kb(
-        [
-            [
-                {
-                    "text": translate(language, "texts.bulkmail_source_db_btn"),
-                    "callback_data": f"{prefix}:db",
-                }
-            ],
-            [
-                {
-                    "text": translate(language, "texts.bulkmail_source_manual"),
-                    "callback_data": f"{prefix}:manual",
-                }
-            ],
-            [{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}],
-        ]
-    )
-
-
-def kb_accounts_empty(language: str) -> InlineKeyboardMarkup:
+def accounts_keyboard(language: str) -> InlineKeyboardMarkup:
+    """Список аккаунтов: обновить, добавить, вернуться."""
     return kb(
         [
             [
                 {
                     "text": translate(language, "buttons.add_account"),
-                    "callback_data": "menu:add_account",
-                }
+                    "callback_data": "add_account",
+                },
+                {
+                    "text": translate(language, "buttons.task_refresh"),
+                    "callback_data": "accounts",
+                },
             ],
-            [{"text": translate(language, "buttons.menu"), "callback_data": "menu:main"}],
+            main_row(language),
         ]
     )
 
 
-def kb_account_choice(
-    language: str, prefix: str, auto_key: str = "texts.scrape_auto"
-) -> InlineKeyboardMarkup:
-    rows: list[list[dict[str, str]]] = [
-        [{"text": translate(language, auto_key), "callback_data": f"{prefix}:auto"}]
-    ]
-    for account in account_manager.accounts[:10]:
-        rows.append(
-            [
-                {
-                    "text": f"🧾 {account.session_file}",
-                    "callback_data": f"{prefix}:session:{account.session_file}",
-                }
-            ]
-        )
-    rows.append([{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}])
-    return kb(rows)
-
-
-def kb_mail_target(language: str) -> InlineKeyboardMarkup:
+def no_accounts_keyboard(language: str) -> InlineKeyboardMarkup:
     return kb(
         [
             [
                 {
-                    "text": translate(language, "texts.bulkmail_target_chats"),
+                    "text": translate(language, "buttons.add_account"),
+                    "callback_data": "add_account",
+                }
+            ],
+            main_row(language),
+        ]
+    )
+
+
+def scrape_mode_keyboard(language: str) -> InlineKeyboardMarkup:
+    return kb(
+        [
+            [
+                {
+                    "text": translate(language, "buttons.mode_messages"),
+                    "callback_data": "scrape:mode:messages",
+                },
+                {
+                    "text": translate(language, "buttons.mode_users"),
+                    "callback_data": "scrape:mode:users",
+                },
+            ],
+            cancel_row(language),
+        ]
+    )
+
+
+def source_keyboard(language: str, prefix: str) -> InlineKeyboardMarkup:
+    return kb(
+        [
+            [
+                {
+                    "text": translate(language, "buttons.source_from_db"),
+                    "callback_data": f"{prefix}:db",
+                }
+            ],
+            [
+                {
+                    "text": translate(language, "buttons.source_manual"),
+                    "callback_data": f"{prefix}:manual",
+                }
+            ],
+            cancel_row(language),
+        ]
+    )
+
+
+def account_keyboard(language: str, prefix: str) -> InlineKeyboardMarkup:
+    rows: list[list[dict[str, str]]] = [
+        [
+            {
+                "text": translate(language, "buttons.auto_account"),
+                "callback_data": f"{prefix}:auto",
+            }
+        ]
+    ]
+    rows.extend(
+        [
+            [
+                {
+                    "text": html.escape(account.session_file),
+                    "callback_data": f"{prefix}:session:{account.session_file}",
+                }
+            ]
+            for account in account_manager.accounts[:10]
+            if len(f"{prefix}:session:{account.session_file}".encode()) <= CALLBACK_DATA_MAX_BYTES
+        ]
+    )
+    rows.append(cancel_row(language))
+    return kb(rows)
+
+
+def mail_target_keyboard(language: str) -> InlineKeyboardMarkup:
+    return kb(
+        [
+            [
+                {
+                    "text": translate(language, "buttons.mail_target_chats"),
                     "callback_data": "mail:target:chats",
                 }
             ],
             [
                 {
-                    "text": translate(language, "texts.bulkmail_target_users"),
+                    "text": translate(language, "buttons.mail_target_users"),
                     "callback_data": "mail:target:users",
                 }
             ],
-            [{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}],
+            cancel_row(language),
         ]
     )
 
 
-def kb_mail_more_text(language: str) -> InlineKeyboardMarkup:
+def mail_texts_done_keyboard(language: str) -> InlineKeyboardMarkup:
     return kb(
         [
             [
                 {
-                    "text": translate(language, "texts.bulkmail_texts_done"),
+                    "text": translate(language, "buttons.mail_texts_done"),
                     "callback_data": "mail:texts_done",
                 }
             ],
-            [{"text": translate(language, "buttons.cancel"), "callback_data": "menu:main"}],
+            cancel_row(language),
         ]
     )
+
+
+def confirm_keyboard(language: str, accept_data: str) -> InlineKeyboardMarkup:
+    """Подтверждение: ровно две кнопки - да и нет."""
+    return kb(
+        [
+            [
+                {
+                    "text": translate(language, "buttons.confirm_yes"),
+                    "callback_data": accept_data,
+                },
+                {
+                    "text": translate(language, "buttons.confirm_no"),
+                    "callback_data": "start",
+                },
+            ]
+        ]
+    )
+
+
+def task_list_keyboard(language: str, scope: str, tasks: list[Task]) -> InlineKeyboardMarkup:
+    """Список задач: сами задачи, обновление, возврат на главную."""
+    rows: list[list[dict[str, str]]] = [
+        [
+            {
+                "text": f"{task_status_emoji(task.status)} {html.escape(task.task_id)}",
+                "callback_data": f"task:view:{task.task_id}",
+            }
+        ]
+        for task in tasks[:8]
+    ]
+    rows.append(
+        [
+            {
+                "text": translate(language, "buttons.task_refresh"),
+                "callback_data": f"task:list:{scope}",
+            }
+        ]
+    )
+    rows.append(main_row(language))
+    return kb(rows)
 
 
 # --- Middleware ---
@@ -4074,7 +4904,7 @@ class ErrorLogMiddleware(BaseMiddleware):
             error_text = translate(
                 data.get("language", DEFAULT_LANGUAGE),
                 "texts.error_prefix",
-                error=html.escape(e.message),
+                error=e.message,
             )
             if isinstance(event, Message):
                 with suppress(TelegramBadRequest, TelegramNetworkError):
@@ -4094,7 +4924,65 @@ class ErrorLogMiddleware(BaseMiddleware):
         return None
 
 
-# --- Хелперы для сообщений ---
+# --- Экраны: сборка текста и клавиатуры в одном месте ---
+@dataclass(frozen=True, slots=True)
+class Screen:
+    """Единица отображения.
+
+    Экран - это текст плюс клавиатура. Хэндлеры не собирают сообщения, они
+    выбирают экран и показывают его, поэтому правка разметки или формулировки
+    не требует правки бизнес-логики.
+    """
+
+    text: str
+    markup: InlineKeyboardMarkup | None = None
+    delete_origin: bool = False
+
+    async def show(self, event: Message | CallbackQuery) -> bool:
+        return await smart_answer(
+            event, self.text, self.markup, self.delete_origin or isinstance(event, CallbackQuery)
+        )
+
+
+SCRAPE_WIZARD_STEPS: int = 5
+MAILING_WIZARD_STEPS: int = 6
+
+
+def screen_text(
+    language: str,
+    title_key: str,
+    body_key: str = "",
+    *,
+    step: int = 0,
+    total: int = 0,
+    **kwargs: Any,
+) -> str:
+    """Собирает текст экрана по эталону: заголовок, пустая строка, тело.
+
+    `step`/`total` добавляют счётчик шага мастера. Заголовок и счётчик
+    повторяются на каждом шаге, чтобы пользователь не зависел от истории
+    переписки.
+    """
+    counter = (
+        translate(language, "texts.step_counter", current=step, total=total)
+        if step and total
+        else ""
+    )
+    body = translate(language, body_key, **kwargs) if body_key else ""
+    if counter and body:
+        text = f"{translate(language, title_key)}\n\n{counter} {body}"
+    else:
+        text = f"{translate(language, title_key)}\n\n{counter or body}"
+    unresolved = PLACEHOLDER_PATTERN.search(text)
+    if unresolved is not None:
+        raise BotError(f"{title_key}: не подставлено {unresolved.group(0)}")
+    return text
+
+
+def screen_notice(language: str, key: str, **kwargs: Any) -> str:
+    return translate(language, key, **kwargs)
+
+
 def task_status_emoji(status: str) -> str:
     return {
         "pending": "⏳",
@@ -4107,11 +4995,14 @@ def task_status_emoji(status: str) -> str:
 
 
 def format_task_row(task: Task, language: str) -> str:
-    return (
-        f"{task_status_emoji(task.status)} <code>{html.escape(task.task_id)}</code> "
-        f"[{format_task_type(task.type, language)}] "
-        f"{format_progress_bar(task.progress)} {html.escape(task.progress_text or '')}".strip()
+    row = (
+        f"{task_status_emoji(task.status)} <code>{html.escape(task.task_id)}</code> - "
+        f"{format_task_type(task.type, language)} "
+        f"{format_progress_bar(task.progress)}\n"
     )
+    if task.progress_text:
+        row += f"   {html.escape(task.progress_text)}\n"
+    return row
 
 
 async def download_links_from_document(bot: Bot, message: Message) -> list[str]:
@@ -4131,18 +5022,23 @@ async def parse_links_from_message(message: Message) -> list[str]:
 async def render_main_menu(
     event: Message | CallbackQuery, language: str, delete_origin: bool = False
 ) -> None:
-    await smart_answer(
-        event,
-        translate(
-            language,
-            "texts.welcome_admin",
-            accounts=len(account_manager.accounts),
-            chats=await chat_db.get_active_chats_count(),
-            users=await chat_db.get_total_users(),
+    active = await tasks_db.get_active_tasks()
+    await Screen(
+        text=truncate(
+            translate(
+                language,
+                "texts.welcome_admin",
+                accounts=len(account_manager.accounts),
+                chats=await chat_db.get_active_chats_count(),
+                users=await chat_db.get_total_users(),
+                tasks=len(active),
+            )
         ),
-        reply_markup=kb_main(language),
+        markup=main_menu_keyboard(
+            language, worm_active=any(item.type == "worm" for item in active)
+        ),
         delete_origin=delete_origin,
-    )
+    ).show(event)
 
 
 async def render_task_list(
@@ -4156,136 +5052,115 @@ async def render_task_list(
     else:
         tasks = list(await tasks_db.get_active_tasks())
     if not tasks:
-        await smart_answer(
-            event,
-            translate(language, "texts.no_active_tasks"),
-            reply_markup=kb_main(language),
+        await Screen(
+            text=translate(language, "texts.no_active_tasks"),
+            markup=main_menu_keyboard(language),
             delete_origin=delete_origin,
-        )
+        ).show(event)
         return
-    lines = [translate(language, title_key)]
+    lines = [f"{translate(language, title_key)}\n"]
     lines.extend(format_task_row(task, language) for task in tasks[:20])
-    rows: list[list[dict[str, str]]] = [
-        [
-            {
-                "text": f"{task_status_emoji(task.status)} {html.escape(task.task_id)}",
-                "callback_data": f"task:view:{task.task_id}",
-            }
-        ]
-        for task in tasks[:8]
-    ]
-    rows.append(
-        [{"text": translate(language, "texts.task_refresh"), "callback_data": "task:list:active"}]
-    )
-    rows.append([{"text": translate(language, "buttons.menu"), "callback_data": "menu:main"}])
-    await smart_answer(
-        event,
-        "\n".join(lines),
-        reply_markup=kb(rows),
+    await Screen(
+        text=truncate("".join(lines)),
+        markup=task_list_keyboard(language, scope, tasks),
         delete_origin=delete_origin,
-    )
+    ).show(event)
 
 
-# --- Обработчики: навигация ---
-@router.message(F.text.func(lambda text: text in NAV_ACTIONS))
-async def on_nav_button(message: Message, state: FSMContext, language: str) -> None:
-    action = NAV_ACTIONS.get(message.text or "")
-    if action is None:
-        return
-    if action == "menu":
-        await state.clear()
-        await render_main_menu(message, language)
-    elif action == "tasks":
-        await state.clear()
-        await render_task_list(message, language, "active")
-    elif action == "language":
-        await smart_answer(
-            message,
-            translate(language, "texts.language_select"),
-            reply_markup=kb_language(language),
-        )
-    elif action == "stop_worm":
-        await state.clear()
-        await cmd_stop_worm(message, language)
-    elif action == "cancel":
-        had_state = await state.get_state() is not None
-        await state.clear()
-        if had_state:
-            await smart_answer(
-                message,
-                translate(language, "texts.action_cancelled"),
-                reply_markup=kb_main(language),
-            )
-        else:
-            await render_main_menu(message, language)
+async def render_prompt(
+    event: Message | CallbackQuery,
+    language: str,
+    text: str,
+    markup: InlineKeyboardMarkup | None = None,
+    delete_origin: bool = False,
+) -> None:
+    """Шаг мастера: текст и кнопки этого шага. Без кнопок главного меню."""
+    await Screen(
+        text=text,
+        markup=cancel_keyboard(language) if markup is None else markup,
+        delete_origin=delete_origin,
+    ).show(event)
+
+
+async def render_notice(
+    event: Message | CallbackQuery, language: str, key: str, **kwargs: Any
+) -> None:
+    """Короткое уведомление после действия: главное меню тут уместно."""
+    await Screen(
+        text=screen_notice(language, key, **kwargs),
+        markup=main_menu_keyboard(language),
+        delete_origin=isinstance(event, CallbackQuery),
+    ).show(event)
 
 
 # --- Обработчики: старт и меню ---
 @router.message(Command("start"))
-async def cmd_start(message: Message, state: FSMContext, language: str) -> None:
+@router.callback_query(F.data == "start")
+@log_error
+async def cmd_start(event: Message | CallbackQuery, state: FSMContext, language: str) -> None:
     await state.clear()
-    await user_db.ensure_user(message.from_user.id)
-    await smart_answer(
-        message,
-        translate(language, "texts.menu_hint"),
-        reply_markup=kb_nav(language),
-    )
-    await render_main_menu(message, language)
+    await render_main_menu(event, language, delete_origin=isinstance(event, CallbackQuery))
+
+
+@router.callback_query(F.data == "cancel")
+@router.message(Command("cancel"))
+@log_error
+async def cmd_cancel(event: Message | CallbackQuery, state: FSMContext, language: str) -> None:
+    had_state = await state.get_state() is not None
+    await state.clear()
+    if not had_state:
+        await render_main_menu(event, language, delete_origin=isinstance(event, CallbackQuery))
+        return
+    await _drop_login_client(to_int(event.from_user.id))
+    await render_notice(event, language, "texts.action_cancelled")
+
+
+async def prompt_language_selection(event: Message | CallbackQuery, language: str) -> None:
+    """Экран выбора языка - как в эталоне: список языков и возврат на главную."""
+    await Screen(
+        text=translate(language, "texts.language_prompt"),
+        markup=build_language_keyboard(language),
+        delete_origin=isinstance(event, CallbackQuery),
+    ).show(event)
 
 
 @router.message(Command("language"))
-async def cmd_language(message: Message, language: str) -> None:
-    await message.answer(
-        translate(language, "texts.language_select"),
-        reply_markup=kb_language(language),
-    )
-
-
-@router.callback_query(F.data == "menu:language")
-async def cb_language(call: CallbackQuery, language: str) -> None:
-    await smart_answer(
-        call,
-        translate(language, "texts.language_select"),
-        reply_markup=kb_language(language),
-        delete_origin=True,
-    )
+@router.callback_query(F.data == "change_language")
+@log_error
+async def cb_change_language(event: Message | CallbackQuery, language: str) -> None:
+    await prompt_language_selection(event, language)
 
 
 @router.callback_query(F.data.startswith("lang:"))
+@log_error
 async def cb_language_set(call: CallbackQuery, state: FSMContext, language: str) -> None:
     code = str(call.data or "").split(":", 1)[1].strip().lower()
     if code not in LANGUAGES:
         await call.answer(translate(language, "texts.language_unknown"), show_alert=True)
         return
-    await user_db.set_language(call.from_user.id, code)
+    if not await user_db.set_language(call.from_user.id, code):
+        await call.answer(translate(language, "texts.language_save_failed"), show_alert=True)
+        return
     await state.clear()
-    await call.answer()
-    await smart_answer(
-        call,
+    await call.answer(
         translate(code, "texts.language_selected", name=get_language_display_name(code)),
-        reply_markup=kb_main(code),
-        delete_origin=True,
+        show_alert=True,
     )
+    await render_main_menu(call, code, delete_origin=True)
 
 
-@router.callback_query(F.data == "menu:main")
-async def cb_main(call: CallbackQuery, state: FSMContext, language: str) -> None:
+@router.callback_query(F.data == "stop_worm")
+async def cb_stop_worm(call: CallbackQuery, state: FSMContext, language: str) -> None:
     await state.clear()
-    await call.answer()
-    await render_main_menu(call, language, delete_origin=True)
+    await cmd_stop_worm(call, language)
 
 
 # --- Аккаунты ---
-@router.callback_query(F.data == "menu:add_account")
+@router.callback_query(F.data == "add_account")
 async def cb_add_account(call: CallbackQuery, state: FSMContext, language: str) -> None:
     await state.clear()
     await call.answer()
-    await smart_answer(
-        call,
-        translate(language, "texts.waiting_phone"),
-        reply_markup=kb_cancel(language),
-        delete_origin=True,
-    )
+    await render_prompt(call, language, translate(language, "texts.waiting_phone"))
     await state.set_state(InviterStates.waiting_phone)
 
 
@@ -4294,7 +5169,9 @@ async def on_phone(message: Message, state: FSMContext, language: str) -> None:
     phone = (message.text or "").strip()
     if not is_phone(phone):
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     await _drop_login_client(message.from_user.id)
@@ -4305,7 +5182,9 @@ async def on_phone(message: Message, state: FSMContext, language: str) -> None:
     except (PhoneNumberInvalidError, FloodError) as e:
         await client.disconnect()
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         logger.warning(f"Ошибка отправки кода: {e}")
         return
@@ -4313,17 +5192,21 @@ async def on_phone(message: Message, state: FSMContext, language: str) -> None:
         await client.disconnect()
         logger.error(f"Ошибка подключения при добавлении аккаунта: {e}")
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     LOGIN_CLIENTS[message.from_user.id] = client
     await state.update_data(
-        phone=phone, phone_code_hash=sent.phone_code_hash, session_name=phone.replace("+", "")
+        phone=phone,
+        phone_code_hash=sent.phone_code_hash,
+        session_name=re.sub(r"\D", "", phone),
     )
     await smart_answer(
         message,
-        translate(language, "texts.waiting_code", phone=html.escape(phone)),
-        reply_markup=kb_cancel(language),
+        translate(language, "texts.waiting_code", phone=phone),
+        reply_markup=cancel_keyboard(language),
     )
     await state.set_state(InviterStates.waiting_code)
 
@@ -4334,8 +5217,11 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
     data = await state.get_data()
     client = LOGIN_CLIENTS.get(message.from_user.id)
     if client is None or not code:
+        await state.clear()
         await smart_answer(
-            message, translate(language, "texts.auth_error_state"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_error_state"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     try:
@@ -4346,14 +5232,16 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
         await smart_answer(
             message,
             translate(language, "texts.waiting_password"),
-            reply_markup=kb_cancel(language),
+            reply_markup=cancel_keyboard(language),
         )
         await state.set_state(InviterStates.waiting_password)
         return
     except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
         logger.warning(f"Неверный код: {e}")
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     except Exception as e:  # noqa: BLE001
@@ -4361,7 +5249,9 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
         await _drop_login_client(message.from_user.id)
         await state.clear()
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     await _finish_account_login(message, state, client, language)
@@ -4371,15 +5261,20 @@ async def on_code(message: Message, state: FSMContext, language: str) -> None:
 async def on_password(message: Message, state: FSMContext, language: str) -> None:
     client = LOGIN_CLIENTS.get(message.from_user.id)
     if client is None:
+        await state.clear()
         await smart_answer(
-            message, translate(language, "texts.auth_error_state"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_error_state"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     try:
         await client.sign_in(password=message.text or "")
     except PasswordHashInvalidError:
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     except Exception as e:  # noqa: BLE001
@@ -4387,7 +5282,9 @@ async def on_password(message: Message, state: FSMContext, language: str) -> Non
         await _drop_login_client(message.from_user.id)
         await state.clear()
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     await _finish_account_login(message, state, client, language)
@@ -4406,14 +5303,18 @@ async def _finish_account_login(
         await _drop_login_client(message.from_user.id)
         await state.clear()
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     await _drop_login_client(message.from_user.id)
     await state.clear()
     if not account_manager.add_account(session_string, session_name):
         await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
+            message,
+            translate(language, "texts.auth_failed"),
+            reply_markup=cancel_keyboard(language),
         )
         return
     await smart_answer(
@@ -4421,26 +5322,25 @@ async def _finish_account_login(
         translate(
             language,
             "texts.account_added",
-            name=html.escape(session_name),
-            username=html.escape(getattr(me, "username", "") or "-"),
-            phone=html.escape(getattr(me, "phone", "") or "-"),
+            name=session_name,
+            username=getattr(me, "username", "") or "-",
+            phone=getattr(me, "phone", "") or "-",
         ),
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
     )
 
 
-@router.callback_query(F.data == "menu:accounts")
+@router.callback_query(F.data == "accounts")
 async def cb_accounts(call: CallbackQuery, language: str) -> None:
     await call.answer()
     if not account_manager.accounts:
-        await smart_answer(
-            call,
-            translate(language, "texts.no_accounts"),
-            reply_markup=kb_accounts_empty(language),
+        await Screen(
+            text=translate(language, "texts.no_available_accounts"),
+            markup=no_accounts_keyboard(language),
             delete_origin=True,
-        )
+        ).show(call)
         return
-    lines = [translate(language, "texts.accounts_list")]
+    lines = [f"{translate(language, 'texts.accounts_list')}\n"]
     now = datetime.now(UTC)
     for account in account_manager.accounts:
         status = (
@@ -4460,24 +5360,20 @@ async def cb_accounts(call: CallbackQuery, language: str) -> None:
                 language, "texts.account_flood_wait", until=flood_until.strftime("%H:%M:%S")
             )
         lines.append(line)
-    await smart_answer(
-        call,
-        "\n".join(lines),
-        reply_markup=kb_main(language),
+    await Screen(
+        text=truncate("\n".join(lines)),
+        markup=accounts_keyboard(language),
         delete_origin=True,
-    )
+    ).show(call)
 
 
 # --- Чаты ---
-@router.callback_query(F.data == "menu:add_chats")
+@router.callback_query(F.data == "add_chats")
 async def cb_add_chats(call: CallbackQuery, state: FSMContext, language: str) -> None:
     await state.clear()
     await call.answer()
-    await smart_answer(
-        call,
-        translate(language, "texts.worm_waiting_links"),
-        reply_markup=kb_cancel(language),
-        delete_origin=True,
+    await render_prompt(
+        call, language, translate(language, "texts.worm_waiting_links"), delete_origin=True
     )
     await state.set_state(InviterStates.waiting_links)
 
@@ -4489,119 +5385,148 @@ async def on_links(message: Message, state: FSMContext, language: str) -> None:
         await smart_answer(
             message,
             translate(language, "texts.worm_wait_links_input"),
-            reply_markup=kb_cancel(language),
+            reply_markup=cancel_keyboard(language),
         )
         return
     added: list[str] = []
     failed = 0
+    rejected = 0
+    processed = 0
+    flood_events = 0
+    flood_seconds = 0.0
+    accounts_used: list[str] = []
+    notes: list[str] = []
+    limit = max(1, Config.MAX_CHATS_PER_IMPORT)
     if not account_manager.accounts:
-        await smart_answer(
-            message,
-            translate(language, "texts.scrape_no_accounts"),
-            reply_markup=kb_cancel(language),
-        )
+        await render_prompt(message, language, translate(language, "texts.no_available_accounts"))
         await state.clear()
         return
-    async with account_manager.acquire(None) as account:
-        for link in links:
-            if len(added) >= Config.WORM_MAX_SOURCES:
-                break
-            identifier = parse_identifier(link)
-            if not identifier:
-                failed += 1
-                continue
-            try:
-                validated = await validate_and_test_chat(account, identifier)
-            except FloodWaitError as e:
-                account_manager.handle_flood_wait(account, float(getattr(e, "seconds", 60)))
-                break
-            except AuthKeyUnregisteredError:
-                account.is_valid = False
-                break
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"Ошибка добавления {identifier}: {e}")
-                failed += 1
-                continue
-            if validated is None:
-                failed += 1
-            else:
-                added.append(
-                    translate(
-                        language,
-                        "texts.chat_added_result",
-                        chat_name=html.escape(validated.chat_name),
-                        user_count=validated.user_count,
+    for link in links:
+        if processed >= limit:
+            break
+        identifier = parse_identifier(link)
+        if not identifier:
+            rejected += 1
+            failed += 1
+            continue
+        try:
+            async with account_manager.acquire_step(None) as account:
+                if account.session_file not in accounts_used:
+                    accounts_used.append(account.session_file)
+                try:
+                    validated = await validate_and_test_chat(account, identifier, language)
+                except FloodWaitError as e:
+                    seconds = float(getattr(e, "seconds", 60))
+                    account_manager.handle_flood_wait(account, seconds)
+                    flood_events += 1
+                    flood_seconds = max(flood_seconds, seconds)
+                    logger.warning(
+                        f"FloodWait на {identifier}: {seconds:.0f}с, беру другой аккаунт"
                     )
-                )
+                    continue
+                except AuthKeyUnregisteredError:
+                    account.is_valid = False
+                    notes.append(translate(language, "texts.invalid_account_continue"))
+                    continue
+                processed += 1
+                if validated is None:
+                    failed += 1
+                else:
+                    added.append(
+                        translate(
+                            language,
+                            "texts.chat_added_result",
+                            chat_name=validated.chat_name,
+                            user_count=validated.user_count,
+                        )
+                    )
+        except AccountWaitCancelled:
+            notes.append(translate(language, "texts.roller_stopped"))
+            break
+        except NoAvailableAccountError as e:
+            notes.append(translate(language, "texts.import_stopped_no_accounts", error=e.message))
+            break
     await state.clear()
     text = translate(
         language,
         "texts.chats_added_title",
-        count=len(links),
+        count=processed,
     )
     if added:
         text += "\n\n" + "\n".join(added)
     if failed:
         text += f"\n\n{translate(language, 'texts.more_results', count=failed)}"
-    await smart_answer(message, text, reply_markup=kb_main(language))
+    skipped = len(links) - processed - rejected
+    if skipped > 0:
+        text += f"\n\n{translate(language, 'texts.links_skipped', count=skipped)}"
+    if flood_events:
+        text += "\n\n" + translate(
+            language,
+            "texts.roller_flood_summary",
+            count=flood_events,
+            seconds=int(flood_seconds),
+        )
+    if accounts_used:
+        text += "\n\n" + translate(
+            language,
+            "texts.roller_accounts_used",
+            count=len(accounts_used),
+            accounts=format_accounts_summary(accounts_used),
+        )
+    if notes:
+        text += "\n\n" + "\n".join(notes)
+    await smart_answer(message, text, reply_markup=main_menu_keyboard(language))
 
 
-@router.callback_query(F.data == "menu:update_chats")
+@router.callback_query(F.data == "update_chats")
 async def cb_update_chats(call: CallbackQuery, language: str) -> None:
     await call.answer()
     total = await chat_db.get_active_chats_count()
-    await smart_answer(
-        call,
-        translate(language, "texts.update_db_start", total=total),
-        reply_markup=kb_main(language),
-        delete_origin=True,
-    )
+    await render_notice(call, language, "texts.update_db_start", total=total)
     if not account_manager.accounts:
-        await safe_send_message(
-            call.bot,
-            call.from_user.id,
-            translate(language, "texts.no_available_accounts"),
-            reply_markup=kb_main(language),
-        )
+        await render_notice(call, language, "texts.no_available_accounts")
         return
-    async with account_manager.acquire(None) as account:
-        try:
-            result = await check_and_clean_chats(account)
-        except AuthKeyUnregisteredError:
-            account.is_valid = False
-            await safe_send_message(
-                call.bot,
-                call.from_user.id,
-                translate(language, "texts.invalid_account"),
-                reply_markup=kb_main(language),
+    result = await check_and_clean_chats(language)
+    text = translate(
+        language,
+        "texts.update_db_done",
+        checked=result.checked,
+        added=result.added,
+        removed=result.removed,
+        errors=result.errors,
+    )
+    notes: list[str] = []
+    if result.flood_events:
+        notes.append(
+            translate(
+                language,
+                "texts.roller_flood_summary",
+                count=result.flood_events,
+                seconds=int(result.flood_seconds),
             )
-            return
-        except FloodWaitError as e:
-            seconds = float(getattr(e, "seconds", 60))
-            account_manager.handle_flood_wait(account, seconds)
-            await safe_send_message(
-                call.bot,
-                call.from_user.id,
-                translate(language, "texts.floodwait_pause", task_id="-", seconds=int(seconds)),
-                reply_markup=kb_main(language),
+        )
+    if result.accounts_used:
+        notes.append(
+            translate(
+                language,
+                "texts.roller_accounts_used",
+                count=len(result.accounts_used),
+                accounts=format_accounts_summary(result.accounts_used),
             )
-            return
+        )
+    if result.stop_reason:
+        notes.append(result.stop_reason)
+    if notes:
+        text += "\n\n" + "\n".join(notes)
     await safe_send_message(
         call.bot,
         call.from_user.id,
-        translate(
-            language,
-            "texts.update_db_done",
-            checked=result.checked,
-            added=0,
-            removed=result.removed,
-            errors=result.errors,
-        ),
-        reply_markup=kb_main(language),
+        text,
+        reply_markup=main_menu_keyboard(language),
     )
 
 
-@router.callback_query(F.data == "menu:clear_cache")
+@router.callback_query(F.data == "clear_cache")
 async def cb_clear_cache(call: CallbackQuery, language: str) -> None:
     await call.answer()
     removed = await cache_db.clear()
@@ -4610,7 +5535,7 @@ async def cb_clear_cache(call: CallbackQuery, language: str) -> None:
     await smart_answer(
         call,
         translate(language, "texts.cache_cleared", count=removed),
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
         delete_origin=True,
     )
 
@@ -4653,8 +5578,8 @@ async def cb_task_pause(call: CallbackQuery, language: str) -> None:
     await call.answer()
     await smart_answer(
         call,
-        translate(language, "texts.task_paused", task_id=task_id),
-        reply_markup=kb_main(language),
+        translate(language, "texts.task_paused_action", task_id=task_id),
+        reply_markup=main_menu_keyboard(language),
         delete_origin=True,
     )
 
@@ -4669,7 +5594,7 @@ async def cb_task_resume(call: CallbackQuery, language: str) -> None:
     await smart_answer(
         call,
         translate(language, "texts.task_resumed", task_id=task_id),
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
         delete_origin=True,
     )
 
@@ -4684,31 +5609,18 @@ async def cb_task_cancel(call: CallbackQuery, language: str) -> None:
     await smart_answer(
         call,
         translate(language, "texts.task_cancelled_confirm", task_id=task_id),
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
         delete_origin=True,
     )
 
 
-@router.callback_query(F.data == "menu:cancel_all")
+@router.callback_query(F.data == "cancel_all")
 async def cb_cancel_all(call: CallbackQuery, language: str) -> None:
     await call.answer()
     await smart_answer(
         call,
         translate(language, "texts.task_cancel_confirm"),
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=translate(language, "texts.task_confirm_yes"),
-                        callback_data="cancel_all:yes",
-                    ),
-                    InlineKeyboardButton(
-                        text=translate(language, "texts.task_confirm_no"),
-                        callback_data="menu:main",
-                    ),
-                ]
-            ]
-        ),
+        reply_markup=confirm_keyboard(language, "cancel_all:yes"),
         delete_origin=True,
     )
 
@@ -4716,17 +5628,19 @@ async def cb_cancel_all(call: CallbackQuery, language: str) -> None:
 @router.callback_query(F.data == "cancel_all:yes")
 async def cb_cancel_all_yes(call: CallbackQuery, language: str) -> None:
     await call.answer()
-    count = await tasks_db.cancel_all_active()
+    manager = get_queue_manager()
+    stopped = 0
     for task in await tasks_db.get_user_tasks(call.from_user.id):
-        if not task.is_active:
+        control = manager.get_control(task.task_id)
+        if control is None:
             continue
-        control = get_queue_manager().get_control(task.task_id)
-        if control is not None:
-            control.cancel()
+        control.cancel()
+        stopped += 1
+    count = await tasks_db.cancel_all_active(call.from_user.id)
     await smart_answer(
         call,
-        translate(language, "texts.tasks_cancelled", count=count),
-        reply_markup=kb_main(language),
+        translate(language, "texts.tasks_cancelled", count=count, stopped=stopped),
+        reply_markup=main_menu_keyboard(language),
         delete_origin=True,
     )
 
@@ -4737,16 +5651,15 @@ async def _submit_task(
     language: str,
     task_type: str,
     data: dict[str, Any],
-    launch_text: str,
-) -> bool:
+) -> Task | None:
     if not account_manager.accounts:
         await safe_send_message(
             bot,
             user_id,
-            translate(language, "texts.scrape_no_accounts"),
-            reply_markup=kb_main(language),
+            translate(language, "texts.no_available_accounts"),
+            reply_markup=main_menu_keyboard(language),
         )
-        return False
+        return None
     task = Task(
         task_id=new_task_id(),
         type=task_type,
@@ -4760,22 +5673,27 @@ async def _submit_task(
             bot,
             user_id,
             translate(language, "texts.max_tasks", max_tasks=Config.MAX_TASKS_PER_USER),
-            reply_markup=kb_main(language),
+            reply_markup=main_menu_keyboard(language),
         )
-        return False
-    await safe_send_message(bot, user_id, launch_text, reply_markup=kb_main(language))
-    return True
+        return None
+    return task
 
 
 # --- Сбор пользователей и инвайты ---
-@router.callback_query(F.data == "menu:scrape")
+@router.callback_query(F.data == "scrape")
 async def cb_scrape(call: CallbackQuery, state: FSMContext, language: str) -> None:
     await state.clear()
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.waiting_source"),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(
+            language,
+            "texts.waiting_source",
+            "texts.chat_link_hint",
+            step=1,
+            total=SCRAPE_WIZARD_STEPS,
+        ),
         delete_origin=True,
     )
     await state.set_state(InviterStates.waiting_scrape_source)
@@ -4785,15 +5703,19 @@ async def cb_scrape(call: CallbackQuery, state: FSMContext, language: str) -> No
 async def on_scrape_source(message: Message, state: FSMContext, language: str) -> None:
     identifier = parse_identifier(message.text or "")
     if not identifier:
-        await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
-        )
+        await render_prompt(message, language, translate(language, "texts.invalid_format"))
         return
     await state.update_data(source=identifier)
-    await smart_answer(
+    await render_prompt(
         message,
-        translate(language, "texts.waiting_target"),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(
+            language,
+            "texts.waiting_target",
+            "texts.chat_link_hint",
+            step=2,
+            total=SCRAPE_WIZARD_STEPS,
+        ),
     )
     await state.set_state(InviterStates.waiting_scrape_target)
 
@@ -4802,41 +5724,26 @@ async def on_scrape_source(message: Message, state: FSMContext, language: str) -
 async def on_scrape_target(message: Message, state: FSMContext, language: str) -> None:
     identifier = parse_identifier(message.text or "")
     if not identifier:
-        await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
-        )
+        await render_prompt(message, language, translate(language, "texts.invalid_format"))
         return
     data = await state.get_data()
     if identifier == data.get("source"):
-        await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
-        )
+        await render_prompt(message, language, translate(language, "texts.invalid_format"))
         return
     await state.update_data(target=identifier)
-    await smart_answer(
+    await render_prompt(
         message,
-        translate(language, "texts.waiting_mode"),
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text=translate(language, "texts.mode_messages"),
-                        callback_data="scrape:mode:messages",
-                    ),
-                    InlineKeyboardButton(
-                        text=translate(language, "texts.mode_users"),
-                        callback_data="scrape:mode:users",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        text=translate(language, "buttons.cancel"), callback_data="menu:main"
-                    )
-                ],
-            ]
+        language,
+        screen_text(
+            language,
+            "texts.waiting_mode",
+            "texts.scrape_mode_select",
+            step=3,
+            total=SCRAPE_WIZARD_STEPS,
         ),
+        markup=scrape_mode_keyboard(language),
     )
-    await state.set_state(InviterStates.waiting_scrape_mode)
+    await state.set_state(None)
 
 
 @router.callback_query(F.data.startswith("scrape:mode:"))
@@ -4847,15 +5754,27 @@ async def cb_scrape_mode(call: CallbackQuery, state: FSMContext, language: str) 
         return
     await state.update_data(mode=mode)
     await call.answer()
-    await smart_answer(
-        call,
-        translate(
+    if mode == "messages":
+        text = screen_text(
             language,
-            "texts.waiting_message_limit" if mode == "messages" else "texts.waiting_user_count",
-        ),
-        reply_markup=kb_cancel(language),
-        delete_origin=True,
-    )
+            "texts.waiting_message_limit",
+            "texts.scrape_limit_prompt",
+            step=4,
+            total=SCRAPE_WIZARD_STEPS,
+            min_limit=Config.SCRAPE_MIN_MESSAGE_LIMIT,
+            max_limit=Config.SCRAPE_MAX_MESSAGE_LIMIT,
+        )
+    else:
+        text = screen_text(
+            language,
+            "texts.waiting_user_count",
+            "texts.scrape_user_count_prompt",
+            step=4,
+            total=SCRAPE_WIZARD_STEPS,
+            min_count=Config.SCRAPE_MIN_USER_COUNT,
+            max_count=Config.SCRAPE_MAX_USER_COUNT,
+        )
+    await render_prompt(call, language, text, delete_origin=True)
     await state.set_state(InviterStates.waiting_scrape_limit)
 
 
@@ -4863,47 +5782,53 @@ async def cb_scrape_mode(call: CallbackQuery, state: FSMContext, language: str) 
 async def on_scrape_limit(message: Message, state: FSMContext, language: str) -> None:
     data = await state.get_data()
     mode = str(data.get("mode") or "messages")
-    value = to_int(message.text or "", -1)
+    value = to_int(message.text or "", default=-1)
     if mode == "messages":
         if not Config.SCRAPE_MIN_MESSAGE_LIMIT <= value <= Config.SCRAPE_MAX_MESSAGE_LIMIT:
-            await smart_answer(
+            await render_prompt(
                 message,
+                language,
                 translate(
                     language,
                     "texts.invalid_number",
                     min_val=Config.SCRAPE_MIN_MESSAGE_LIMIT,
                     max_val=Config.SCRAPE_MAX_MESSAGE_LIMIT,
                 ),
-                reply_markup=kb_cancel(language),
             )
             return
         await state.update_data(message_limit=value)
     else:
         if not Config.SCRAPE_MIN_USER_COUNT <= value <= Config.SCRAPE_MAX_USER_COUNT:
-            await smart_answer(
+            await render_prompt(
                 message,
+                language,
                 translate(
                     language,
                     "texts.invalid_number",
                     min_val=Config.SCRAPE_MIN_USER_COUNT,
                     max_val=Config.SCRAPE_MAX_USER_COUNT,
                 ),
-                reply_markup=kb_cancel(language),
             )
             return
         await state.update_data(user_limit=value)
-    await smart_answer(
+    await render_prompt(
         message,
-        translate(language, "texts.scrape_select_account"),
-        reply_markup=kb_account_choice(language, "scrape:account"),
+        language,
+        screen_text(
+            language,
+            "texts.scrape_select_account",
+            "texts.scrape_account_prompt",
+            step=5,
+            total=SCRAPE_WIZARD_STEPS,
+        ),
+        markup=account_keyboard(language, "scrape:account"),
     )
-    await state.set_state(InviterStates.waiting_scrape_account)
+    await state.set_state(None)
 
 
 @router.callback_query(F.data.startswith("scrape:account:"))
 async def cb_scrape_account(call: CallbackQuery, state: FSMContext, language: str) -> None:
-    payload = call.data.split(":")
-    session = "auto" if payload[-1] == "auto" else ":".join(payload[2:])
+    session = parse_account_callback(call.data, "scrape:account:")
     data = await state.get_data()
     task_data = {
         "source": data.get("source", ""),
@@ -4915,47 +5840,55 @@ async def cb_scrape_account(call: CallbackQuery, state: FSMContext, language: st
     }
     await state.clear()
     await call.answer()
-    await _submit_task(
+    task = await _submit_task(
         call.bot,
         call.from_user.id,
         language,
         "scrape_invite",
         task_data,
-        translate(
-            language,
-            "texts.task_launched",
-            task_id=translate(language, "texts.see_card_below"),
-            source=html.escape(str(task_data["source"])),
-            target=html.escape(str(task_data["target"])),
-            mode=translate(language, "texts.mode_messages")
-            if task_data["mode"] == "messages"
-            else translate(language, "texts.mode_users"),
-            account=html.escape(session),
-        ),
     )
     if call.message is not None:
         with suppress(TelegramBadRequest, TelegramNetworkError):
             await call.message.delete()
+    if task is None:
+        return
+    await safe_send_message(
+        call.bot,
+        call.from_user.id,
+        translate(
+            language,
+            "texts.task_launched",
+            task_id=task.task_id,
+            source=str(task_data["source"]),
+            target=str(task_data["target"]),
+            mode=translate(language, "buttons.mode_messages")
+            if task_data["mode"] == "messages"
+            else translate(language, "buttons.mode_users"),
+            account=session,
+        ),
+        reply_markup=build_task_keyboard(task, language),
+    )
+    await safe_send_message(call.bot, call.from_user.id, format_task_card(task, language))
 
 
 # --- Режим червя ---
-@router.callback_query(F.data == "menu:worm")
+@router.callback_query(F.data == "worm")
 async def cb_worm(call: CallbackQuery, state: FSMContext, language: str) -> None:
     if not Features.worm_mode():
         await call.answer(translate(language, "texts.feature_disabled_worm"), show_alert=True)
         return
     await state.clear()
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.worm_waiting_chat"),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(language, "texts.worm_waiting_chat", "texts.chat_link_hint"),
         delete_origin=True,
     )
     await state.set_state(InviterStates.waiting_worm_chats)
 
 
-@router.message(InviterStates.waiting_worm_chats)
+@router.message(InviterStates.waiting_worm_chats, ~F.text.startswith("/"))
 async def on_worm_chats(message: Message, state: FSMContext, language: str) -> None:
     links = await parse_links_from_message(message)
     sources: list[str] = []
@@ -4964,59 +5897,57 @@ async def on_worm_chats(message: Message, state: FSMContext, language: str) -> N
         if identifier and identifier not in sources:
             sources.append(identifier)
     if not sources:
-        await smart_answer(
-            message, translate(language, "texts.invalid_format"), reply_markup=kb_cancel(language)
-        )
+        await render_prompt(message, language, translate(language, "texts.invalid_format"))
         return
     if len(sources) > Config.WORM_MAX_SOURCES:
-        await smart_answer(
+        await render_prompt(
             message,
+            language,
             translate(language, "texts.worm_max_sources", count=Config.WORM_MAX_SOURCES),
-            reply_markup=kb_cancel(language),
         )
         sources = sources[: Config.WORM_MAX_SOURCES]
     await state.clear()
-    await _submit_task(
+    task = await _submit_task(
         message.bot,
         message.from_user.id,
         language,
         "worm",
         {"sources": sources, "chats_label": f"{len(sources)}"},
+    )
+    if task is None:
+        return
+    await safe_send_message(
+        message.bot,
+        message.from_user.id,
         translate(
             language,
             "texts.worm_started_multi",
+            task_id=task.task_id,
             chats=len(sources),
-            sources="\n".join(html.escape(item) for item in sources),
+            sources="\n".join(f"• {item}" for item in sources),
         ),
+        reply_markup=main_menu_keyboard(language),
     )
 
 
 @router.message(Command("stop_worm"))
-async def cmd_stop_worm(message: Message, language: str) -> None:
+async def cmd_stop_worm(event: Message | CallbackQuery, language: str) -> None:
+    manager = get_queue_manager()
     cancelled = 0
     messages = links = added = errors = 0
-    for task in await tasks_db.get_user_tasks(message.from_user.id):
+    for task in await tasks_db.get_user_tasks(event.from_user.id):
         if task.type != "worm" or not task.is_active:
             continue
-        await get_queue_manager().request_cancel(task.task_id, message.from_user.id)
+        if not await manager.request_cancel(task.task_id, event.from_user.id):
+            continue
         cancelled += 1
-        task_results = task.results or {}
-        for key in ("messages", "links", "added", "errors"):
-            value = task_results.get(key, 0)
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                value = 0
-            if key == "messages":
-                messages += value
-            elif key == "links":
-                links += value
-            elif key == "added":
-                added += value
-            elif key == "errors":
-                errors += value
+        stored = decode_json_object(task.results)
+        messages += to_int(stored.get("messages"))
+        links += to_int(stored.get("links"))
+        added += to_int(stored.get("added"))
+        errors += to_int(stored.get("errors"))
     await smart_answer(
-        message,
+        event,
         translate(
             language,
             "texts.worm_stopped_multi",
@@ -5027,22 +5958,30 @@ async def cmd_stop_worm(message: Message, language: str) -> None:
         )
         if cancelled
         else translate(language, "texts.no_active_tasks"),
-        reply_markup=kb_main(language),
+        reply_markup=main_menu_keyboard(language),
+        delete_origin=isinstance(event, CallbackQuery),
     )
 
 
 # --- Массовая рассылка ---
-@router.callback_query(F.data == "menu:mailing")
+@router.callback_query(F.data == "mailing")
 async def cb_mailing(call: CallbackQuery, state: FSMContext, language: str) -> None:
     if not Features.mailing():
         await call.answer(translate(language, "texts.feature_disabled_mailing"), show_alert=True)
         return
     await state.clear()
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.bulkmail_target_select"),
-        reply_markup=kb_mail_target(language),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_target_select",
+            "texts.bulkmail_target_prompt",
+            step=1,
+            total=MAILING_WIZARD_STEPS,
+        ),
+        markup=mail_target_keyboard(language),
         delete_origin=True,
     )
 
@@ -5064,10 +6003,18 @@ async def cb_mail_target(call: CallbackQuery, state: FSMContext, language: str) 
         await call.answer(translate(language, "texts.bulkmail_db_empty"), show_alert=True)
         return
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.bulkmail_step1_db", count=chat_count),
-        reply_markup=kb_source_choice(language, "mail:source"),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_chats_db",
+            "texts.bulkmail_chats_db_prompt",
+            step=2,
+            total=MAILING_WIZARD_STEPS,
+            count=chat_count,
+        ),
+        markup=source_keyboard(language, "mail:source"),
         delete_origin=True,
     )
 
@@ -5083,10 +6030,16 @@ async def cb_mail_source(call: CallbackQuery, state: FSMContext, language: str) 
             return
         await state.update_data(chats=identifiers)
         await call.answer()
-        await smart_answer(
+        await render_prompt(
             call,
-            translate(language, "texts.bulkmail_step2_delay"),
-            reply_markup=kb_cancel(language),
+            language,
+            screen_text(
+                language,
+                "texts.bulkmail_delay",
+                "texts.bulkmail_delay_prompt",
+                step=3,
+                total=MAILING_WIZARD_STEPS,
+            ),
             delete_origin=True,
         )
         await state.set_state(InviterStates.waiting_mail_delay)
@@ -5095,10 +6048,16 @@ async def cb_mail_source(call: CallbackQuery, state: FSMContext, language: str) 
         await call.answer(translate(language, "texts.invalid_format"), show_alert=True)
         return
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.bulkmail_step1_manual"),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_chats_manual",
+            "texts.bulkmail_chats_manual_prompt",
+            step=2,
+            total=MAILING_WIZARD_STEPS,
+        ),
         delete_origin=True,
     )
     await state.set_state(InviterStates.waiting_mail_chats)
@@ -5112,17 +6071,19 @@ async def on_mail_chats(message: Message, state: FSMContext, language: str) -> N
         if identifier and identifier not in identifiers:
             identifiers.append(identifier)
     if not identifiers:
-        await smart_answer(
-            message,
-            translate(language, "texts.bulkmail_empty_chats"),
-            reply_markup=kb_cancel(language),
-        )
+        await render_prompt(message, language, translate(language, "texts.bulkmail_empty_chats"))
         return
     await state.update_data(chats=identifiers)
-    await smart_answer(
+    await render_prompt(
         message,
-        translate(language, "texts.bulkmail_step2_delay"),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_delay",
+            "texts.bulkmail_delay_prompt",
+            step=3,
+            total=MAILING_WIZARD_STEPS,
+        ),
     )
     await state.set_state(InviterStates.waiting_mail_delay)
 
@@ -5131,25 +6092,23 @@ async def on_mail_chats(message: Message, state: FSMContext, language: str) -> N
 async def on_mail_delay(message: Message, state: FSMContext, language: str) -> None:
     parts = re.split(r"[\s,]+", (message.text or "").strip())
     if len(parts) != 2:
-        await smart_answer(
-            message,
-            translate(language, "texts.bulkmail_invalid_delay"),
-            reply_markup=kb_cancel(language),
-        )
+        await render_prompt(message, language, translate(language, "texts.bulkmail_invalid_delay"))
         return
-    min_delay, max_delay = to_int(parts[0], -1), to_int(parts[1], -1)
+    min_delay, max_delay = to_int(parts[0], default=-1), to_int(parts[1], default=-1)
     if min_delay < 0 or max_delay < 0 or min_delay > max_delay:
-        await smart_answer(
-            message,
-            translate(language, "texts.bulkmail_invalid_delay"),
-            reply_markup=kb_cancel(language),
-        )
+        await render_prompt(message, language, translate(language, "texts.bulkmail_invalid_delay"))
         return
     await state.update_data(min_delay=min_delay, max_delay=max_delay)
-    await smart_answer(
+    await render_prompt(
         message,
-        translate(language, "texts.bulkmail_step3_text_first"),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_texts_first",
+            "texts.bulkmail_texts_first_prompt",
+            step=4,
+            total=MAILING_WIZARD_STEPS,
+        ),
     )
     await state.set_state(InviterStates.waiting_mail_text)
 
@@ -5158,18 +6117,17 @@ async def on_mail_delay(message: Message, state: FSMContext, language: str) -> N
 async def on_mail_text(message: Message, state: FSMContext, language: str) -> None:
     text_value = (message.text or "").strip()
     if not text_value:
-        await smart_answer(
-            message, translate(language, "texts.empty_input"), reply_markup=kb_cancel(language)
-        )
+        await render_prompt(message, language, translate(language, "texts.empty_input"))
         return
     data = await state.get_data()
     texts: list[str] = list(data.get("texts", []))
     texts.append(text_value)
     await state.update_data(texts=texts)
-    await smart_answer(
+    await render_prompt(
         message,
+        language,
         translate(language, "texts.bulkmail_texts_received", count=len(texts)),
-        reply_markup=kb_mail_more_text(language),
+        markup=mail_texts_done_keyboard(language),
     )
 
 
@@ -5180,25 +6138,38 @@ async def cb_mail_texts_done(call: CallbackQuery, state: FSMContext, language: s
         await call.answer(translate(language, "texts.bulkmail_no_texts"), show_alert=True)
         return
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.bulkmail_step4_account"),
-        reply_markup=kb_account_choice(language, "mail:account"),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_account",
+            "texts.bulkmail_account_prompt",
+            step=5,
+            total=MAILING_WIZARD_STEPS,
+        ),
+        markup=account_keyboard(language, "mail:account"),
         delete_origin=True,
     )
-    await state.set_state(InviterStates.waiting_mail_account)
+    await state.set_state(None)
 
 
 @router.callback_query(F.data.startswith("mail:account:"))
 async def cb_mail_account(call: CallbackQuery, state: FSMContext, language: str) -> None:
-    payload = call.data.split(":")
-    session = "auto" if payload[-1] == "auto" else ":".join(payload[2:])
+    session = parse_account_callback(call.data, "mail:account:")
     await state.update_data(account=session)
     await call.answer()
-    await smart_answer(
+    await render_prompt(
         call,
-        translate(language, "texts.bulkmail_sender_selected", sender=html.escape(session)),
-        reply_markup=kb_cancel(language),
+        language,
+        screen_text(
+            language,
+            "texts.bulkmail_total",
+            "texts.bulkmail_total_prompt",
+            step=6,
+            total=MAILING_WIZARD_STEPS,
+            max_total=Config.MAILING_MAX_TOTAL_SENDS,
+        ),
         delete_origin=True,
     )
     await state.set_state(InviterStates.waiting_mail_total)
@@ -5206,12 +6177,12 @@ async def cb_mail_account(call: CallbackQuery, state: FSMContext, language: str)
 
 @router.message(InviterStates.waiting_mail_total)
 async def on_mail_total(message: Message, state: FSMContext, language: str) -> None:
-    total = to_int(message.text or "", 0)
+    total = to_int(message.text or "")
     if total <= 0:
         await smart_answer(
             message,
             translate(language, "texts.bulkmail_total_error"),
-            reply_markup=kb_cancel(language),
+            reply_markup=cancel_keyboard(language),
         )
         return
     data = await state.get_data()
@@ -5221,38 +6192,34 @@ async def on_mail_total(message: Message, state: FSMContext, language: str) -> N
         "chat_count": len(chats),
         "chats_label": f"{len(chats)}",
         "texts": list(data.get("texts", [])),
-        "min_delay": to_int(data.get("min_delay"), Config.MAILING_MIN_DELAY),
-        "max_delay": to_int(data.get("max_delay"), Config.MAILING_MAX_DELAY),
+        "min_delay": to_int(data.get("min_delay"), default=Config.MAILING_MIN_DELAY),
+        "max_delay": to_int(data.get("max_delay"), default=Config.MAILING_MAX_DELAY),
         "account": str(data.get("account") or "auto"),
         "target": str(data.get("target") or "chats"),
         "total": total,
     }
     await state.clear()
-    await _submit_task(
+    task = await _submit_task(
         message.bot,
         message.from_user.id,
         language,
         "bulkmail",
         task_data,
-        translate(
-            language,
-            "texts.bulkmail_sent",
-            task_id=translate(language, "texts.see_card_below"),
-            sent=total,
-        ),
     )
-
-
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext, language: str) -> None:
-    current = await state.get_state()
-    if current is None:
+    if task is None:
         return
-    await state.clear()
-    await _drop_login_client(message.from_user.id)
-    await smart_answer(
-        message, translate(language, "texts.action_cancelled"), reply_markup=kb_main(language)
+    await safe_send_message(
+        message.bot,
+        message.from_user.id,
+        translate(language, "texts.bulkmail_sent", task_id=task.task_id, sent=total),
+        reply_markup=main_menu_keyboard(language),
     )
+
+
+@router.message(F.text)
+@log_error
+async def on_unhandled_text(message: Message, language: str) -> None:
+    await render_main_menu(message, language)
 
 
 async def cache_cleanup_loop() -> None:
@@ -5291,16 +6258,13 @@ async def release_webhook() -> None:
 async def on_startup() -> None:
     await release_webhook()
 
-    load_languages()
-    language_errors = validate_languages()
-    for error in language_errors:
+    for error in validate_languages():
         logger.error(f"Языки: {error}")
 
     await tasks_db.connect()
     await chat_db.connect()
     await cache_db.connect()
     await user_db.connect()
-    account_manager.load_accounts()
     global queue_manager
     queue_manager = TaskQueueManager(bot=bot)
     await queue_manager.start()
