@@ -49,6 +49,7 @@ from telethon.errors import (
     ChannelInvalidError,
     ChannelPrivateError,
     ChatAdminRequiredError,
+    ChatRestrictedError,
     ChatWriteForbiddenError,
     FloodError,
     FloodWaitError,
@@ -215,6 +216,37 @@ def log_error(func: Callable[..., Any]) -> Callable[..., Any]:
             raise
 
     return wrapper
+
+
+def _log_task_failure(task: asyncio.Task[None]) -> None:
+    """Логирует непойманные исключения из fire-and-forget задач."""
+    if task.cancelled():
+        return
+    exception = task.exception()
+    if exception is not None:
+        logger.error(
+            f"Фоновая задача {task.get_name()}: непойманное исключение: "
+            f"{type(exception).__name__}: {exception}"
+        )
+
+
+def spawn_tracked_task(
+    coro: Awaitable[None],
+    *,
+    name: str = "",
+    registry: list[asyncio.Task[None]] | set[asyncio.Task[None]] | None = None,
+) -> asyncio.Task[None]:
+    """Создаёт задачу с удержанием ссылки и callback'ом на логирование сбоев."""
+    task = asyncio.create_task(coro, name=name)  # type: ignore[arg-type]
+    task.add_done_callback(_log_task_failure)
+    if registry is not None:
+        if isinstance(registry, list):
+            registry.append(task)
+            task.add_done_callback(lambda t: registry.remove(t) if t in registry else None)
+        else:
+            registry.add(task)
+            task.add_done_callback(registry.discard)
+    return task
 
 
 async def safe_send_message(
@@ -563,7 +595,7 @@ class Config:
     INVITE_STEP_USERS: int = env_int("INVITE_STEP_USERS", 1)
     MAILING_STEP_MESSAGES: int = env_int("MAILING_STEP_MESSAGES", 1)
 
-    ADAPTIVE_DELAY_BASE: float = env_float("ADAPTIVE_DELAY_BASE", 5.0)
+    ADAPTIVE_DELAY_BASE: float = env_float("ADAPTIVE_DELAY_BASE", 2.0)
     ADAPTIVE_DELAY_MAX: float = env_float("ADAPTIVE_DELAY_MAX", 120.0)
     MAX_ACCOUNT_CONSECUTIVE_ERRORS: int = env_int("MAX_ACCOUNT_CONSECUTIVE_ERRORS", 5)
     ACCOUNT_ERROR_COOLDOWN: int = env_int("ACCOUNT_ERROR_COOLDOWN", 300)
@@ -594,7 +626,7 @@ class Config:
     MAILING_MAX_TOTAL_SENDS: int = env_int("MAILING_MAX_TOTAL_SENDS", 5000)
 
     VALIDATOR_TEST_DELETE_WAIT: int = env_int("VALIDATOR_TEST_DELETE_WAIT", 5)
-    MAX_CHATS_PER_IMPORT: int = env_int("MAX_CHATS_PER_IMPORT", 50)
+    DB_CHAT_SAMPLE_SIZE: int = env_int("DB_CHAT_SAMPLE_SIZE", 10)
     VALIDATOR_ANTI_FLOOD_DELAY_MIN: int = env_int("VALIDATOR_ANTI_FLOOD_DELAY_MIN", 3)
     VALIDATOR_ANTI_FLOOD_DELAY_MAX: int = env_int("VALIDATOR_ANTI_FLOOD_DELAY_MAX", 7)
     CHAT_ADD_THROTTLE_DELAY_MIN: float = env_float("CHAT_ADD_THROTTLE_DELAY_MIN", 1.0)
@@ -1016,6 +1048,12 @@ class ValidatedChat:
     chat_url: str
     chat_type: str
     user_count: int
+
+
+def pick_random_chats(chats: list[ChatInfo], count: int) -> list[ChatInfo]:
+    if count <= 0 or len(chats) <= count:
+        return chats
+    return random.sample(chats, count)
 
 
 @dataclass
@@ -1441,7 +1479,8 @@ class ChatDB(SQLiteDatabase):
                 set_clause = ", ".join(f"{name} = ?" for name in fields)
                 values = [*fields.values(), str(chat_id)]
                 await self.conn.execute(
-                    f"UPDATE collected_chats SET {set_clause} WHERE chat_id = ?", values
+                    f"UPDATE collected_chats SET {set_clause} WHERE chat_id = ?",
+                    values,
                 )
                 await self.conn.commit()
             except Exception as e:  # noqa: BLE001
@@ -2220,6 +2259,7 @@ async def validate_and_test_chat(
         raise
     except (
         ChatAdminRequiredError,
+        ChatRestrictedError,
         ChannelPrivateError,
         ChatWriteForbiddenError,
         UserPrivacyRestrictedError,
@@ -2313,7 +2353,12 @@ async def check_one_chat(
             logger.warning(
                 f"Чат {chat.chat_name}: не удалось удалить проверочное сообщение: {type(e).__name__}"
             )
-    except (ChatAdminRequiredError, ChannelPrivateError, ChatWriteForbiddenError):
+    except (
+        ChatAdminRequiredError,
+        ChatRestrictedError,
+        ChannelPrivateError,
+        ChatWriteForbiddenError,
+    ):
         reachable = False
     except SlowModeWaitError as e:
         logger.info(f"Чат {chat.chat_name}: slow mode {getattr(e, 'seconds', 5)}с")
@@ -2686,9 +2731,12 @@ class AccountPoolManager:
                 raise NoAvailableAccountError(err("no_free_accounts"))
             if not any(account.is_valid for account in self.accounts):
                 raise NoAvailableAccountError(err("no_valid_accounts"))
+            self._free_event.clear()
             delay = self._next_ready_delay_locked(session_file)
             busy, flood, invalid = self.pool_state_locked()
-        if delay is not None and delay > 0:
+        if delay is None:
+            raise NoAvailableAccountError(err("no_valid_accounts"))
+        if delay > 0:
             wait_time = max(0.1, delay)
             logger.info(
                 f"Роллер: свободных аккаунтов нет, ждём {wait_time:.0f}с "
@@ -2753,7 +2801,10 @@ class AccountPoolManager:
                 logger.error(f"Проверка аккаунта {account.session_file}: {e}")
 
     async def start_health_check(self) -> None:
-        self._health_task = asyncio.create_task(self._health_check_loop())
+        if self._health_task is not None and not self._health_task.done():
+            return
+        self._health_task = asyncio.create_task(self._health_check_loop(), name="account-health")
+        self._health_task.add_done_callback(_log_task_failure)
         logger.info("Health check аккаунтов запущен")
 
     async def stop_health_check(self) -> None:
@@ -2874,12 +2925,15 @@ def format_task_card(task: Task, language: str = DEFAULT_LANGUAGE) -> str:
             else html.escape(account)
         )
         lines.append(f"{translate(language, 'texts.task_account_label')} {account_value}")
-    used_accounts = task.results.get("accounts") if isinstance(task.results, dict) else None
+    used_accounts = decode_json_object(task.results).get("accounts")
     if isinstance(used_accounts, list) and used_accounts:
         lines.append(
             f"{translate(language, 'texts.task_accounts_label', count=len(used_accounts))} "
             f"<code>{html.escape(format_accounts_summary([str(item) for item in used_accounts]))}</code>"
         )
+    remaining = to_int(data.get("remaining"))
+    if remaining:
+        lines.append(f"{translate(language, 'texts.task_remaining_label')} <b>{remaining}</b>")
     for label_key, data_key in (
         ("texts.task_messages_label", "message_limit"),
         ("texts.task_users_label", "user_limit"),
@@ -2890,6 +2944,11 @@ def format_task_card(task: Task, language: str = DEFAULT_LANGUAGE) -> str:
         if value:
             lines.append(f"{translate(language, label_key)} <b>{value}</b>")
     lines.append(f"{translate(language, 'texts.task_sent_label')} <b>{task.sent}</b>")
+    updated = task.created_at
+    if updated:
+        lines.append(
+            f"{translate(language, 'texts.task_updated_label')} <code>{updated[:16].replace('T', ' ')}</code>"
+        )
     lines.append("")
     lines.append(format_progress_bar(task.progress))
     if task.progress_text:
@@ -2994,10 +3053,7 @@ class TaskControl:
                 except TimeoutError:
                     return not self._cancelled
                 continue
-            try:
-                await asyncio.wait_for(self._resume_event.wait(), timeout=remaining)
-            except TimeoutError:
-                return not self._cancelled
+            await asyncio.sleep(min(remaining, 1.0))
 
     @property
     def task_id(self) -> str:
@@ -3059,9 +3115,9 @@ class TaskQueueManager:
         for index in range(max(1, Config.MIN_WORKERS)):
             await self._spawn_worker(index)
         self._monitors = [
-            asyncio.create_task(self._scale_loop(), name="task-scaler"),
-            asyncio.create_task(self._health_loop(), name="task-health"),
-            asyncio.create_task(self._cleanup_loop(), name="task-cleanup"),
+            spawn_tracked_task(self._scale_loop(), name="task-scaler", registry=self._monitors),
+            spawn_tracked_task(self._health_loop(), name="task-health", registry=self._monitors),
+            spawn_tracked_task(self._cleanup_loop(), name="task-cleanup", registry=self._monitors),
         ]
         logger.info(
             f"Планировщик задач запущен: воркеров {len(self._workers)}, "
@@ -3164,7 +3220,7 @@ class TaskQueueManager:
         return await tasks_db.cancel_task(task_id, cancelled_by=cancelled_by)
 
     async def _spawn_worker(self, index: int) -> None:
-        worker = asyncio.create_task(self._worker_loop(index), name=f"invite-worker-{index}")
+        worker = spawn_tracked_task(self._worker_loop(index), name=f"invite-worker-{index}")
         self._workers[index] = worker
 
     async def _retire_worker(self, index: int) -> None:
@@ -3218,7 +3274,7 @@ class TaskQueueManager:
 
         control = TaskControl()
         control.task = task
-        runner = asyncio.create_task(self._runner(task, control), name=f"invite-task-{task_id}")
+        runner = spawn_tracked_task(self._runner(task, control), name=f"invite-task-{task_id}")
         async with self._lock:
             self.controls[task_id] = control
             self.runners[task_id] = runner
@@ -3234,6 +3290,8 @@ class TaskQueueManager:
             try:
                 await runner
             except asyncio.CancelledError:
+                if not runner.cancelled():
+                    raise
                 logger.debug(f"Задача {task_id}: выполнение отменено по таймауту")
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Задача {task_id}: runner остановлен по таймауту: {e}")
@@ -3307,10 +3365,18 @@ class TaskQueueManager:
             if task.type == "bulkmail"
             else "texts.task_cancelled_report"
         )
+        results = decode_json_object(task.results)
         await safe_send_message(
             self.bot,
             task.user_id,
-            translate(language, key, task_id=task.task_id),
+            translate(
+                language,
+                key,
+                task_id=task.task_id,
+                sent=task.sent,
+                processed=to_int(results.get("processed")),
+                total=to_int(results.get("total")),
+            ),
             reply_markup=main_menu_keyboard(language),
         )
         logger.info(f"Задача {task.task_id} отменена")
@@ -3442,9 +3508,9 @@ class TaskProgressReporter:
             markup = build_task_keyboard(self.task, self.language)
             try:
                 await self.bot.edit_message_text(
-                    self._chat_id,
-                    self._message_id,
-                    card,
+                    text=card,
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup,
                 )
@@ -3474,9 +3540,9 @@ class TaskProgressReporter:
                 return
             try:
                 await self.bot.edit_message_text(
-                    self._chat_id,
-                    self._message_id,
-                    card,
+                    text=card,
+                    chat_id=self._chat_id,
+                    message_id=self._message_id,
                     parse_mode=ParseMode.HTML,
                     reply_markup=markup,
                 )
@@ -3562,7 +3628,9 @@ async def _invite_user(account: Account, target: Any, user_id: int) -> str:
             input_user = await client.get_input_entity(user_id)
             await client(
                 functions.channels.InviteToChannelRequest(
-                    channel=target, users=[input_user], random_id=random.randint(1, 2**31)
+                    channel=target,
+                    users=[input_user],
+                    random_id=random.randint(1, 2**31),
                 )
             )
         else:
@@ -3738,7 +3806,7 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
                         language,
                         joined_targets,
                     )
-                    if batch_error:
+                    if batch_error and not control.is_cancelled:
                         fatal_error = batch_error
                     break
             except FloodWaitError as e:
@@ -3758,6 +3826,8 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
                 stop_reason = "cancelled"
                 break
 
+        if control.is_cancelled and not fatal_error:
+            stop_reason = "cancelled"
         if not fatal_error and not collected and not stop_reason:
             fatal_error = translate(language, "texts.no_users_found", source=source_identifier)
         if fatal_error or (stop_reason and not collected):
@@ -3989,29 +4059,62 @@ async def run_scrape_invite_task(task: Task, control: TaskControl) -> None:
 
 
 async def _collect_mailing_users(
-    account: Account,
+    pinned: str,
     chats: list[str],
     limit: int,
     control: TaskControl,
+    accounts_used: list[str],
 ) -> list[int]:
-    require_client(account)
     seen: set[int] = set()
     for identifier in chats:
         if not await control.checkpoint():
             break
+        if len(seen) >= limit:
+            break
         cached = await cache_db.get_cached_participants(identifier)
-        candidates = cached or []
-        if not candidates:
-            entity, joined = await join_chat(account, identifier)
-            participants = await _collect_users_from_participants(
-                account, entity, Config.SCRAPE_MAX_USER_COUNT, control
+        if cached:
+            for user_id in cached:
+                if user_id not in seen:
+                    seen.add(user_id)
+                if len(seen) >= limit:
+                    return list(seen)
+            continue
+        account: Account | None = None
+        participants: list[int] = []
+        try:
+            async with account_manager.acquire_step(pinned or None, control) as account:
+                if account.session_file not in accounts_used:
+                    accounts_used.append(account.session_file)
+                entity, joined = await join_chat(account, identifier)
+                participants = await _collect_users_from_participants(
+                    account, entity, Config.SCRAPE_MAX_USER_COUNT, control
+                )
+                if participants:
+                    await cache_db.cache_participants(identifier, participants)
+                if Features.auto_leave() and joined:
+                    await leave_chat(account, entity, identifier)
+        except FloodWaitError as e:
+            seconds = float(getattr(e, "seconds", 60))
+            if account is not None:
+                account_manager.handle_flood_wait(account, seconds)
+            logger.warning(
+                f"Рассылка: FloodWait на {identifier} {seconds:.0f}с, перехожу на другой аккаунт"
             )
-            if participants:
-                await cache_db.cache_participants(identifier, participants)
-            if Features.auto_leave() and joined:
-                await leave_chat(account, entity, identifier)
-            candidates = participants
-        for user_id in candidates:
+            continue
+        except ChatUnreachableError as e:
+            logger.warning(f"Рассылка: чат {identifier} недоступен: {e}")
+            continue
+        except AuthKeyUnregisteredError:
+            if account is not None:
+                account.is_valid = False
+            logger.warning(f"Рассылка: аккаунт недействителен на {identifier}")
+            continue
+        except (AccountWaitCancelled, NoAvailableAccountError):
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Рассылка: сбор {identifier} не удался: {type(e).__name__}: {e}")
+            continue
+        for user_id in participants:
             if user_id not in seen:
                 seen.add(user_id)
             if len(seen) >= limit:
@@ -4061,22 +4164,9 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
 
     if target == "users":
         try:
-            async with account_manager.acquire(pinned or None, control) as account:
-                if account.session_file not in accounts_used:
-                    accounts_used.append(account.session_file)
-                recipients = await _collect_mailing_users(
-                    account, chats, Config.SCRAPE_MAX_USER_COUNT, control
-                )
-        except FloodWaitError as e:
-            seconds = float(getattr(e, "seconds", 60))
-            account_manager.handle_flood_wait(account, seconds)
-            flood_events += 1
-            flood_seconds = max(flood_seconds, seconds)
-            fatal_error = translate(
-                language, "texts.task_failed_flood_scrape", seconds=int(seconds)
+            recipients = await _collect_mailing_users(
+                pinned, chats, Config.SCRAPE_MAX_USER_COUNT, control, accounts_used
             )
-        except AuthKeyUnregisteredError:
-            fatal_error = translate(language, "texts.task_failed_auth_reset")
         except AccountWaitCancelled:
             pass
         except NoAvailableAccountError as e:
@@ -4089,6 +4179,24 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
         )
         if total_planned > len(recipients):
             recipients = [recipients[index % len(recipients)] for index in range(total_planned)]
+
+    if control.is_cancelled and not fatal_error:
+        await tasks_db.update_task(
+            task.task_id,
+            {
+                "status": "cancelled",
+                "completed_at": utc_now_iso(),
+            },
+        )
+        await reporter.finalize(
+            translate(
+                language,
+                "texts.mailing_cancelled_report",
+                task_id=task.task_id,
+                sent=sent,
+            )
+        )
+        return
 
     if fatal_error:
         await tasks_db.update_task(
@@ -4236,10 +4344,12 @@ async def run_mailing_task(task: Task, control: TaskControl) -> None:
 
     task.sent = sent
     status = resolve_final_status(control, fatal_error)
-    report_lines = "\n".join(
-        translate(language, "texts.mailing_chat_line", chat=chat, count=count)
-        for chat, count in list(per_chat.items())[:20]
-    )
+    report_lines = ""
+    if target != "users":
+        report_lines = "\n".join(
+            translate(language, "texts.mailing_chat_line", chat=chat, count=count)
+            for chat, count in list(per_chat.items())[:20]
+        )
     await tasks_db.update_task(
         task.task_id,
         {
@@ -4738,6 +4848,26 @@ def scrape_mode_keyboard(language: str) -> InlineKeyboardMarkup:
     )
 
 
+def scrape_source_chat_keyboard(language: str, chats: list[ChatInfo]) -> InlineKeyboardMarkup:
+    rows: list[list[dict[str, str]]] = []
+    for chat in chats:
+        identifier = chat.chat_url or chat.chat_id
+        callback = f"scrape:source:chat:{identifier}"
+        if len(callback.encode()) > CALLBACK_DATA_MAX_BYTES:
+            continue
+        label = truncate(chat.chat_name or identifier, 24)
+        rows.append(
+            [
+                {
+                    "text": f"{html.escape(label)} • {chat.user_count}",
+                    "callback_data": callback,
+                }
+            ]
+        )
+    rows.append(cancel_row(language))
+    return kb(rows)
+
+
 def source_keyboard(language: str, prefix: str) -> InlineKeyboardMarkup:
     return kb(
         [
@@ -4944,7 +5074,7 @@ class Screen:
         )
 
 
-SCRAPE_WIZARD_STEPS: int = 5
+SCRAPE_WIZARD_STEPS: int = 6
 MAILING_WIZARD_STEPS: int = 6
 
 
@@ -5396,14 +5526,11 @@ async def on_links(message: Message, state: FSMContext, language: str) -> None:
     flood_seconds = 0.0
     accounts_used: list[str] = []
     notes: list[str] = []
-    limit = max(1, Config.MAX_CHATS_PER_IMPORT)
     if not account_manager.accounts:
         await render_prompt(message, language, translate(language, "texts.no_available_accounts"))
         await state.clear()
         return
     for link in links:
-        if processed >= limit:
-            break
         identifier = parse_identifier(link)
         if not identifier:
             rejected += 1
@@ -5684,19 +5811,102 @@ async def _submit_task(
 async def cb_scrape(call: CallbackQuery, state: FSMContext, language: str) -> None:
     await state.clear()
     await call.answer()
+    if await chat_db.get_active_chats_count() == 0:
+        await render_prompt(
+            call,
+            language,
+            screen_text(
+                language,
+                "texts.waiting_source",
+                "texts.chat_link_hint",
+                step=2,
+                total=SCRAPE_WIZARD_STEPS,
+            ),
+            delete_origin=True,
+        )
+        await state.set_state(InviterStates.waiting_scrape_source)
+        return
     await render_prompt(
         call,
         language,
         screen_text(
             language,
-            "texts.waiting_source",
-            "texts.chat_link_hint",
+            "texts.scrape_source_choice",
+            "texts.scrape_source_choice_prompt",
             step=1,
+            total=SCRAPE_WIZARD_STEPS,
+        ),
+        markup=source_keyboard(language, "scrape:source"),
+        delete_origin=True,
+    )
+
+
+@router.callback_query(F.data.startswith("scrape:source:"))
+async def cb_scrape_source(call: CallbackQuery, state: FSMContext, language: str) -> None:
+    parts = call.data.split(":")
+    mode = parts[2] if len(parts) > 2 else ""
+    if mode == "db":
+        chats = pick_random_chats(await chat_db.get_all_chats(), Config.DB_CHAT_SAMPLE_SIZE)
+        selectable = [
+            chat
+            for chat in chats
+            if len(f"scrape:source:chat:{chat.chat_url or chat.chat_id}".encode())
+            <= CALLBACK_DATA_MAX_BYTES
+        ]
+        if not selectable:
+            await call.answer(translate(language, "texts.bulkmail_db_empty"), show_alert=True)
+            return
+        await call.answer()
+        await render_prompt(
+            call,
+            language,
+            screen_text(
+                language,
+                "texts.scrape_source_db",
+                "texts.scrape_source_db_prompt",
+                step=2,
+                total=SCRAPE_WIZARD_STEPS,
+                count=len(chats),
+            ),
+            markup=scrape_source_chat_keyboard(language, selectable),
+            delete_origin=True,
+        )
+        return
+    if mode == "manual":
+        await call.answer()
+        await render_prompt(
+            call,
+            language,
+            screen_text(
+                language,
+                "texts.waiting_source",
+                "texts.chat_link_hint",
+                step=2,
+                total=SCRAPE_WIZARD_STEPS,
+            ),
+            delete_origin=True,
+        )
+        await state.set_state(InviterStates.waiting_scrape_source)
+        return
+    if mode != "chat" or len(parts) < 4:
+        await call.answer(translate(language, "texts.invalid_format"), show_alert=True)
+        return
+    identifier = ":".join(parts[3:])
+    await state.update_data(source=identifier)
+    await call.answer()
+    await render_prompt(
+        call,
+        language,
+        screen_text(
+            language,
+            "texts.waiting_target",
+            "texts.chat_link_hint",
+            step=3,
             total=SCRAPE_WIZARD_STEPS,
         ),
         delete_origin=True,
     )
-    await state.set_state(InviterStates.waiting_scrape_source)
+    await state.set_state(InviterStates.waiting_scrape_target)
 
 
 @router.message(InviterStates.waiting_scrape_source)
@@ -5713,7 +5923,7 @@ async def on_scrape_source(message: Message, state: FSMContext, language: str) -
             language,
             "texts.waiting_target",
             "texts.chat_link_hint",
-            step=2,
+            step=3,
             total=SCRAPE_WIZARD_STEPS,
         ),
     )
@@ -5738,7 +5948,7 @@ async def on_scrape_target(message: Message, state: FSMContext, language: str) -
             language,
             "texts.waiting_mode",
             "texts.scrape_mode_select",
-            step=3,
+            step=4,
             total=SCRAPE_WIZARD_STEPS,
         ),
         markup=scrape_mode_keyboard(language),
@@ -5759,7 +5969,7 @@ async def cb_scrape_mode(call: CallbackQuery, state: FSMContext, language: str) 
             language,
             "texts.waiting_message_limit",
             "texts.scrape_limit_prompt",
-            step=4,
+            step=5,
             total=SCRAPE_WIZARD_STEPS,
             min_limit=Config.SCRAPE_MIN_MESSAGE_LIMIT,
             max_limit=Config.SCRAPE_MAX_MESSAGE_LIMIT,
@@ -5769,7 +5979,7 @@ async def cb_scrape_mode(call: CallbackQuery, state: FSMContext, language: str) 
             language,
             "texts.waiting_user_count",
             "texts.scrape_user_count_prompt",
-            step=4,
+            step=5,
             total=SCRAPE_WIZARD_STEPS,
             min_count=Config.SCRAPE_MIN_USER_COUNT,
             max_count=Config.SCRAPE_MAX_USER_COUNT,
@@ -5818,7 +6028,7 @@ async def on_scrape_limit(message: Message, state: FSMContext, language: str) ->
             language,
             "texts.scrape_select_account",
             "texts.scrape_account_prompt",
-            step=5,
+            step=6,
             total=SCRAPE_WIZARD_STEPS,
         ),
         markup=account_keyboard(language, "scrape:account"),
@@ -5998,10 +6208,8 @@ async def cb_mail_target(call: CallbackQuery, state: FSMContext, language: str) 
         )
         return
     await state.update_data(target=target)
-    chat_count = await chat_db.get_active_chats_count()
-    if chat_count == 0:
-        await call.answer(translate(language, "texts.bulkmail_db_empty"), show_alert=True)
-        return
+    total_chats = await chat_db.get_active_chats_count()
+    chat_count = total_chats
     await call.answer()
     await render_prompt(
         call,
@@ -6023,7 +6231,7 @@ async def cb_mail_target(call: CallbackQuery, state: FSMContext, language: str) 
 async def cb_mail_source(call: CallbackQuery, state: FSMContext, language: str) -> None:
     mode = call.data.split(":")[-1]
     if mode == "db":
-        chats = await chat_db.get_all_chats()
+        chats = pick_random_chats(await chat_db.get_all_chats(), 0)
         identifiers = [chat.chat_url or chat.chat_id for chat in chats]
         if not identifiers:
             await call.answer(translate(language, "texts.bulkmail_db_empty"), show_alert=True)
@@ -6269,7 +6477,7 @@ async def on_startup() -> None:
     queue_manager = TaskQueueManager(bot=bot)
     await queue_manager.start()
     await account_manager.start_health_check()
-    BACKGROUND_TASKS.add(asyncio.create_task(cache_cleanup_loop(), name="cache-cleanup"))
+    spawn_tracked_task(cache_cleanup_loop(), name="cache-cleanup", registry=BACKGROUND_TASKS)
 
     me = await bot.get_me()
     logger.info(f"Бот запущен: @{me.username}")
